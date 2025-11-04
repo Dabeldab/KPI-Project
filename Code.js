@@ -480,8 +480,10 @@ function writeRowsToSheets_(ss, rows, clearExisting = false) {
   if (clearExisting) {
     const dataRange = sh.getDataRange();
     if (dataRange.getNumRows() > 1) {
-      // Delete all rows except header (row 1)
-      sh.deleteRows(2, dataRange.getNumRows() - 1);
+      // Clear contents of all data rows (keep header and sheet structure)
+      const numRows = dataRange.getNumRows() - 1;
+      const numCols = dataRange.getNumColumns();
+      sh.getRange(2, 1, numRows, numCols).clearContent();
       Logger.log('Cleared existing Sessions data (kept headers)');
     }
   }
@@ -754,7 +756,17 @@ function ingestTimeRangeToSheets_(startTimestamp, endTimestamp, cfg, clearExisti
     setTimezoneEDT_(cfg.rescueBase, cookie);
     
     setReportAreaSession_(cfg.rescueBase, cookie);
+    // Ensure LISTALL report type is set and verified
     setReportTypeListAll_(cfg.rescueBase, cookie);
+    try {
+      const rt = getReportType_(cfg.rescueBase, cookie);
+      if (rt !== 'LISTALL') {
+        Logger.log(`Report type after first set was ${rt}, re-applying LISTALL`);
+        setReportTypeListAll_(cfg.rescueBase, cookie);
+      }
+    } catch (e) {
+      Logger.log('getReportType check failed (non-fatal): ' + e.toString());
+    }
     setOutputXMLOrFallback_(cfg.rescueBase, cookie);
     setDelimiter_(cfg.rescueBase, cookie, '|');
     // Extract date strings (YYYY-MM-DD) for API date setting
@@ -763,6 +775,8 @@ function ingestTimeRangeToSheets_(startTimestamp, endTimestamp, cfg, clearExisti
     
     Logger.log(`Setting API date range: ${startDateIso} to ${endDateIso}`);
     setReportDate_(cfg.rescueBase, cookie, startDateIso, endDateIso);
+    // Some environments reset report type after date/time changes: re-assert LISTALL
+    setReportTypeListAll_(cfg.rescueBase, cookie);
     
     // For same-day pulls, set time range to 00:00:00 to 23:59:59
     if (startDateIso === endDateIso) {
@@ -774,6 +788,16 @@ function ingestTimeRangeToSheets_(startTimestamp, endTimestamp, cfg, clearExisti
       // For multi-day ranges, use full day for each day
       Logger.log(`Setting time range for multi-day: 00:00:00 to 23:59:59`);
       setReportTimeAllDay_(cfg.rescueBase, cookie);
+    }
+    // Verify report type again before querying
+    try {
+      const rt2 = getReportType_(cfg.rescueBase, cookie);
+      if (rt2 !== 'LISTALL') {
+        Logger.log(`Report type before query was ${rt2}, re-applying LISTALL`);
+        setReportTypeListAll_(cfg.rescueBase, cookie);
+      }
+    } catch (e) {
+      Logger.log('getReportType pre-query check failed (non-fatal): ' + e.toString());
     }
     let allMappedRows = [];
     for (const nr of noderefs) {
@@ -791,32 +815,8 @@ function ingestTimeRangeToSheets_(startTimestamp, endTimestamp, cfg, clearExisti
           
           Logger.log(`Filtering sessions: date range=${startDateStr} to ${endDateStr} (strict: only dates within this range)`);
           
-          const mapped = parsed.map(mapRow_).filter(r => {
-            if (!r || !r.session_id) return false;
-            
-            // Use start_time for date filtering (LogMeIn returns sessions by start date)
-            const rowStartTime = r.start_time ? new Date(r.start_time) : null;
-            if (!rowStartTime || isNaN(rowStartTime.getTime())) {
-              Logger.log(`Session ${r.session_id} has invalid start_time: ${r.start_time}`);
-              return false;
-            }
-            
-            // Convert row timestamp to date string (YYYY-MM-DD) for comparison
-            // The API returns timestamps, we need to extract just the date part
-            // Use UTC date to match the ISO date string format
-            const rowDateStr = rowStartTime.toISOString().split('T')[0];
-            
-            // Strict date filtering: only include if session started on exact date within range
-            // This ensures "Last Month" (October) only includes sessions from 10/01 to 10/31, not 11/01 or 11/02
-            const isInRange = rowDateStr >= startDateStr && rowDateStr <= endDateStr;
-            
-            if (!isInRange && parsed.length < 100) {
-              // Only log if we have a small number of rows (to avoid spam)
-              Logger.log(`Filtering out session ${r.session_id}: rowDate=${rowDateStr} is outside range ${startDateStr} to ${endDateStr}`);
-            }
-            
-            return isInRange;
-          });
+          // Trust the API date/time scope (we set date+time range above) to avoid timezone edge cases
+          const mapped = parsed.map(mapRow_).filter(r => r && r.session_id);
           
           Logger.log(`After filtering: ${mapped.length} sessions match date range ${startDateStr} to ${endDateStr} (from ${parsed.length} total parsed rows)`);
           if (!mapped.length) {
