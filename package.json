@@ -12,6 +12,8 @@
     "vite": "^5.2.0"
   },
   "dependencies": {
+    "-": "^0.0.1",
+    "@google/clasp": "^3.1.1",
     "bootstrap": "^5.1.1"
   },
   "engines": {
