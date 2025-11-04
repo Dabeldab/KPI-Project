@@ -420,43 +420,53 @@ function getOrCreateSessionsSheet_(ss) {
     sh = ss.insertSheet(SHEETS_SESSIONS_TABLE);
   }
   
-  // Always ensure headers exist and are correct (fixes issue where first column shows date)
-  // Column remapping: session_id→technician_id, session_type→session_id, session_status→session_type,
-  // technician_email→platform, technician_group→technician_email, customer_name→session_status,
-  // device_id→ip_address, browser→technician_group, company_name→customer_phone_number,
-  // caller_phone→customer_name, technician_id→applicationid
+  // Headers matching LogMeIn Rescue API field names from mapRow_ function
+  // Order: Session info, Technician info, Customer info, Network info, Timestamps, Durations, Other
   const headers = [
-    'technician_id', 'session_id', 'session_type', 'applicationid', 'technician_name',
-    'platform', 'technician_email', 'session_status', 'customer_email',
-    'tracking_id', 'ip_address', 'ip_address', 'platform', 'technician_group', 'host',
+    'session_id', 'session_type', 'session_status',
+    'technician_id', 'technician_name', 'technician_email', 'technician_group',
+    'customer_name', 'customer_email',
+    'tracking_id', 'ip_address', 'device_id', 'platform', 'browser', 'host',
     'start_time', 'end_time', 'last_action_time',
     'duration_active_seconds', 'duration_work_seconds', 'duration_total_seconds',
-    'pickup_seconds', 'channel_id', 'channel_name', 'customer_phone_number', 'session_status',
-    'customer_name', 'resolved_unresolved', 'calling_card', 'browser_type',
-    'connecting_time', 'waiting_time', 'total_time', 'active_time',
-    'work_time', 'hold_time', 'time_in_transfer', 'reconnecting_time',
-    'rebooting_time', 'ingested_at'
+    'pickup_seconds', 'channel_id', 'channel_name',
+    'company_name', 'caller_name', 'caller_phone',
+    'resolved_unresolved', 'calling_card', 'browser_type',
+    'connecting_time', 'waiting_time', 'total_time', 'active_time', 'work_time',
+    'hold_time', 'time_in_transfer', 'reconnecting_time', 'rebooting_time',
+    'ingested_at'
   ];
   
   // Check if header row exists and is correct
   const headerRange = sh.getRange(1, 1, 1, headers.length);
   const existingHeaders = headerRange.getValues()[0];
   const needsHeaderUpdate = !existingHeaders || existingHeaders.length !== headers.length || 
-                           !existingHeaders[0] || existingHeaders[0] !== 'technician_id';
+                           !existingHeaders[0] || existingHeaders[0] !== 'session_id';
   
   if (needsHeaderUpdate) {
-    // Clear and set headers
+    // Clear and set headers with improved styling
     headerRange.clear();
     headerRange.setValues([headers]);
-    headerRange.setFontWeight('bold');
+    headerRange.setFontWeight('bold')
+      .setBackground('#1A73E8')
+      .setFontColor('#FFFFFF')
+      .setHorizontalAlignment('left')
+      .setVerticalAlignment('middle');
     sh.setFrozenRows(1);
     Logger.log('Updated Sessions sheet headers');
   }
   
-  sh.setColumnWidth(1, 150);
-  sh.setColumnWidth(16, 180);
-  sh.setColumnWidth(17, 180);
-  sh.setColumnWidth(18, 180);
+  // Set column widths for better readability
+  sh.setColumnWidth(1, 120);  // session_id
+  sh.setColumnWidth(4, 100);  // technician_id
+  sh.setColumnWidth(5, 150);  // technician_name
+  sh.setColumnWidth(6, 180);  // technician_email
+  sh.setColumnWidth(8, 150);  // customer_name
+  sh.setColumnWidth(9, 180);  // customer_email
+  sh.setColumnWidth(16, 180);  // start_time
+  sh.setColumnWidth(17, 180); // end_time
+  sh.setColumnWidth(18, 180); // last_action_time
+  sh.setColumnWidth(39, 180); // ingested_at
   
   return sh;
 }
@@ -479,11 +489,11 @@ function writeRowsToSheets_(ss, rows, clearExisting = false) {
   const existingIds = new Set();
   const dataRange = sh.getDataRange();
   if (dataRange.getNumRows() > 1) {
-    // Column 1 is now technician_id (was session_id), but we still dedupe by session_id (now in column 2)
-    const existing = sh.getRange(2, 2, dataRange.getNumRows() - 1, 1).getValues();
+    // Column 1 is session_id - dedupe by session_id
+    const existing = sh.getRange(2, 1, dataRange.getNumRows() - 1, 1).getValues();
     existing.forEach(r => { if (r[0]) existingIds.add(String(r[0])); });
   }
-  // Filter by session_id (now in column 2, but still use r.session_id from mapRow_)
+  // Filter by session_id
   const toInsert = rows.filter(r => r && r.session_id && !existingIds.has(String(r.session_id)));
   if (!toInsert.length) return 0;
   
@@ -497,47 +507,45 @@ function writeRowsToSheets_(ss, rows, clearExisting = false) {
     }
   };
   
-  // Map data to new column positions according to remapping:
-  // Col 1: technician_id (was session_id position, contains technician_id data)
-  // Col 2: session_id (was session_type position, contains session_id data)
-  // Col 3: session_type (was session_status position, contains session_type data)
-  // Col 4: applicationid (was technician_id position, contains technician_id data for now)
-  // Col 5: technician_name, Col 6: platform (was technician_email, contains platform data)
-  // Col 7: technician_email (was technician_group, contains technician_email data)
-  // Col 8: session_status (was customer_name, contains session_status data)
-  // Col 9: customer_email, Col 10: tracking_id, Col 11: ip_address,
-  // Col 12: ip_address (was device_id, contains ip_address data again)
-  // Col 13: platform (duplicate), Col 14: technician_group (was browser, contains technician_group data)
-  // Col 15: host, Col 16-18: timestamps, Col 19-21: durations,
-  // Col 22: pickup_seconds, Col 23-24: channel info,
-  // Col 25: customer_phone_number (was company_name, contains caller_phone data)
-  // Col 26: session_status (was caller_name, contains session_status data again)
-  // Col 27: customer_name (was caller_phone, contains customer_name/caller_name data)
-  // Col 28+: rest
+  // Map data to column order matching headers exactly:
+  // session_id, session_type, session_status,
+  // technician_id, technician_name, technician_email, technician_group,
+  // customer_name, customer_email,
+  // tracking_id, ip_address, device_id, platform, browser, host,
+  // start_time, end_time, last_action_time,
+  // duration_active_seconds, duration_work_seconds, duration_total_seconds,
+  // pickup_seconds, channel_id, channel_name,
+  // company_name, caller_name, caller_phone,
+  // resolved_unresolved, calling_card, browser_type,
+  // connecting_time, waiting_time, total_time, active_time, work_time,
+  // hold_time, time_in_transfer, reconnecting_time, rebooting_time,
+  // ingested_at
   const values = toInsert.map(r => [
-    r.technician_id, r.session_id, r.session_type, r.technician_id, r.technician_name,
-    r.platform, r.technician_email, r.session_status, r.customer_email,
-    r.tracking_id, r.ip_address, r.ip_address, r.platform, r.technician_group, r.host,
+    r.session_id, r.session_type, r.session_status,
+    r.technician_id, r.technician_name, r.technician_email, r.technician_group,
+    (r.customer_name || r.caller_name), r.customer_email,
+    r.tracking_id, r.ip_address, r.device_id, r.platform, r.browser, r.host,
     toDate(r.start_time), toDate(r.end_time), toDate(r.last_action_time),
     r.duration_active_seconds, r.duration_work_seconds, r.duration_total_seconds,
-    r.pickup_seconds, r.channel_id, r.channel_name, r.caller_phone, r.session_status,
-    r.customer_name || r.caller_name, r.resolved_unresolved, r.calling_card, r.browser_type,
-    r.connecting_time, r.waiting_time, r.total_time, r.active_time,
-    r.work_time, r.hold_time, r.time_in_transfer, r.reconnecting_time,
-    r.rebooting_time, toDate(r.ingested_at)
+    r.pickup_seconds, r.channel_id, r.channel_name,
+    r.company_name, r.caller_name, r.caller_phone,
+    r.resolved_unresolved, r.calling_card, r.browser_type,
+    r.connecting_time, r.waiting_time, r.total_time, r.active_time, r.work_time,
+    r.hold_time, r.time_in_transfer, r.reconnecting_time, r.rebooting_time,
+    toDate(r.ingested_at)
   ]);
   
   const newRowStart = sh.getLastRow() + 1;
   sh.getRange(newRowStart, 1, values.length, values[0].length).setValues(values);
   
-  // Set date format for timestamp columns (columns 16, 17, 18, and 38)
-  // start_time (col 16), end_time (col 17), last_action_time (col 18), ingested_at (col 38)
+  // Set date format for timestamp columns (columns 16, 17, 18, and 39)
+  // start_time (col 16), end_time (col 17), last_action_time (col 18), ingested_at (col 39)
   const dateFormat = 'mm/dd/yyyy hh:mm:ss AM/PM';
   if (values.length > 0) {
     sh.getRange(newRowStart, 16, values.length, 1).setNumberFormat(dateFormat); // start_time
     sh.getRange(newRowStart, 17, values.length, 1).setNumberFormat(dateFormat); // end_time
     sh.getRange(newRowStart, 18, values.length, 1).setNumberFormat(dateFormat); // last_action_time
-    sh.getRange(newRowStart, 38, values.length, 1).setNumberFormat(dateFormat); // ingested_at
+    sh.getRange(newRowStart, 39, values.length, 1).setNumberFormat(dateFormat); // ingested_at
   }
   
   return toInsert.length;
@@ -2068,14 +2076,14 @@ function createMainAnalyticsPage_(ss) {
   sh.getRange(2, 5).setValue(new Date().toLocaleString());
   const kpiRow = 4;
   const kpiCards = [
-    ['Total Sessions', '=COUNTA(Sessions!B2:B)'], // Column B is now session_id (was A)
-    ['Active Sessions', '=COUNTIFS(Sessions!H2:H, "Active")'], // Column H is now session_status (was C)
+    ['Total Sessions', '=COUNTA(Sessions!A2:A)'], // Column A is session_id
+    ['Active Sessions', '=COUNTIFS(Sessions!C2:C, "Active")'], // Column C is session_status
     ['Nova Wave Sessions', ''], // Will be calculated dynamically in refreshAnalyticsDashboard_ based on time frame
-    ['Avg Duration', '=IF(COUNT(Sessions!U2:U)>0, ROUND(AVERAGE(Sessions!U2:U)/60, 1)&" min", "0 min")'],
-    ['Avg Pickup Time', '=IF(COUNT(Sessions!V2:V)>0, ROUND(AVERAGE(Sessions!V2:V))&" sec", "0 sec")'],
+    ['Avg Duration', '=IF(COUNT(Sessions!U2:U)>0, ROUND(AVERAGE(Sessions!U2:U)/60, 1)&" min", "0 min")'], // Column U is duration_total_seconds
+    ['Avg Pickup Time', '=IF(COUNT(Sessions!V2:V)>0, ROUND(AVERAGE(Sessions!V2:V))&" sec", "0 sec")'], // Column V is pickup_seconds
     ['Longest Session', '=IF(MAX(Sessions!U2:U)>0, ROUND(MAX(Sessions!U2:U)/60, 1)&" min", "0 min")'],
     ['SLA Hit %', '=IF(COUNT(Sessions!V2:V)>0, TEXT(COUNTIFS(Sessions!V2:V, "<=30")/COUNT(Sessions!V2:V), "0.0%"), "0%")'],
-    ['Avg Sessions/Hour', '=IF(COUNTA(Sessions!B2:B)>0, ROUND(COUNTA(Sessions!B2:B)/8, 1), "0")'] // Column B is now session_id
+    ['Avg Sessions/Hour', '=IF(COUNTA(Sessions!A2:A)>0, ROUND(COUNTA(Sessions!A2:A)/8, 1), "0")'] // Column A is session_id
   ];
   for (let i = 0; i < kpiCards.length; i++) {
     const row = kpiRow + Math.floor(i / 3);
@@ -2170,13 +2178,13 @@ function refreshAnalyticsDashboard_(startDate, endDate) {
     const endStr = endDate.toISOString().split('T')[0];
     const startIdx = headers.indexOf('start_time');
     const techIdx = headers.indexOf('technician_name');
-    const statusIdx = headers.indexOf('session_status'); // Now in column 8 (was 3)
+    const statusIdx = headers.indexOf('session_status'); // Column 3
     const durationIdx = headers.indexOf('duration_total_seconds');
     const pickupIdx = headers.indexOf('pickup_seconds');
     const workIdx = headers.indexOf('duration_work_seconds');
-    const customerIdx = headers.indexOf('customer_name'); // Now in column 27 (was 8)
+    const customerIdx = headers.indexOf('customer_name'); // Column 8
     const channelIdx = headers.indexOf('channel_name');
-    const sessionIdIdx = headers.indexOf('session_id'); // Now in column 2 (was 1)
+    const sessionIdIdx = headers.indexOf('session_id'); // Column 1
     const callingCardIdx = headers.indexOf('calling_card'); // Define once at the top
     const filtered = allData.filter(row => {
       if (!row[startIdx]) return false;
@@ -2446,11 +2454,11 @@ function generateTechnicianTabs_(startDate, endDate) {
     const durationIdx = headers.indexOf('duration_total_seconds');
     const pickupIdx = headers.indexOf('pickup_seconds');
     const workIdx = headers.indexOf('duration_work_seconds');
-    const customerIdx = headers.indexOf('customer_name'); // Now in column 27 (was 8)
-    const sessionIdIdx = headers.indexOf('session_id'); // Now in column 2 (was 1)
-    const phoneIdx = headers.indexOf('customer_phone_number'); // Now customer_phone_number (was company_name/column 24)
-    const companyIdx = headers.indexOf('customer_phone_number'); // Use phoneIdx for this
-    const callingCardIdx = headers.indexOf('calling_card'); // Define once at the top of function
+    const customerIdx = headers.indexOf('customer_name'); // Column 8
+    const sessionIdIdx = headers.indexOf('session_id'); // Column 1
+    const phoneIdx = headers.indexOf('caller_phone'); // Column 26
+    const companyIdx = headers.indexOf('company_name'); // Column 24
+    const callingCardIdx = headers.indexOf('calling_card'); // Column 28
     const filtered = allData.filter(row => {
       if (!row || !row[startIdx] || !row[techIdx]) return false;
       try {
@@ -2519,18 +2527,13 @@ function generateTechnicianTabs_(startDate, endDate) {
       const detailRow = kpiRow + Math.ceil(kpis.length / 2) + 2;
       techSheet.getRange(detailRow, 1).setValue('Session Details');
       techSheet.getRange(detailRow, 1).setFontSize(14).setFontWeight('bold');
-      // Updated column order: Date, Session ID, Status, Customer Name, Phone Number, Duration, Pickup
-      // Column 3: Status (was Customer Name position)
-      // Column 4: Customer Name (was Phone Number position)
-      // Column 5: Phone Number (was Company Name position)
-      // Removed old Status column (was column 8)
+      // Column order: Date, Session ID, Status, Customer Name, Phone Number, Duration, Pickup
       const detailHeaders = ['Date', 'Session ID', 'Status', 'Customer Name', 'Phone Number', 'Duration (hh:mm)', 'Pickup (sec)'];
       techSheet.getRange(detailRow + 1, 1, 1, detailHeaders.length).setValues([detailHeaders]);
       techSheet.getRange(detailRow + 1, 1, 1, detailHeaders.length).setFontWeight('bold').setBackground('#9C27B0').setFontColor('#FFFFFF');
       
       // Get resolved_unresolved index for status information
       const resolvedIdx = headers.indexOf('resolved_unresolved');
-      const callerNameIdx = headers.indexOf('customer_name'); // customer_name is now in column 27 (was caller_phone)
       // callingCardIdx already defined above
       
       // Format duration from seconds to hh:mm
@@ -2573,10 +2576,10 @@ function generateTechnicianTabs_(startDate, endDate) {
             .trim();
         }
         
-        // Customer name is now in column 27 (was caller_phone position)
+        // Customer name from column 8
         const customerName = row[customerIdx] || 'Anonymous';
         
-        // Phone number from customer_phone_number (was company_name, now in column 25)
+        // Phone number from caller_phone (column 26)
         const phoneNumber = row[phoneIdx] || '';
         
         // Duration in hh:mm format
