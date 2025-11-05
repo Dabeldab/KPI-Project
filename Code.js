@@ -33,6 +33,7 @@ function onOpen() {
     .addSeparator()
     .addItem('🚀 Analytics Dashboard', 'createAnalyticsDashboard')
     .addItem('🔄 Refresh Dashboard (Pull from API)', 'refreshDashboardFromAPI')
+    .addItem('🧭 Migrate Sessions Headers (Official)', 'migrateSessionsHeaders')
     .addSeparator()
     .addItem('📈 Advanced Analytics Dashboard', 'createAdvancedAnalyticsDashboard')
     .addToUi();
@@ -359,6 +360,17 @@ function fetchDigiumCallReports_(startDate, endDate, options) {
 
   if (!r.ok) return { ok: false, error: r.error || r.raw };
 
+  // Helper: parse Digium numeric fields. Accept plain numbers or HH:MM:SS; return seconds (raw).
+  const parseDigiumNum = (txt) => {
+    if (txt == null) return 0;
+    const s = String(txt).trim();
+    if (!s) return 0;
+    // HH:MM:SS
+    if (/^\d{1,2}:\d{2}:\d{2}$/.test(s)) return parseDurationSeconds_(s);
+    const n = Number(s);
+    return isNaN(n) ? 0 : n;
+  };
+
   // Try to parse per-day results. Best-effort: look for <day date="YYYY-MM-DD">...</day>
   try {
     const doc = r.xml;
@@ -398,8 +410,8 @@ function fetchDigiumCallReports_(startDate, endDate, options) {
           const child = dayEl.getChild(f);
           if (child) {
             const txt = (child.getText() || '').trim();
-            const num = Number(txt || 0);
-            if (!isNaN(num)) fieldMap[dateKey][f] = num;
+            const num = parseDigiumNum(txt);
+            fieldMap[dateKey][f] = num;
           }
         });
       });
@@ -422,8 +434,8 @@ function fetchDigiumCallReports_(startDate, endDate, options) {
           fields.forEach(f => {
             const a = rowEl.getAttribute(f);
             if (a) {
-              const num = Number(a.getValue());
-              fieldMap[dateKey][f] = isNaN(num) ? 0 : num;
+              const num = parseDigiumNum(a.getValue());
+              fieldMap[dateKey][f] = num;
             }
           });
         });
@@ -437,7 +449,7 @@ function fetchDigiumCallReports_(startDate, endDate, options) {
           fields.forEach(f => { single[f] = 0; });
           rowsEl.getAttributes().forEach(attr => {
             const name = attr.getName();
-            const val = Number(attr.getValue()) || 0;
+            const val = parseDigiumNum(attr.getValue());
             if (fields.indexOf(name) >= 0) single[name] = val;
           });
           // Return single-column wide data labeled with the range
@@ -567,39 +579,8 @@ function formatAllDurationColumns() {
       }
     } catch (e) { Logger.log('formatAllDurationColumns sessions formatting failed: ' + e.toString()); }
 
-    // Support_Data: look for Digium table at row 18, col H (8)
-    try {
-      const support = ss.getSheetByName('Support_Data');
-      if (support) {
-        const res = convertSecondsToDayFractionForTableAt_(support, 18, 8);
-        Logger.log('Support_Data Digium table conversion: ' + JSON.stringify(res));
-      }
-    } catch (e) { Logger.log('formatAllDurationColumns Support_Data failed: ' + e.toString()); }
-
-    // Digium_Calls sheet: header at row 1, metric column at col 1
-    try {
-      const digs = ss.getSheetByName('Digium_Calls');
-      if (digs) {
-        const res2 = convertSecondsToDayFractionForTableAt_(digs, 1, 1);
-        Logger.log('Digium_Calls conversion: ' + JSON.stringify(res2));
-      }
-    } catch (e) { Logger.log('formatAllDurationColumns Digium_Calls failed: ' + e.toString()); }
-
-    // Technician tabs: many generator sheets place Digium wide table at row 18, col H — scan all sheets and convert where found
-    try {
-      const all = ss.getSheets();
-      all.forEach(sh => {
-        try {
-          const name = sh.getName();
-          if (name === 'Support_Data' || name === 'Digium_Calls' || name === SHEETS_SESSIONS_TABLE) return;
-          const cell = sh.getRange(18, 8).getValue();
-          if (cell && String(cell).toLowerCase().indexOf('metric') >= 0) {
-            const r = convertSecondsToDayFractionForTableAt_(sh, 18, 8);
-            Logger.log('Converted Digium table on sheet ' + name + ': ' + JSON.stringify(r));
-          }
-        } catch (e) { /* ignore missing cells or permissions */ }
-      });
-    } catch (e) { Logger.log('formatAllDurationColumns technician conversion failed: ' + e.toString()); }
+    // Per request: keep Digium data raw (seconds/counts). Do NOT auto-convert Digium tables here.
+    // If time-formatting is desired in the future, do it in a read-only presentation layer referencing raw cells.
 
     SpreadsheetApp.getActive().toast('Duration formatting applied across sheets');
   } catch (e) {
@@ -1027,9 +1008,14 @@ function mapRow_(rec) {
     tracking_id: g(rec, ['Tracking ID'], ''),
     ip_address: g(rec, ['Customer IP'], ''),
     device_id: g(rec, ['Device ID'], ''),
-    platform: g(rec, ['Platform'], ''),
+  platform: g(rec, ['Platform'], ''),
     browser: g(rec, ['Browser Type'], ''),
     host: g(rec, ['Host Name'], ''),
+  // Additional fields present in LISTALL headers
+  location_name: g(rec, ['Location Name:','Location Name'], ''),
+  custom_field_4: g(rec, ['Custom field 4','Custom Field 4'], ''),
+  custom_field_5: g(rec, ['Custom field 5','Custom Field 5'], ''),
+  incident_tools_used: g(rec, ['Incident Tools Used'], ''),
     start_time: toTs(g(rec, ['Start Time'], '')),
     end_time: toTs(g(rec, ['End Time'], '')),
     last_action_time: toTs(g(rec, ['Last Action Time'], '')),
@@ -1108,20 +1094,18 @@ function getOrCreateSessionsSheet_(ss) {
     sh = ss.insertSheet(SHEETS_SESSIONS_TABLE);
   }
   
-  // Headers matching LogMeIn Rescue API field names from mapRow_ function
-  // Order: Session info, Technician info, Customer info, Network info, Timestamps, Durations, Other
+  // Use the exact column titles from LogMeIn Rescue API (Report Area: Session, Type: LISTALL)
+  // This ensures we store raw data exactly as returned to avoid mixed-column issues.
   const headers = [
-    'technician_id', 'session_id', 'session_status',
-    'group_name', 'technician_name', 'platform', 'technician_email',
-    'session_status', 'tracking_id',
-    'tracking_id', 'custom_column', 'ip_address', 'reconnecting_time', 'technician_group', 'host',
-    'start_time', 'end_time', 'last_action_time',
-    'duration_active_seconds', 'duration_work_seconds', 'duration_total_seconds',
-    'connecting_time', 'channel_idx', 'channel_id',
-    'company_name', 'caller_name', 'caller_phone',
-    'incident_tools_used', 'calling_card', 'technician_group',
-    'connecting_timex', 'connecting_time', 'waiting_time', 'work_time', 'work_time',
-    'active_time', 'time_in_transfer', 'reconnecting_time', 'rebooting_time',
+    'Start Time','End Time','Last Action Time',
+    'Technician Name','Technician ID','Technician Email','Technician Group',
+    'Session ID','Session Type','Status',
+    'Your Name:','Your Phone #:','Company name:','Location Name:',
+    'Custom field 4','Custom field 5','Tracking ID','Customer IP','Device ID','Incident Tools Used',
+    'Resolved Unresolved','Channel ID','Channel Name','Calling Card',
+    'Connecting Time','Waiting Time','Total Time','Active Time','Work Time','Hold Time','Time in Transfer','Rebooting Time','Reconnecting Time',
+    'Platform','Browser Type','Host Name',
+    // Additional internal field for ingestion timestamp
     'ingested_at'
   ];
   
@@ -1129,7 +1113,7 @@ function getOrCreateSessionsSheet_(ss) {
   const headerRange = sh.getRange(1, 1, 1, headers.length);
   const existingHeaders = headerRange.getValues()[0];
   const needsHeaderUpdate = !existingHeaders || existingHeaders.length !== headers.length || 
-                           !existingHeaders[0] || existingHeaders[0] !== 'session_id';
+                           !existingHeaders[0] || existingHeaders[0] !== 'Start Time';
   
   if (needsHeaderUpdate) {
     // Clear and set headers with improved styling
@@ -1145,33 +1129,127 @@ function getOrCreateSessionsSheet_(ss) {
   }
   
   // Set column widths for better readability
-  sh.setColumnWidth(1, 120);  // session_id
-  sh.setColumnWidth(4, 100);  // technician_id
-  sh.setColumnWidth(5, 150);  // technician_name
-  sh.setColumnWidth(6, 180);  // technician_email
-  sh.setColumnWidth(8, 150);  // customer_name
-  sh.setColumnWidth(9, 180);  // customer_email
-  sh.setColumnWidth(16, 180);  // start_time
-  sh.setColumnWidth(17, 180); // end_time
-  sh.setColumnWidth(18, 180); // last_action_time
-  sh.setColumnWidth(39, 180); // ingested_at
+  // Set key column widths for readability
+  sh.setColumnWidth(1, 160);  // Start Time
+  sh.setColumnWidth(2, 160);  // End Time
+  sh.setColumnWidth(3, 160);  // Last Action Time
+  sh.setColumnWidth(4, 180);  // Technician Name
+  sh.setColumnWidth(6, 200);  // Technician Email
+  sh.setColumnWidth(9, 160);  // Session Type
+  sh.setColumnWidth(11, 160); // Your Phone #:
+  sh.setColumnWidth(13, 180); // Company name:
+  sh.setColumnWidth(23, 160); // Channel Name
+  sh.setColumnWidth(headers.length, 180); // ingested_at
   
   // Apply consistent styling
   try { applyProfessionalTableStyling_(sh, headers.length); } catch (e) { Logger.log('Styling sessions sheet failed: ' + e.toString()); }
 
-  // Hide duplicate duration columns that duplicate other time fields
-  try {
-    const hdrs = headers.map(h => String(h||'').toLowerCase());
-    const duplicates = ['duration_active_seconds','duration_work_seconds','duration_total_seconds'];
-    duplicates.forEach(d => {
-      const i = hdrs.indexOf(d);
-      if (i >= 0) {
-        try { sh.hideColumns(i+1); } catch(e) {}
-      }
-    });
-  } catch(e) { Logger.log('Failed to hide duplicate duration columns: ' + e.toString()); }
+  // No duplicate columns in the official header set
 
   return sh;
+}
+
+// Migrate existing Sessions sheet to official LISTALL headers with correct column mapping.
+// Keeps raw values; attempts to map from prior normalized headers and synonyms.
+function migrateSessionsSheetToOfficial_() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
+  if (!sh) { SpreadsheetApp.getActive().toast('Sessions sheet not found'); return false; }
+
+  // Official header order (same as getOrCreateSessionsSheet_)
+  const official = [
+    'Start Time','End Time','Last Action Time','Technician Name','Technician ID','Technician Email','Technician Group',
+    'Session ID','Session Type','Status','Your Name:','Your Phone #:','Company name:','Location Name:',
+    'Custom field 4','Custom field 5','Tracking ID','Customer IP','Device ID','Incident Tools Used',
+    'Resolved Unresolved','Channel ID','Channel Name','Calling Card',
+    'Connecting Time','Waiting Time','Total Time','Active Time','Work Time','Hold Time','Time in Transfer','Rebooting Time','Reconnecting Time',
+    'Platform','Browser Type','Host Name','ingested_at'
+  ];
+
+  // Build alias -> canonical map (canonical is close to snake_case keys)
+  const A = (k)=>k.toLowerCase().trim();
+  const alias = new Map([
+    ['Start Time',['Start Time','start_time']],
+    ['End Time',['End Time','end_time']],
+    ['Last Action Time',['Last Action Time','last_action_time']],
+    ['Technician Name',['Technician Name','technician_name','Technician']],
+    ['Technician ID',['Technician ID','technician_id']],
+    ['Technician Email',['Technician Email','technician_email']],
+    ['Technician Group',['Technician Group','technician_group','group_name']],
+    ['Session ID',['Session ID','session_id']],
+    ['Session Type',['Session Type','session_type']],
+    ['Status',['Status','session_status']],
+    ['Your Name:',['Your Name:','Your Name','Customer Name','customer_name']],
+    ['Your Phone #:',['Your Phone #:','Phone','Phone Number','Caller Phone','caller_phone','customer_phone']],
+    ['Company name:',['Company name:','Company Name','Company','company_name']],
+    ['Location Name:',['Location Name:','Location Name','location_name']],
+    ['Custom field 4',['Custom field 4','Custom Field 4','custom_field_4']],
+    ['Custom field 5',['Custom field 5','Custom Field 5','custom_field_5']],
+    ['Tracking ID',['Tracking ID','tracking_id']],
+    ['Customer IP',['Customer IP','IP Address','ip_address']],
+    ['Device ID',['Device ID','device_id']],
+    ['Incident Tools Used',['Incident Tools Used','incident_tools_used']],
+    ['Resolved Unresolved',['Resolved Unresolved','resolved_unresolved']],
+    ['Channel ID',['Channel ID','channel_id']],
+    ['Channel Name',['Channel Name','channel_name']],
+    ['Calling Card',['Calling Card','calling_card']],
+    ['Connecting Time',['Connecting Time','connecting_time']],
+    ['Waiting Time',['Waiting Time','waiting_time','pickup_seconds']],
+    ['Total Time',['Total Time','total_time','duration_total_seconds']],
+    ['Active Time',['Active Time','active_time','duration_active_seconds']],
+    ['Work Time',['Work Time','work_time','duration_work_seconds']],
+    ['Hold Time',['Hold Time','hold_time']],
+    ['Time in Transfer',['Time in Transfer','time_in_transfer']],
+    ['Rebooting Time',['Rebooting Time','rebooting_time']],
+    ['Reconnecting Time',['Reconnecting Time','reconnecting_time']],
+    ['Platform',['Platform','platform']],
+    ['Browser Type',['Browser Type','browser_type','browser']],
+    ['Host Name',['Host Name','host','host_name']],
+    ['ingested_at',['ingested_at','Ingested At']]
+  ]);
+
+  // Current header row
+  const lastCol = sh.getLastColumn();
+  const lastRow = sh.getLastRow();
+  if (lastCol === 0 || lastRow < 1) { SpreadsheetApp.getActive().toast('Sessions sheet empty'); return false; }
+  const currentHeaders = sh.getRange(1,1,1,lastCol).getValues()[0];
+  const currentMap = new Map();
+  currentHeaders.forEach((h, i) => { if (h != null && String(h).trim()) currentMap.set(A(String(h)), i); });
+
+  // Resolve mapping: for each official header, find source column index
+  const resolveIndex = (header) => {
+    const alts = alias.get(header) || [header];
+    for (const alt of alts) {
+      const idx = currentMap.get(A(alt));
+      if (typeof idx === 'number') return idx;
+    }
+    return -1;
+  };
+
+  // Read all data rows
+  const dataRows = lastRow > 1 ? sh.getRange(2,1,lastRow-1,lastCol).getValues() : [];
+
+  // Build new table with official headers
+  const newHeaders = official.slice();
+  const newValues = dataRows.map(row => {
+    return newHeaders.map(h => {
+      const srcIdx = resolveIndex(h);
+      return (srcIdx >= 0 && srcIdx < row.length) ? row[srcIdx] : '';
+    });
+  });
+
+  // Replace sheet contents
+  sh.clear();
+  sh.getRange(1,1,1,newHeaders.length).setValues([newHeaders]);
+  if (newValues.length) sh.getRange(2,1,newValues.length,newHeaders.length).setValues(newValues);
+  try { applyProfessionalTableStyling_(sh, newHeaders.length); } catch (e) {}
+  SpreadsheetApp.getActive().toast(`Sessions migrated to official headers (${newHeaders.length} columns)`);
+  return true;
+}
+
+// Public wrapper for menu/run list
+function migrateSessionsHeaders() {
+  try { migrateSessionsSheetToOfficial_(); } catch (e) { SpreadsheetApp.getActive().toast('Migration failed: ' + e.toString()); }
 }
 
 // Apply consistent, professional styling to a sheet's table area.
@@ -1326,75 +1404,40 @@ function writeRowsToSheets_(ss, rows, clearExisting = false) {
     }
   };
   
-  // Map data to column order matching headers exactly:
-  // session_id, session_type, session_status,
-  // technician_id, technician_name, technician_email, technician_group,
-  // customer_name, customer_email,
-  // tracking_id, ip_address, device_id, platform, browser, host,
-  // start_time, end_time, last_action_time,
-  // duration_active_seconds, duration_work_seconds, duration_total_seconds,
-  // pickup_seconds, channel_id, channel_name,
-  // company_name, caller_name, caller_phone,
-  // resolved_unresolved, calling_card, browser_type,
-  // connecting_time, waiting_time, total_time, active_time, work_time,
-  // hold_time, time_in_transfer, reconnecting_time, rebooting_time,
-  // ingested_at
+  // Map data to the official LISTALL column order defined in getOrCreateSessionsSheet_ headers
   const values = toInsert.map(r => [
+    // Start/End/Last Action Time (keep raw API strings when STORE_RAW_SESSIONS is true)
+    (STORE_RAW_SESSIONS ? (r.start_time || '') : toDate(r.start_time)),
+    (STORE_RAW_SESSIONS ? (r.end_time || '') : toDate(r.end_time)),
+    (STORE_RAW_SESSIONS ? (r.last_action_time || '') : toDate(r.last_action_time)),
+    // Technician details
+    r.technician_name, r.technician_id, r.technician_email, r.technician_group,
+    // Session IDs and status
     r.session_id, r.session_type, r.session_status,
-    r.technician_id, r.technician_name, r.technician_email, r.technician_group,
-    (r.customer_name || r.caller_name), r.customer_email,
-    r.tracking_id, r.ip_address, r.device_id, r.platform, r.browser, r.host,
-    (typeof STORE_RAW_SESSIONS !== 'undefined' && STORE_RAW_SESSIONS) ? (r.start_time || '') : toDate(r.start_time),
-    (typeof STORE_RAW_SESSIONS !== 'undefined' && STORE_RAW_SESSIONS) ? (r.end_time || '') : toDate(r.end_time),
-    (typeof STORE_RAW_SESSIONS !== 'undefined' && STORE_RAW_SESSIONS) ? (r.last_action_time || '') : toDate(r.last_action_time),
-    // durations/pickups/work times: keep original mapped values (may be Number or ''/string)
-    r.duration_active_seconds, r.duration_work_seconds, r.duration_total_seconds,
-    r.pickup_seconds, r.channel_id, r.channel_name,
-    r.company_name, r.caller_name, r.caller_phone,
-    r.resolved_unresolved, r.calling_card, r.browser_type,
-    r.connecting_time, r.waiting_time, r.total_time, r.active_time, r.work_time,
-    r.hold_time, r.time_in_transfer, r.reconnecting_time, r.rebooting_time,
-    (typeof STORE_RAW_SESSIONS !== 'undefined' && STORE_RAW_SESSIONS) ? (r.ingested_at || '') : toDate(r.ingested_at)
+    // Customer fields
+    (r.customer_name || r.caller_name), r.caller_phone, r.company_name, r.location_name || '',
+    // Custom fields
+    r.custom_field_4 || '', r.custom_field_5 || '', r.tracking_id, r.ip_address, r.device_id, r.incident_tools_used || '',
+    // Resolution / Channel / Calling Card
+    r.resolved_unresolved, r.channel_id, r.channel_name, r.calling_card,
+    // Timings (keep original seconds or hh:mm:ss as stored by mapRow_)
+    r.connecting_time, r.waiting_time, r.total_time, r.active_time, r.work_time, r.hold_time, r.time_in_transfer, r.rebooting_time, r.reconnecting_time,
+    // Platform / Browser / Host
+    r.platform, r.browser_type || r.browser, r.host,
+    // Ingested timestamp
+    (STORE_RAW_SESSIONS ? (r.ingested_at || '') : toDate(r.ingested_at))
   ]);
   
   const newRowStart = sh.getLastRow() + 1;
-  // Transform duration-like numeric seconds into spreadsheet time fractions (days) for human-friendly display
-  // Columns indices (1-based): 19(duration_active_seconds),20(duration_work_seconds),21(duration_total_seconds),
-  // 22(pickup_seconds), 31(connecting_time),32(waiting_time),33(total_time),34(active_time),35(work_time),36(hold_time),37(time_in_transfer)
-  const durationCols = [19,20,21,22,31,32,33,34,35,36,37];
-  const displayValues = values.map(row => {
-    const newRow = row.slice();
-    durationCols.forEach(col => {
-      const ai = col - 1;
-      try {
-        const v = newRow[ai];
-        if (v != null && v !== '' && !isNaN(Number(v))) {
-          // convert seconds -> fraction of day for display
-          newRow[ai] = Number(v) / 86400;
-        }
-      } catch (e) {}
-    });
-    return newRow;
-  });
-  sh.getRange(newRowStart, 1, displayValues.length, displayValues[0].length).setValues(displayValues);
+  // Per your direction: keep raw values for timings (seconds or HH:MM:SS). Do not auto-convert to day-fractions here.
+  sh.getRange(newRowStart, 1, values.length, values[0].length).setValues(values);
   
-  // Set date format for timestamp columns (columns 16, 17, 18, and 39)
-  // start_time (col 16), end_time (col 17), last_action_time (col 18), ingested_at (col 39)
+  // Optional: if not storing raw, apply date formats to the first three columns and ingested_at
   const dateFormat = 'mm/dd/yyyy hh:mm:ss AM/PM';
   if (!STORE_RAW_SESSIONS && values.length > 0) {
-    // Only apply date formatting when we converted values to Date objects
-    sh.getRange(newRowStart, 16, values.length, 1).setNumberFormat(dateFormat); // start_time
-    sh.getRange(newRowStart, 17, values.length, 1).setNumberFormat(dateFormat); // end_time
-    sh.getRange(newRowStart, 18, values.length, 1).setNumberFormat(dateFormat); // last_action_time
-    sh.getRange(newRowStart, 39, values.length, 1).setNumberFormat(dateFormat); // ingested_at
+    sh.getRange(newRowStart, 1, values.length, 3).setNumberFormat(dateFormat); // Start/End/Last Action
+    sh.getRange(newRowStart, headers.length, values.length, 1).setNumberFormat(dateFormat); // ingested_at
   }
-  // Apply time format for duration-like columns we converted to day-fractions
-  try {
-    const durCols = [19,20,21,22,31,32,33,34,35,36,37];
-    durCols.forEach(c => {
-      try { sh.getRange(newRowStart, c, values.length, 1).setNumberFormat('hh:mm:ss'); } catch (e) {}
-    });
-  } catch (e) { Logger.log('Failed to set duration column formats: ' + e.toString()); }
   
   return toInsert.length;
 }
@@ -2212,13 +2255,21 @@ function createDailySummarySheet_(ss, startDate, endDate) {
     
     const allData = sessionsSheet.getRange(2, 1, dataRange.getNumRows() - 1, dataRange.getNumColumns()).getValues();
     const headers = sessionsSheet.getRange(1, 1, 1, dataRange.getNumColumns()).getValues()[0];
+    // Header resolver that supports both normalized keys and official API titles
+    const getHeaderIndex = (variants) => {
+      for (const v of variants) {
+        const i = headers.findIndex(h => String(h || '').toLowerCase().trim() === String(v).toLowerCase().trim());
+        if (i >= 0) return i;
+      }
+      return -1;
+    };
     
-    const startIdx = headers.indexOf('start_time');
-    const techIdx = headers.indexOf('technician_name');
-    const statusIdx = headers.indexOf('session_status');
-    const durationIdx = headers.indexOf('duration_total_seconds');
-    const workIdx = headers.indexOf('duration_work_seconds');
-    const pickupIdx = headers.indexOf('pickup_seconds');
+    const startIdx = getHeaderIndex(['start_time','Start Time']);
+    const techIdx = getHeaderIndex(['technician_name','Technician Name']);
+    const statusIdx = getHeaderIndex(['session_status','Status']);
+    const durationIdx = getHeaderIndex(['duration_total_seconds','Total Time']);
+    const workIdx = getHeaderIndex(['duration_work_seconds','Work Time']);
+    const pickupIdx = getHeaderIndex(['pickup_seconds','Waiting Time']);
     
     // Filter by date range
     const startStr = startDate.toISOString().split('T')[0];
@@ -2556,18 +2607,25 @@ function createSupportDataSheet_(ss, startDate, endDate) {
     
     const allData = sessionsSheet.getRange(2, 1, dataRange.getNumRows() - 1, dataRange.getNumColumns()).getValues();
     const headers = sessionsSheet.getRange(1, 1, 1, dataRange.getNumColumns()).getValues()[0];
+    const getHeaderIndex = (variants) => {
+      for (const v of variants) {
+        const i = headers.findIndex(h => String(h || '').toLowerCase().trim() === String(v).toLowerCase().trim());
+        if (i >= 0) return i;
+      }
+      return -1;
+    };
     
-    const startIdx = headers.indexOf('start_time');
-    const techIdx = headers.indexOf('technician_name');
-    const statusIdx = headers.indexOf('session_status');
-    const durationIdx = headers.indexOf('duration_total_seconds');
-    const workIdx = headers.indexOf('duration_work_seconds');
-    const pickupIdx = headers.indexOf('pickup_seconds');
-    const customerIdx = headers.indexOf('customer_name');
-    const sessionIdIdx = headers.indexOf('session_id');
-    const channelIdx = headers.indexOf('channel_name');
-    const resolvedIdx = headers.indexOf('resolved_unresolved');
-    const callingCardIdx = headers.indexOf('calling_card');
+    const startIdx = getHeaderIndex(['start_time','Start Time']);
+    const techIdx = getHeaderIndex(['technician_name','Technician Name']);
+    const statusIdx = getHeaderIndex(['session_status','Status']);
+    const durationIdx = getHeaderIndex(['duration_total_seconds','Total Time']);
+    const workIdx = getHeaderIndex(['duration_work_seconds','Work Time']);
+    const pickupIdx = getHeaderIndex(['pickup_seconds','Waiting Time']);
+    const customerIdx = getHeaderIndex(['customer_name','Your Name:','Customer Name']);
+    const sessionIdIdx = getHeaderIndex(['session_id','Session ID']);
+    const channelIdx = getHeaderIndex(['channel_name','Channel Name']);
+    const resolvedIdx = getHeaderIndex(['resolved_unresolved','Resolved Unresolved']);
+    const callingCardIdx = getHeaderIndex(['calling_card','Calling Card']);
     
     // Filter by date range
     const startStr = startDate.toISOString().split('T')[0];
@@ -2823,12 +2881,13 @@ function createSupportDataSheet_(ss, startDate, endDate) {
   try { applyProfessionalTableStyling_(supportSheet, wideRows[0].length); } catch (e) { Logger.log('Styling support sheet failed: ' + e.toString()); }
     
     Logger.log('Support Data sheet created');
-    // --- Insert Digium call report (wide-format) into Support_Data at row 18, column H (8)
+    // --- Insert Digium call report (wide-format) into Support_Data under Channel Performance Summary
+    // Place starting at row 25, column A as requested
     try {
       const digRes = fetchDigiumCallReports_(startDate, endDate, {});
       if (digRes && digRes.ok && digRes.dates && digRes.rows) {
-        const startCol = 8; // Column H
-        const startRow = 18;
+        const startCol = 1; // Column A
+        const startRow = 25; // Under the Channel Performance Summary (daily)
         // Build header (Metric + dates)
         const header = ['Metric'].concat(digRes.dates || []);
         supportSheet.getRange(startRow, startCol, 1, header.length).setValues([header]);
@@ -2838,8 +2897,8 @@ function createSupportDataSheet_(ss, startDate, endDate) {
         }
         // Styling
         try { supportSheet.getRange(startRow, startCol, 1, header.length).setFontWeight('bold').setBackground('#E5E7EB').setFontColor('#000000'); } catch (e) {}
-        // Number formatting: leave numbers raw (caller durations are seconds). If values look like time fractions later, formatting can be applied.
-        supportSheet.setColumnWidth(startCol, 140);
+        // Leave numbers raw (seconds/counts). No conversion here.
+        try { supportSheet.setColumnWidth(startCol, 140); } catch (e) {}
         SpreadsheetApp.flush();
       } else {
         Logger.log('No Digium parsed data available for Support_Data: ' + (digRes && (digRes.error || digRes.raw) ? (digRes.error || digRes.raw).toString().substring(0,200) : 'no response'));
@@ -3479,6 +3538,7 @@ function refreshAnalyticsDashboard_(startDate, endDate) {
 function generateTechnicianTabs_(startDate, endDate) {
   try {
     const ss = SpreadsheetApp.getActive();
+    const cfg = getCfg_();
     const sessionsSheet = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
     if (!sessionsSheet) return;
     const dataRange = sessionsSheet.getDataRange();
@@ -3486,15 +3546,20 @@ function generateTechnicianTabs_(startDate, endDate) {
     // Load extension -> technician mapping for per-account Digium pulls (sheet: extension_map)
     const extMap = getExtensionMap_();
     
-    // Get all existing technician tabs and clear them first to prevent stale data
+    // Clear existing personal dashboard tabs only (avoid wiping other sheets)
     const allSheets = ss.getSheets();
-    const reservedSheets = ['Sessions', 'Analytics_Dashboard', 'Dashboard_Config', 'Daily_Summary', 'Support_Data', 'Progress'];
+    const reservedSheets = ['Sessions', 'Analytics_Dashboard', 'Dashboard_Config', 'Daily_Summary', 'Support_Data', 'Progress', 'Advanced_Analytics', 'Digium_Raw', 'Digium_Calls', 'API_Smoke_Test'];
     const existingTechSheets = allSheets.filter(sheet => {
       const sheetName = sheet.getName();
-      return !reservedSheets.some(reserved => sheetName === reserved);
+      if (reservedSheets.indexOf(sheetName) !== -1) return false;
+      try {
+        const a1 = sheet.getRange(1, 1).getValue();
+        return typeof a1 === 'string' && a1.indexOf('Personal Dashboard') !== -1;
+      } catch (e) {
+        return false;
+      }
     });
-    
-    // Clear all existing technician tabs before regenerating
+    // Clear detected personal dashboards before regenerating
     for (const techSheet of existingTechSheets) {
       try {
         techSheet.clear();
@@ -3504,7 +3569,7 @@ function generateTechnicianTabs_(startDate, endDate) {
       }
     }
     
-    const allData = sessionsSheet.getRange(2, 1, dataRange.getNumRows() - 1, dataRange.getNumColumns()).getValues();
+  const allData = sessionsSheet.getRange(2, 1, dataRange.getNumRows() - 1, dataRange.getNumColumns()).getValues();
     const headers = sessionsSheet.getRange(1, 1, 1, dataRange.getNumColumns()).getValues()[0];
     const startStr = startDate.toISOString().split('T')[0];
     const endStr = endDate.toISOString().split('T')[0];
@@ -3515,18 +3580,18 @@ function generateTechnicianTabs_(startDate, endDate) {
       }
       return -1;
     };
-    const startIdx = getHeaderIndex(['start_time', 'start time', 'start_time_local']);
-    const techIdx = getHeaderIndex(['technician_name', 'technician', 'tech']);
-    const statusIdx = getHeaderIndex(['session_status', 'status']);
-    const durationIdx = getHeaderIndex(['duration_total_seconds', 'duration_seconds', 'duration_total']);
-    const pickupIdx = getHeaderIndex(['pickup_seconds', 'pickup_seconds_total', 'pickup']);
-  const workIdx = getHeaderIndex(['duration_work_seconds', 'work_seconds']);
-  const activeIdx = getHeaderIndex(['active_time', 'duration_active_seconds', 'active seconds', 'active']);
-    const customerIdx = getHeaderIndex(['customer_name', 'customer', 'customer_name:']); // Column 8
-    const sessionIdIdx = getHeaderIndex(['session_id', 'session id', 'id']); // Column 1
-    const phoneIdx = getHeaderIndex(['caller_phone', 'caller phone', 'phone']); // Column 26
-    const companyIdx = getHeaderIndex(['company_name', 'company']); // Column 24
-    const callingCardIdx = getHeaderIndex(['calling_card', 'calling card']); // Column 28
+    const startIdx = getHeaderIndex(['Start Time','start_time', 'start time', 'start_time_local']);
+    const techIdx = getHeaderIndex(['Technician Name','technician_name', 'technician name', 'technician', 'tech']);
+    const statusIdx = getHeaderIndex(['Status','session_status', 'status']);
+    const durationIdx = getHeaderIndex(['Total Time','total_time','duration_total_seconds', 'duration_seconds', 'duration_total']);
+    const pickupIdx = getHeaderIndex(['Waiting Time','waiting_time','pickup_seconds', 'pickup_seconds_total', 'pickup']);
+    const workIdx = getHeaderIndex(['Work Time','work_time','duration_work_seconds', 'work_seconds']);
+    const activeIdx = getHeaderIndex(['Active Time','active_time', 'duration_active_seconds', 'active seconds', 'active']);
+    const customerIdx = getHeaderIndex(['Your Name:','Customer Name','customer_name', 'customer', 'customer_name:']); // Column 8
+    const sessionIdIdx = getHeaderIndex(['Session ID','session_id', 'session id', 'id']); // Column 1
+    const phoneIdx = getHeaderIndex(['Your Phone #:','caller_phone', 'caller phone', 'phone']); // Column 26
+    const companyIdx = getHeaderIndex(['Company name:','Company Name','company_name', 'company']); // Column 24
+    const callingCardIdx = getHeaderIndex(['Calling Card','calling_card', 'calling card']); // Column 28
     const filtered = allData.filter(row => {
       if (!row || !row[startIdx] || !row[techIdx]) return false;
       try {
@@ -3536,7 +3601,9 @@ function generateTechnicianTabs_(startDate, endDate) {
         return false;
       }
     });
-    const techs = [...new Set(filtered.map(row => row[techIdx]).filter(Boolean))];
+  const techs = [...new Set(filtered.map(row => row[techIdx]).filter(Boolean))];
+  // Pull performance summary once for the whole range; used for Avg Session (API)
+  const perfByTech = fetchPerformanceSummaryData_(cfg, startDate, endDate) || {};
     for (const techName of techs) {
       const safeName = techName.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30);
       let techSheet = ss.getSheetByName(safeName);
@@ -3564,7 +3631,9 @@ function generateTechnicianTabs_(startDate, endDate) {
       const slaPct = pickups.length > 0 ? ((slaHits / pickups.length) * 100).toFixed(1) : '0';
       const days = Math.max(1, (new Date(endDate) - new Date(startDate)) / (1000*60*60*24));
       const sessionsPerHour = (techRows.length / days / 8).toFixed(1);
-      const workHours = (workSeconds / 3600).toFixed(1);
+  // Total Active Hours should reflect active time from sessions (not work time)
+  const totalActiveSeconds = activeSecondsArr.reduce((a,b)=>a+b, 0);
+  const activeHoursTotal = (totalActiveSeconds / 3600).toFixed(1);
       // Count Nova Wave sessions for this technician
       // callingCardIdx already defined above
       const novaWaveCount = callingCardIdx >= 0 ? 
@@ -3584,7 +3653,7 @@ function generateTechnicianTabs_(startDate, endDate) {
         ['Active Time', (activeSecondsArr.length > 0 ? Math.round(activeSecondsArr.reduce((a,b)=>a+b,0) / activeSecondsArr.length) : 0) / 86400],
         ['Avg Pickup Time', avgPickupSeconds / 86400],
         ['SLA Hit %', slaPct + '%'],
-        ['Total Work Hours', workHours + ' hrs'],
+        ['Total Active Hours', activeHoursTotal + ' hrs'],
         ['Sessions/Hour', sessionsPerHour]
       ];
       for (let i = 0; i < kpis.length; i++) {
@@ -3617,8 +3686,8 @@ function generateTechnicianTabs_(startDate, endDate) {
       }
       const headerRow = ['Metric', ...dates, 'Totals/Averages'];
       const totalSessionsRow = ['Total sessions'];
-      const totalWorkRow = ['Total Work Time'];
-      const avgSessionRow = ['Avg Session'];
+  const totalWorkRow = ['Total Active Time'];
+  const avgSessionRow = ['Avg Session (API)'];
       const avgPickupRow = ['Avg Pick-up Speed'];
       let totalSessionsAll = 0;
       let totalWorkAll = 0;
@@ -3627,13 +3696,14 @@ function generateTechnicianTabs_(startDate, endDate) {
       let totalPickupSeconds = 0;
       let totalPickupCount = 0;
       const dailyMap = {};
-      dates.forEach(d => { dailyMap[d] = { sessions: [], totalWorkSeconds: 0 }; });
+      dates.forEach(d => { dailyMap[d] = { sessions: [], totalActiveSeconds: 0 }; });
       techRows.forEach(r => {
         try {
           const d = new Date(r[startIdx]).toISOString().split('T')[0];
-          if (!dailyMap[d]) dailyMap[d] = { sessions: [], totalWorkSeconds: 0 };
+          if (!dailyMap[d]) dailyMap[d] = { sessions: [], totalActiveSeconds: 0 };
           dailyMap[d].sessions.push(r);
-          dailyMap[d].totalWorkSeconds += parseDurationSeconds_(r[workIdx] || 0);
+          // Sum ACTIVE time for daily totals
+          dailyMap[d].totalActiveSeconds += parseDurationSeconds_(r[activeIdx] || 0);
         } catch (e) { }
       });
       dates.forEach(d => {
@@ -3641,10 +3711,17 @@ function generateTechnicianTabs_(startDate, endDate) {
         const count = data && data.sessions ? data.sessions.length : 0;
         totalSessionsRow.push(count);
         totalSessionsAll += count;
-        const secs = data && data.totalWorkSeconds ? data.totalWorkSeconds : 0;
+        const secs = data && data.totalActiveSeconds ? data.totalActiveSeconds : 0;
         totalWorkRow.push(secs / 86400);
         totalWorkAll += secs;
-        if (data && data.sessions.length > 0) {
+        // For Avg Session, prefer API performance average for this technician
+        const perf = perfByTech[techName] || perfByTech[String(techName).trim()] || null;
+        if (perf && perf.avgDuration) {
+          const avg = Number(perf.avgDuration) || 0;
+          avgSessionRow.push(avg / 86400);
+          totalAvgSeconds += avg;
+          daysWithData++;
+        } else if (data && data.sessions.length > 0) {
           const durations = data.sessions.map(s => parseDurationSeconds_(s[durationIdx] || 0)).filter(Boolean);
           if (durations.length > 0) {
             const avg = durations.reduce((a,b)=>a+b,0) / durations.length;
@@ -3654,6 +3731,11 @@ function generateTechnicianTabs_(startDate, endDate) {
           } else {
             avgSessionRow.push(0);
           }
+        } else {
+          avgSessionRow.push(0);
+        }
+
+        if (data && data.sessions.length > 0) {
           const pickups = data.sessions.map(s => parseDurationSeconds_(s[pickupIdx] || 0)).filter(p=>p>0);
           if (pickups.length > 0) {
             const avgp = pickups.reduce((a,b)=>a+b,0) / pickups.length;
@@ -3664,7 +3746,6 @@ function generateTechnicianTabs_(startDate, endDate) {
             avgPickupRow.push(0);
           }
         } else {
-          avgSessionRow.push(0);
           avgPickupRow.push(0);
         }
       });
@@ -3702,7 +3783,7 @@ function generateTechnicianTabs_(startDate, endDate) {
 
       // Resolve indices that might exist for fallback lookups
       const resolvedIdx = headers.indexOf('resolved_unresolved');
-      const callerNameIdx = getHeaderIndex(['caller_name', 'caller name', 'caller', 'Caller Name']);
+  const callerNameIdx = getHeaderIndex(['Your Name:','caller_name', 'caller name', 'caller', 'Caller Name', 'Customer Name']);
 
       // Helpers: content heuristics and formatting
       const isStatus = (s) => { if (!s) return false; return /closed|waiting|active|connected|resolved|unresolved|connecting|in session|closed by/i.test(String(s)); };
