@@ -275,7 +275,14 @@ function fetchDigiumCallReports_(startDate, endDate, options) {
     'total_calls','total_incoming_calls','total_outgoing_calls','talking_duration','call_duration','avg_talking_duration','avg_call_duration'
   ];
 
-  const breakdown = (options && options.breakdown) || 'day'; // prefer per-day breakdown for wide output
+  // Human-friendly labels for metrics (used in wide table rows)
+  const human = {
+    total_calls: 'Total Calls', total_incoming_calls: 'Total Incoming Calls', total_outgoing_calls: 'Total Outgoing Calls',
+    talking_duration: 'Talking Duration (s)', call_duration: 'Call Duration (s)', avg_talking_duration: 'Avg Talking Duration (s)', avg_call_duration: 'Avg Call Duration (s)'
+  };
+
+  // prefer per-day breakdown for wide output; use Switchvox token 'by_day' per API docs
+  const breakdown = (options && options.breakdown) || 'by_day';
 
   // Build report_fields XML
   let reportFieldsXml = '<report_fields>'; 
@@ -283,20 +290,72 @@ function fetchDigiumCallReports_(startDate, endDate, options) {
   reportFieldsXml += '</report_fields>';
 
   // ignore_weekends: 0 => do not ignore weekends (user requested we do NOT ignore weekends)
-  const paramsXml = `\n    <start_date>${xmlEscape_(startStr)}</start_date>\n    <end_date>${xmlEscape_(endStr)}</end_date>\n    <ignore_weekends>0</ignore_weekends>\n    <breakdown>${xmlEscape_(breakdown)}</breakdown>\n    ${reportFieldsXml}\n    <format>xml</format>\n  `;
+  // Optionally include account_ids (extensions) to filter results per account
+  let accountIdsXml = '';
+  if (options && options.account_ids) {
+    // accept comma-separated string or array
+    const ids = Array.isArray(options.account_ids) ? options.account_ids : String(options.account_ids).split(',').map(s=>s.trim()).filter(Boolean);
+    if (ids && ids.length) {
+      accountIdsXml = '\n    <account_ids>' + ids.map(id => '<account_id>' + xmlEscape_(id) + '</account_id>').join('') + '</account_ids>';
+    }
+  }
+
+  const paramsXml = `\n    <start_date>${xmlEscape_(startStr)}</start_date>\n    <end_date>${xmlEscape_(endStr)}</end_date>\n    <ignore_weekends>0</ignore_weekends>\n    <breakdown>${xmlEscape_(breakdown)}</breakdown>${accountIdsXml}\n    ${reportFieldsXml}\n    <format>xml</format>\n  `;
 
   const r = digiumApiCall_('switchvox.callReports.search', paramsXml, user, pass, host);
-  // Save raw response for inspection
+  // Save raw response for inspection — append rather than clear so history is preserved
   try {
     const ss = SpreadsheetApp.getActive();
     let rawSh = ss.getSheetByName('Digium_Raw');
     if (!rawSh) rawSh = ss.insertSheet('Digium_Raw');
-    rawSh.clear();
-    rawSh.getRange(1,1).setValue('Request (XML)');
-    rawSh.getRange(2,1).setValue(paramsXml);
-    rawSh.getRange(4,1).setValue('Raw XML Response');
-    rawSh.getRange(5,1).setValue(r.raw || (r.error || ''));
-  } catch (e) { Logger.log('Failed to write Digium_Raw: ' + e.toString()); }
+    const last = Math.max(1, rawSh.getLastRow());
+    const start = last + 2; // leave a blank row between entries
+    rawSh.getRange(start,1).setValue('Request (XML)');
+    rawSh.getRange(start+1,1).setValue(paramsXml);
+    rawSh.getRange(start+3,1).setValue('Raw XML Response');
+    rawSh.getRange(start+4,1).setValue(r.raw || (r.error || ''));
+  } catch (e) { Logger.log('Failed to append Digium_Raw: ' + e.toString()); }
+
+  // If Digium returned an error (for example "Invalid breakdown"), try a fallback without the breakdown
+  try {
+    if (r.ok && r.xml) {
+      const rootChk = r.xml.getRootElement ? r.xml.getRootElement() : null;
+      const errorsEl = rootChk ? rootChk.getChild('errors') : null;
+      if (errorsEl) {
+        const errEl = errorsEl.getChild('error');
+        const msg = errEl && errEl.getAttribute ? (errEl.getAttribute('message') ? errEl.getAttribute('message').getValue() : '') : '';
+        Logger.log('Digium returned errors: ' + msg);
+        // If breakdown is invalid, retry without breakdown param (aggregate totals)
+        if (/invalid breakdown/i.test(String(msg || ''))) {
+          try {
+            const ss2 = SpreadsheetApp.getActive();
+            let rawSh2 = ss2.getSheetByName('Digium_Raw');
+            if (!rawSh2) rawSh2 = ss2.insertSheet('Digium_Raw');
+            const last2 = Math.max(1, rawSh2.getLastRow());
+            const start2 = last2 + 2;
+            rawSh2.getRange(start2,1).setValue('Server reported invalid breakdown, retrying without <breakdown>');
+            // Remove the <breakdown>...</breakdown> element from the paramsXml
+            const paramsNoBreakdown = paramsXml.replace(/\s*<breakdown>.*?<\/breakdown>\s*/i, ' ');
+            rawSh2.getRange(start2+1,1).setValue('Retry Request (XML)');
+            rawSh2.getRange(start2+2,1).setValue(paramsNoBreakdown);
+            const r2 = digiumApiCall_('switchvox.callReports.search', paramsNoBreakdown, user, pass, host);
+            rawSh2.getRange(start2+4,1).setValue('Retry Raw XML Response');
+            rawSh2.getRange(start2+5,1).setValue(r2.raw || (r2.error || ''));
+            if (!r2.ok) return { ok: false, error: r2.error || r2.raw, raw: r.raw };
+            // Replace r with successful fallback response
+            r = r2;
+          } catch (e) {
+            Logger.log('Retry without breakdown failed: ' + e.toString());
+            return { ok: false, error: e.toString(), raw: r.raw };
+          }
+        } else {
+          return { ok: false, error: msg || (r.error || r.raw), raw: r.raw };
+        }
+      }
+    }
+  } catch (e) {
+    Logger.log('Error checking Digium errors element: ' + e.toString());
+  }
 
   if (!r.ok) return { ok: false, error: r.error || r.raw };
 
@@ -345,44 +404,52 @@ function fetchDigiumCallReports_(startDate, endDate, options) {
         });
       });
     } else {
-      // Fallback 1: Digium returned aggregated attributes on a <rows ... /> element (no per-day breakdown)
-      // Example: <rows total_calls="69" total_incoming_calls="43" ... />
-      const rowsEl = root.getChild('result') ? root.getChild('result').getChild('rows') : root.getChild('rows');
-      if (rowsEl && rowsEl.getAttributes && rowsEl.getAttributes().length > 0) {
-        // Build a single-date column representing the requested range
-        const rangeLabel = `${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]}`;
-        const single = {};
-        fields.forEach(f => { single[f] = 0; });
-        rowsEl.getAttributes().forEach(attr => {
-          const name = attr.getName();
-          const val = Number(attr.getValue()) || 0;
-          if (fields.indexOf(name) >= 0) single[name] = val;
+      // Try <rows><row .../></rows> where each row has date and metric attributes
+      const resultEl = root.getChild('result') || root;
+      const rowsEl = resultEl.getChild('rows');
+      const rowChildren = rowsEl ? rowsEl.getChildren('row') : null;
+      if (rowChildren && rowChildren.length) {
+        rowChildren.forEach(rowEl => {
+          let dateAttr = rowEl.getAttribute('date') ? rowEl.getAttribute('date').getValue() : null;
+          let dateKey = null;
+          if (dateAttr) {
+            // Convert MM/DD/YYYY to YYYY-MM-DD
+            const m = String(dateAttr).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+            if (m) dateKey = `${m[3]}-${('0'+m[1]).slice(-2)}-${('0'+m[2]).slice(-2)}`; else dateKey = dateAttr;
+          }
+          if (!dateKey) return;
+          if (!fieldMap[dateKey]) { fieldMap[dateKey] = {}; fields.forEach(f => fieldMap[dateKey][f] = 0); }
+          fields.forEach(f => {
+            const a = rowEl.getAttribute(f);
+            if (a) {
+              const num = Number(a.getValue());
+              fieldMap[dateKey][f] = isNaN(num) ? 0 : num;
+            }
+          });
         });
-        // Return single-column wide data labeled with the range
-        const wideRows = fields.map(f => [ (human && human[f]) || f, single[f] ]);
-        const singleDates = [rangeLabel];
-        return { ok: true, dates: singleDates, rows: wideRows, raw: r.raw };
-      }
-
-      // Fallback 2: search for elements named like the fields directly under root/result rows
-      const traverse = (el, currentDate) => {
-        const name = String(el.getName()).toLowerCase();
-        if (name === 'row' && el.getAttribute('date')) currentDate = el.getAttribute('date').getValue().split(' ')[0];
-        if (fields.indexOf(name) >= 0 && currentDate) {
-          const val = Number((el.getText()||'').trim()) || 0;
-          if (fieldMap[currentDate]) fieldMap[currentDate][name] = val;
+      } else {
+        // Fallback: Digium returned aggregated attributes on a <rows ... /> element (no per-day breakdown)
+        // Example: <rows total_calls="69" total_incoming_calls="43" ... />
+        if (rowsEl && rowsEl.getAttributes && rowsEl.getAttributes().length > 0) {
+          // Build a single-date column representing the requested range
+          const rangeLabel = `${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]}`;
+          const single = {};
+          fields.forEach(f => { single[f] = 0; });
+          rowsEl.getAttributes().forEach(attr => {
+            const name = attr.getName();
+            const val = Number(attr.getValue()) || 0;
+            if (fields.indexOf(name) >= 0) single[name] = val;
+          });
+          // Return single-column wide data labeled with the range
+          const wideRows = fields.map(f => [ (human && human[f]) || f, single[f] ]);
+          const singleDates = [rangeLabel];
+          return { ok: true, dates: singleDates, rows: wideRows, raw: r.raw };
         }
-        el.getChildren().forEach(c => traverse(c, currentDate));
-      };
-      traverse(root, null);
+      }
     }
 
     // Build wide rows
     const wideRows = [];
-    const human = {
-      total_calls: 'Total Calls', total_incoming_calls: 'Total Incoming Calls', total_outgoing_calls: 'Total Outgoing Calls',
-      talking_duration: 'Talking Duration (s)', call_duration: 'Call Duration (s)', avg_talking_duration: 'Avg Talking Duration (s)', avg_call_duration: 'Avg Call Duration (s)'
-    };
     fields.forEach(f => {
       const row = [ human[f] || f ];
       dates.forEach(dKey => row.push(fieldMap[dKey] ? fieldMap[dKey][f] || 0 : 0));
@@ -413,6 +480,183 @@ function createDigiumCallsSheet_(wideData) {
   return sh;
 }
 
+// Convert numeric seconds in a wide table (with a Metric label column) to spreadsheet day-fractions
+// and apply hh:mm:ss formatting to the value cells. Looks for a header cell with text 'Metric'.
+function convertSecondsToDayFractionForTableAt_(sheet, headerRow, headerCol) {
+  try {
+    if (!sheet) return { ok: false, reason: 'no_sheet' };
+    const hdr = sheet.getRange(headerRow, headerCol).getValue();
+    if (!hdr || String(hdr).toLowerCase().indexOf('metric') < 0) return { ok: false, reason: 'no_metric_header' };
+    // Read a generous slice to determine the actual table width robustly
+    const maxScan = Math.max(10, Math.min(50, sheet.getLastColumn() - headerCol + 1));
+    const headerVals = sheet.getRange(headerRow, headerCol, 1, maxScan).getValues()[0];
+    const firstDataVals = sheet.getRange(headerRow + 1, headerCol, 1, maxScan).getValues()[0];
+    // Determine width where either header or first data row still has content
+    let width = 0;
+    for (let i = 0; i < maxScan; i++) {
+      const hv = headerVals[i];
+      const dv = firstDataVals[i];
+      const has = !((hv === '' || hv == null) && (dv === '' || dv == null));
+      if (has) width = i + 1; else break;
+    }
+    if (width <= 1) return { ok: false, reason: 'no_value_columns' };
+
+    // Read successive rows until we hit an empty first cell
+    const rows = [];
+    let r = headerRow + 1;
+    while (true) {
+      const first = sheet.getRange(r, headerCol).getValue();
+      if (first === '' || first == null) break;
+      const rowVals = sheet.getRange(r, headerCol, 1, width).getValues()[0];
+      rows.push({ row: r, vals: rowVals });
+      r++;
+      // Safety: avoid infinite loop
+      if (rows.length > 2000) break;
+    }
+
+    if (!rows.length) return { ok: true, converted: 0 };
+
+    // For each row, convert duration-like metrics to time fractions; leave count metrics as integers
+    rows.forEach(rr => {
+      const label = String(rr.vals[0] || '').toLowerCase();
+      const isDuration = /duration|time/.test(label);
+      const out = [];
+      out.push(rr.vals[0]); // metric label unchanged
+      for (let j = 1; j < rr.vals.length; j++) {
+        const v = rr.vals[j];
+        const n = (v === null || v === '') ? '' : (Number(v));
+        if (n == null || n === '' || isNaN(n)) { out.push(v); continue; }
+        out.push(isDuration ? (n / 86400) : n);
+      }
+      // Determine effective width for this row (trim trailing blanks)
+      let rowWidth = rr.vals.length;
+      for (let k = rr.vals.length - 1; k >= 1; k--) { // keep Metric column
+        if (rr.vals[k] === '' || rr.vals[k] == null) rowWidth--; else break;
+      }
+      if (rowWidth <= 1) return; // nothing to write
+
+      // Write back converted row (only value columns) and set appropriate formats
+      try {
+        const range = sheet.getRange(rr.row, headerCol + 1, 1, rowWidth - 1).setValues([out.slice(1, rowWidth)]);
+        if (isDuration) range.setNumberFormat('hh:mm:ss'); else range.setNumberFormat('0');
+      } catch (e) {
+        Logger.log('convertSecondsToDayFractionForTableAt_ write failed for row ' + rr.row + ': ' + e.toString());
+      }
+    });
+    return { ok: true, converted: rows.length };
+  } catch (e) {
+    Logger.log('convertSecondsToDayFractionForTableAt_ error: ' + e.toString());
+    return { ok: false, error: e.toString() };
+  }
+}
+
+// No-arg wrapper to apply duration formatting across common sheets.
+function formatAllDurationColumns() {
+  try {
+    const ss = SpreadsheetApp.getActive();
+    // Sessions table: try to apply hh:mm:ss to known duration columns if Sessions exists
+    try {
+      const sessions = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
+      if (sessions) {
+        // Known duration-like columns used elsewhere in code: 19,20,21,22,31,32,33,34,35,36,37
+        const durCols = [19,20,21,22,31,32,33,34,35,36,37];
+        const lastRow = Math.max(2, sessions.getLastRow());
+        durCols.forEach(c => {
+          try { sessions.getRange(2, c, lastRow - 1, 1).setNumberFormat('hh:mm:ss'); } catch (e) {}
+        });
+      }
+    } catch (e) { Logger.log('formatAllDurationColumns sessions formatting failed: ' + e.toString()); }
+
+    // Support_Data: look for Digium table at row 18, col H (8)
+    try {
+      const support = ss.getSheetByName('Support_Data');
+      if (support) {
+        const res = convertSecondsToDayFractionForTableAt_(support, 18, 8);
+        Logger.log('Support_Data Digium table conversion: ' + JSON.stringify(res));
+      }
+    } catch (e) { Logger.log('formatAllDurationColumns Support_Data failed: ' + e.toString()); }
+
+    // Digium_Calls sheet: header at row 1, metric column at col 1
+    try {
+      const digs = ss.getSheetByName('Digium_Calls');
+      if (digs) {
+        const res2 = convertSecondsToDayFractionForTableAt_(digs, 1, 1);
+        Logger.log('Digium_Calls conversion: ' + JSON.stringify(res2));
+      }
+    } catch (e) { Logger.log('formatAllDurationColumns Digium_Calls failed: ' + e.toString()); }
+
+    // Technician tabs: many generator sheets place Digium wide table at row 18, col H — scan all sheets and convert where found
+    try {
+      const all = ss.getSheets();
+      all.forEach(sh => {
+        try {
+          const name = sh.getName();
+          if (name === 'Support_Data' || name === 'Digium_Calls' || name === SHEETS_SESSIONS_TABLE) return;
+          const cell = sh.getRange(18, 8).getValue();
+          if (cell && String(cell).toLowerCase().indexOf('metric') >= 0) {
+            const r = convertSecondsToDayFractionForTableAt_(sh, 18, 8);
+            Logger.log('Converted Digium table on sheet ' + name + ': ' + JSON.stringify(r));
+          }
+        } catch (e) { /* ignore missing cells or permissions */ }
+      });
+    } catch (e) { Logger.log('formatAllDurationColumns technician conversion failed: ' + e.toString()); }
+
+    SpreadsheetApp.getActive().toast('Duration formatting applied across sheets');
+  } catch (e) {
+    Logger.log('formatAllDurationColumns error: ' + e.toString());
+    SpreadsheetApp.getActive().toast('Formatting failed: ' + e.toString().slice(0,200));
+  }
+}
+
+// Read extension_map sheet and return { technician_name_lower: [ext1, ext2, ...] }
+function getExtensionMap_() {
+  const out = {};
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const sh = ss.getSheetByName('extension_map');
+    if (!sh) return out;
+    const rng = sh.getDataRange();
+    const vals = rng.getValues();
+    if (!vals || vals.length < 2) return out;
+    const headers = vals[0].map(h => String(h || '').trim().toLowerCase());
+    const nameIdx = headers.indexOf('technician_name');
+    const extIdx = headers.indexOf('extension');
+    const activeIdx = headers.indexOf('is_active');
+    for (let i = 1; i < vals.length; i++) {
+      const row = vals[i];
+      const name = nameIdx >= 0 ? String(row[nameIdx] || '').trim() : '';
+      const extCell = extIdx >= 0 ? String(row[extIdx] || '').trim() : '';
+      const isActive = activeIdx >= 0 ? String(row[activeIdx] || '').toLowerCase() !== 'false' : true;
+      if (!name || !extCell || !isActive) continue;
+      const exts = extCell.split(',').map(s => s.trim()).filter(Boolean);
+      const key = name.toLowerCase();
+      if (!out[key]) out[key] = [];
+      out[key].push(...exts);
+    }
+  } catch (e) { Logger.log('getExtensionMap_ failed: ' + e.toString()); }
+  return out;
+}
+
+// Test helper: writes a small Digium-style table to a test sheet and runs the converter so you can validate formatting.
+function writeDurationTestRow() {
+  try {
+    const ss = SpreadsheetApp.getActive();
+    let sh = ss.getSheetByName('Format_Test');
+    if (!sh) sh = ss.insertSheet('Format_Test');
+    sh.clear();
+    const header = ['Metric', '2025-11-05'];
+    sh.getRange(1,1,1,header.length).setValues([header]);
+    sh.getRange(2,1,1,2).setValues([['Test Duration', 3661]]);
+    // Run conversion
+    const res = convertSecondsToDayFractionForTableAt_(sh, 1, 1);
+    SpreadsheetApp.getActive().toast('Format_Test conversion: ' + JSON.stringify(res));
+    return res;
+  } catch (e) {
+    Logger.log('writeDurationTestRow failed: ' + e.toString());
+    return { ok: false, error: e.toString() };
+  }
+}
+
 // High-level helper: ingest Digium calls for an ISO date range (YYYY-MM-DD) and write wide-format summary.
 // This is a convenience entrypoint you can run from the Apps Script editor.
 function ingestDigiumRangeToSheets_(startISO, endISO) {
@@ -435,10 +679,12 @@ function ingestDigiumRangeToSheets_(startISO, endISO) {
     } else {
       let rawSh = ss.getSheetByName('Digium_Raw');
       if (!rawSh) rawSh = ss.insertSheet('Digium_Raw');
-      rawSh.clear();
-      rawSh.getRange(1,1).setValue('Raw XML Response');
-      rawSh.getRange(2,1).setValue(res.raw || '');
-      SpreadsheetApp.getActive().toast('Digium response saved to Digium_Raw (no parsed metrics)');
+      // Append the raw response rather than clearing the sheet so history is preserved
+      const last = Math.max(1, rawSh.getLastRow());
+      const start = last + 2;
+      rawSh.getRange(start,1).setValue('Raw XML Response');
+      rawSh.getRange(start+1,1).setValue(res.raw || '');
+      SpreadsheetApp.getActive().toast('Digium response appended to Digium_Raw (no parsed metrics)');
       return { ok: true };
     }
   } catch (e) {
@@ -823,6 +1069,38 @@ function mdy_(iso) {
   return `${d.getMonth()+1}/${d.getDate()}/${d.getFullYear()}`;
 }
 
+// Normalize a duration-like value into seconds.
+// Accepts: numeric seconds, numeric time-fraction (days), or hh:mm:ss string.
+function parseDurationSeconds_(val) {
+  if (val == null || val === '') return 0;
+  // If already a number
+  if (typeof val === 'number') {
+    // If small (< 2) assume it's a time-fraction (days) and convert to seconds
+    if (Math.abs(val) < 2) return Math.round(val * 86400);
+    // Otherwise assume it's raw seconds
+    return Math.round(val);
+  }
+  // If string, try to parse numeric first
+  const s = String(val).trim();
+  if (!s) return 0;
+  if (/^[0-9]+(\.[0-9]+)?$/.test(s)) {
+    const n = Number(s);
+    if (Math.abs(n) < 2) return Math.round(n * 86400);
+    return Math.round(n);
+  }
+  // Try HH:MM:SS or MM:SS
+  const parts = s.split(':').map(p => Number(p));
+  if (parts.length === 3 && parts.every(p => !isNaN(p))) {
+    return parts[0]*3600 + parts[1]*60 + parts[2];
+  }
+  if (parts.length === 2 && parts.every(p => !isNaN(p))) {
+    return parts[0]*60 + parts[1];
+  }
+  // Fallback: try to parse as numeric with non-digits removed
+  const n2 = Number(s.replace(/[^0-9.-]/g,''));
+  return isNaN(n2) ? 0 : Math.round(n2);
+}
+
 /* ===== Sheets Storage ===== */
 function getOrCreateSessionsSheet_(ss) {
   let sh = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
@@ -1080,7 +1358,25 @@ function writeRowsToSheets_(ss, rows, clearExisting = false) {
   ]);
   
   const newRowStart = sh.getLastRow() + 1;
-  sh.getRange(newRowStart, 1, values.length, values[0].length).setValues(values);
+  // Transform duration-like numeric seconds into spreadsheet time fractions (days) for human-friendly display
+  // Columns indices (1-based): 19(duration_active_seconds),20(duration_work_seconds),21(duration_total_seconds),
+  // 22(pickup_seconds), 31(connecting_time),32(waiting_time),33(total_time),34(active_time),35(work_time),36(hold_time),37(time_in_transfer)
+  const durationCols = [19,20,21,22,31,32,33,34,35,36,37];
+  const displayValues = values.map(row => {
+    const newRow = row.slice();
+    durationCols.forEach(col => {
+      const ai = col - 1;
+      try {
+        const v = newRow[ai];
+        if (v != null && v !== '' && !isNaN(Number(v))) {
+          // convert seconds -> fraction of day for display
+          newRow[ai] = Number(v) / 86400;
+        }
+      } catch (e) {}
+    });
+    return newRow;
+  });
+  sh.getRange(newRowStart, 1, displayValues.length, displayValues[0].length).setValues(displayValues);
   
   // Set date format for timestamp columns (columns 16, 17, 18, and 39)
   // start_time (col 16), end_time (col 17), last_action_time (col 18), ingested_at (col 39)
@@ -1092,6 +1388,13 @@ function writeRowsToSheets_(ss, rows, clearExisting = false) {
     sh.getRange(newRowStart, 18, values.length, 1).setNumberFormat(dateFormat); // last_action_time
     sh.getRange(newRowStart, 39, values.length, 1).setNumberFormat(dateFormat); // ingested_at
   }
+  // Apply time format for duration-like columns we converted to day-fractions
+  try {
+    const durCols = [19,20,21,22,31,32,33,34,35,36,37];
+    durCols.forEach(c => {
+      try { sh.getRange(newRowStart, c, values.length, 1).setNumberFormat('hh:mm:ss'); } catch (e) {}
+    });
+  } catch (e) { Logger.log('Failed to set duration column formats: ' + e.toString()); }
   
   return toInsert.length;
 }
@@ -1131,7 +1434,6 @@ function pullDateRangeToday() {
     SpreadsheetApp.getActive().toast(`✅ Ingested ${rowsIngested} rows from today`, 5);
     
     // Schedule auto-refresh for today (every 10 minutes)
-    scheduleAutoRefreshToday_();
   } catch (e) {
     SpreadsheetApp.getActive().toast('Error: ' + e.toString().substring(0, 50));
     Logger.log('pullDateRangeToday error: ' + e.toString());
@@ -1192,48 +1494,6 @@ function pullDateRangeCurrentMonth() {
   } catch (e) {
     SpreadsheetApp.getActive().toast('Error: ' + e.toString().substring(0, 50));
     Logger.log('pullDateRangeCurrentMonth error: ' + e.toString());
-  }
-}
-
-function scheduleAutoRefreshToday_() {
-  // Remove existing auto-refresh triggers
-  ScriptApp.getProjectTriggers().forEach(t => {
-    if (t.getHandlerFunction() === 'autoRefreshToday_') {
-      ScriptApp.deleteTrigger(t);
-    }
-  });
-  
-  // Schedule refresh every 10 minutes
-  ScriptApp.newTrigger('autoRefreshToday_')
-    .timeBased()
-    .everyMinutes(10)
-    .create();
-}
-
-function autoRefreshToday_() {
-  try {
-    const ss = SpreadsheetApp.getActive();
-    const configSheet = ss.getSheetByName('Dashboard_Config');
-    if (!configSheet) return;
-    
-    const timeFrame = configSheet.getRange('B3').getValue();
-    if (timeFrame !== 'Today') {
-      // Stop auto-refresh if not set to Today
-      ScriptApp.getProjectTriggers().forEach(t => {
-        if (t.getHandlerFunction() === 'autoRefreshToday_') {
-          ScriptApp.deleteTrigger(t);
-        }
-      });
-      return;
-    }
-    
-    const range = getTimeFrameRange_('Today');
-    const cfg = getCfg_();
-    const startISO = range.startDate.toISOString();
-    const endISO = range.endDate.toISOString();
-    ingestTimeRangeToSheets_(startISO, endISO, cfg, false); // Don't clear, just append new
-  } catch (e) {
-    Logger.log('autoRefreshToday_ error: ' + e.toString());
   }
 }
 
@@ -1983,7 +2243,7 @@ function createDailySummarySheet_(ss, startDate, endDate) {
       }
       dailyData[dateStr].sessions.push(row);
       if (row[techIdx]) dailyData[dateStr].techs.add(row[techIdx]);
-      if (row[workIdx]) dailyData[dateStr].totalWorkSeconds += Number(row[workIdx]);
+      if (row[workIdx]) dailyData[dateStr].totalWorkSeconds += parseDurationSeconds_(row[workIdx]);
     });
     
     // Get all dates in range
@@ -2043,7 +2303,7 @@ function createDailySummarySheet_(ss, startDate, endDate) {
     dates.forEach(d => {
       const data = dailyData[d];
       if (data && data.sessions.length > 0) {
-        const durations = data.sessions.map(s => Number(s[durationIdx] || 0)).filter(Boolean);
+        const durations = data.sessions.map(s => parseDurationSeconds_(s[durationIdx] || 0)).filter(Boolean);
         if (durations.length > 0) {
           const avg = durations.reduce((a, b) => a + b, 0) / durations.length;
           avgSessionRow.push(avg / 86400);
@@ -2071,7 +2331,7 @@ function createDailySummarySheet_(ss, startDate, endDate) {
     dates.forEach(d => {
       const data = dailyData[d];
       if (data && data.sessions.length > 0) {
-        const pickups = data.sessions.map(s => Number(s[pickupIdx] || 0)).filter(p => p > 0);
+        const pickups = data.sessions.map(s => parseDurationSeconds_(s[pickupIdx] || 0)).filter(p => p > 0);
         if (pickups.length > 0) {
           const avg = pickups.reduce((a, b) => a + b, 0) / pickups.length;
           avgPickupRow.push(avg / 86400);
@@ -2190,9 +2450,9 @@ function createDailySummarySheet_(ss, startDate, endDate) {
         };
       }
       techStats[tech].sessions++;
-      if (row[durationIdx]) techStats[tech].durations.push(Number(row[durationIdx]));
-      if (row[pickupIdx]) techStats[tech].pickups.push(Number(row[pickupIdx]));
-      if (row[workIdx]) techStats[tech].workSeconds += Number(row[workIdx]);
+  if (row[durationIdx]) techStats[tech].durations.push(parseDurationSeconds_(row[durationIdx]));
+  if (row[pickupIdx]) techStats[tech].pickups.push(parseDurationSeconds_(row[pickupIdx]));
+  if (row[workIdx]) techStats[tech].workSeconds += parseDurationSeconds_(row[workIdx]);
     });
     
     Object.keys(techStats).sort((a, b) => techStats[b].sessions - techStats[a].sessions).forEach(tech => {
@@ -2334,10 +2594,10 @@ function createSupportDataSheet_(ss, startDate, endDate) {
     // Summary KPIs
     const kpiRow = 4;
     const totalSessions = filtered.length;
-    const totalWorkSeconds = filtered.reduce((sum, row) => sum + (Number(row[workIdx]) || 0), 0);
+    const totalWorkSeconds = filtered.reduce((sum, row) => sum + parseDurationSeconds_(row[workIdx] || 0), 0);
     const totalWorkHours = (totalWorkSeconds / 3600).toFixed(1);
     const avgPickup = filtered.length > 0 ? 
-      Math.round(filtered.reduce((sum, row) => sum + (Number(row[pickupIdx]) || 0), 0) / filtered.length) : 0;
+      Math.round(filtered.reduce((sum, row) => sum + parseDurationSeconds_(row[pickupIdx] || 0), 0) / filtered.length) : 0;
   // resolved/unresolved columns exist in Sessions but Support_Data will not report resolution metrics
   const resolvedCount = filtered.filter(row => row[resolvedIdx] === 'Resolved').length;
     
@@ -2391,9 +2651,9 @@ function createSupportDataSheet_(ss, startDate, endDate) {
         };
       }
       techStats[tech].sessions++;
-      if (row[durationIdx]) techStats[tech].durations.push(Number(row[durationIdx]));
-      if (row[pickupIdx]) techStats[tech].pickups.push(Number(row[pickupIdx]));
-      if (row[workIdx]) techStats[tech].workSeconds += Number(row[workIdx]);
+      if (row[durationIdx]) techStats[tech].durations.push(parseDurationSeconds_(row[durationIdx]));
+      if (row[pickupIdx]) techStats[tech].pickups.push(parseDurationSeconds_(row[pickupIdx]));
+      if (row[workIdx]) techStats[tech].workSeconds += parseDurationSeconds_(row[workIdx]);
       if (row[resolvedIdx] === 'Resolved') techStats[tech].resolved++;
       // Count Nova Wave sessions
       if (callingCardIdx >= 0 && row[callingCardIdx]) {
@@ -2445,7 +2705,8 @@ function createSupportDataSheet_(ss, startDate, endDate) {
         const d = new Date(row[startIdx]).toISOString().split('T')[0];
         if (!dailyData[d]) dailyData[d] = { sessions: [], totalWorkSeconds: 0 };
         dailyData[d].sessions.push(row);
-        dailyData[d].totalWorkSeconds += Number(row[workIdx] || 0);
+        // Use robust parser for duration/work fields to avoid negative/invalid values
+        dailyData[d].totalWorkSeconds += parseDurationSeconds_(row[workIdx] || 0);
       } catch (e) { /* ignore malformed rows */ }
     });
 
@@ -2484,7 +2745,8 @@ function createSupportDataSheet_(ss, startDate, endDate) {
     dates.forEach(d => {
       const data = dailyData[d];
       if (data && data.sessions.length > 0) {
-        const durations = data.sessions.map(s => Number(s[durationIdx] || 0)).filter(Boolean);
+        // Parse session durations defensively (supports seconds, HH:MM:SS, or day-fractions)
+        const durations = data.sessions.map(s => parseDurationSeconds_(s[durationIdx] || 0)).filter(Boolean);
           if (durations.length > 0) {
             const avg = durations.reduce((a,b) => a+b, 0) / durations.length;
             avgSessionRow.push(avg / 86400);
@@ -2511,7 +2773,8 @@ function createSupportDataSheet_(ss, startDate, endDate) {
     dates.forEach(d => {
       const data = dailyData[d];
       if (data && data.sessions.length > 0) {
-        const pickups = data.sessions.map(s => Number(s[pickupIdx] || 0)).filter(p => p > 0);
+        // Parse pickup times defensively
+        const pickups = data.sessions.map(s => parseDurationSeconds_(s[pickupIdx] || 0)).filter(p => p > 0);
         if (pickups.length > 0) {
           const avg = pickups.reduce((a,b) => a+b, 0) / pickups.length;
           avgPickupRow.push(avg / 86400);
@@ -2560,6 +2823,32 @@ function createSupportDataSheet_(ss, startDate, endDate) {
   try { applyProfessionalTableStyling_(supportSheet, wideRows[0].length); } catch (e) { Logger.log('Styling support sheet failed: ' + e.toString()); }
     
     Logger.log('Support Data sheet created');
+    // --- Insert Digium call report (wide-format) into Support_Data at row 18, column H (8)
+    try {
+      const digRes = fetchDigiumCallReports_(startDate, endDate, {});
+      if (digRes && digRes.ok && digRes.dates && digRes.rows) {
+        const startCol = 8; // Column H
+        const startRow = 18;
+        // Build header (Metric + dates)
+        const header = ['Metric'].concat(digRes.dates || []);
+        supportSheet.getRange(startRow, startCol, 1, header.length).setValues([header]);
+        // Write metric rows
+        if (digRes.rows && digRes.rows.length) {
+          supportSheet.getRange(startRow + 1, startCol, digRes.rows.length, digRes.rows[0].length).setValues(digRes.rows);
+        }
+        // Styling
+        try { supportSheet.getRange(startRow, startCol, 1, header.length).setFontWeight('bold').setBackground('#E5E7EB').setFontColor('#000000'); } catch (e) {}
+        // Number formatting: leave numbers raw (caller durations are seconds). If values look like time fractions later, formatting can be applied.
+        supportSheet.setColumnWidth(startCol, 140);
+        SpreadsheetApp.flush();
+      } else {
+        Logger.log('No Digium parsed data available for Support_Data: ' + (digRes && (digRes.error || digRes.raw) ? (digRes.error || digRes.raw).toString().substring(0,200) : 'no response'));
+      }
+    } catch (e) { Logger.log('Failed to write Digium data into Support_Data: ' + e.toString()); }
+    // Apply duration formatting across sheets now that Support_Data and Digium data are populated.
+    try {
+      if (typeof formatAllDurationColumns === 'function') formatAllDurationColumns();
+    } catch (e) { Logger.log('formatAllDurationColumns failed after support data generation: ' + e.toString()); }
   } catch (e) {
     Logger.log('createSupportDataSheet_ error: ' + e.toString());
   }
@@ -2909,13 +3198,14 @@ function refreshAnalyticsDashboard_(startDate, endDate) {
       }
       teamData[tech].sessions++;
       if (row[pickupIdx]) {
-        teamData[tech].pickups.push(Number(row[pickupIdx]));
-  if (Number(row[pickupIdx]) <= 60) teamData[tech].slaHits++;
+        const ps = parseDurationSeconds_(row[pickupIdx]);
+        teamData[tech].pickups.push(ps);
+        if (ps <= 60) teamData[tech].slaHits++;
       }
       if (row[durationIdx]) {
-        teamData[tech].durations.push(Number(row[durationIdx]));
+        teamData[tech].durations.push(parseDurationSeconds_(row[durationIdx]));
       }
-      if (row[workIdx]) teamData[tech].workSeconds += Number(row[workIdx]);
+      if (row[workIdx]) teamData[tech].workSeconds += parseDurationSeconds_(row[workIdx]);
     });
     
     // Merge performance data from API with session counts
@@ -3193,6 +3483,8 @@ function generateTechnicianTabs_(startDate, endDate) {
     if (!sessionsSheet) return;
     const dataRange = sessionsSheet.getDataRange();
     if (dataRange.getNumRows() <= 1) return;
+    // Load extension -> technician mapping for per-account Digium pulls (sheet: extension_map)
+    const extMap = getExtensionMap_();
     
     // Get all existing technician tabs and clear them first to prevent stale data
     const allSheets = ss.getSheets();
@@ -3228,7 +3520,8 @@ function generateTechnicianTabs_(startDate, endDate) {
     const statusIdx = getHeaderIndex(['session_status', 'status']);
     const durationIdx = getHeaderIndex(['duration_total_seconds', 'duration_seconds', 'duration_total']);
     const pickupIdx = getHeaderIndex(['pickup_seconds', 'pickup_seconds_total', 'pickup']);
-    const workIdx = getHeaderIndex(['duration_work_seconds', 'work_seconds']);
+  const workIdx = getHeaderIndex(['duration_work_seconds', 'work_seconds']);
+  const activeIdx = getHeaderIndex(['active_time', 'duration_active_seconds', 'active seconds', 'active']);
     const customerIdx = getHeaderIndex(['customer_name', 'customer', 'customer_name:']); // Column 8
     const sessionIdIdx = getHeaderIndex(['session_id', 'session id', 'id']); // Column 1
     const phoneIdx = getHeaderIndex(['caller_phone', 'caller phone', 'phone']); // Column 26
@@ -3258,13 +3551,15 @@ function generateTechnicianTabs_(startDate, endDate) {
       techSheet.getRange(2, 2).setFormula('=Dashboard_Config!B3');
       techSheet.getRange(2, 4).setValue('Last Updated:');
       techSheet.getRange(2, 5).setValue(new Date().toLocaleString());
-      const durations = techRows.map(r => r[durationIdx]).filter(Boolean).map(Number);
-      const pickups = techRows.map(r => r[pickupIdx]).filter(Boolean).map(Number);
-      const workSeconds = techRows.map(r => r[workIdx]).filter(Boolean).reduce((a,b) => a + Number(b), 0);
+  // Normalize durations/pickups/work seconds to seconds for robust calculations
+  const durations = techRows.map(r => parseDurationSeconds_(r[durationIdx] || 0)).filter(Boolean);
+  const pickups = techRows.map(r => parseDurationSeconds_(r[pickupIdx] || 0)).filter(Boolean);
+  const workSeconds = techRows.map(r => parseDurationSeconds_(r[workIdx] || 0)).filter(Boolean).reduce((a,b) => a + b, 0);
+  const activeSecondsArr = techRows.map(r => parseDurationSeconds_(r[activeIdx] || 0)).filter(Boolean);
       const completed = techRows.filter(r => r[statusIdx] === 'Ended').length;
       const active = techRows.filter(r => r[statusIdx] === 'Active').length;
-      const avgDur = durations.length > 0 ? (durations.reduce((a,b) => a+b, 0) / durations.length / 60).toFixed(1) : '0';
-      const avgPickup = pickups.length > 0 ? (pickups.reduce((a,b) => a+b, 0) / pickups.length / 60).toFixed(1) : '0';
+    const avgDur = durations.length > 0 ? (durations.reduce((a,b) => a+b, 0) / durations.length / 60).toFixed(1) : '0';
+    const avgPickup = pickups.length > 0 ? (pickups.reduce((a,b) => a+b, 0) / pickups.length / 60).toFixed(1) : '0';
   const slaHits = pickups.filter(p => p <= 60).length;
       const slaPct = pickups.length > 0 ? ((slaHits / pickups.length) * 100).toFixed(1) : '0';
       const days = Math.max(1, (new Date(endDate) - new Date(startDate)) / (1000*60*60*24));
@@ -3285,8 +3580,8 @@ function generateTechnicianTabs_(startDate, endDate) {
       const kpis = [
         ['Total Sessions', techRows.length],
         ['Nova Wave Sessions', novaWaveCount],
-        // Avg Duration and Avg Pickup stored as numeric time fractions so sheets can format them as hh:mm:ss
-        ['Avg Duration', avgDurationSeconds / 86400],
+        // Replace Avg Duration with Active Time (average) stored as numeric time fraction for hh:mm:ss formatting
+        ['Active Time', (activeSecondsArr.length > 0 ? Math.round(activeSecondsArr.reduce((a,b)=>a+b,0) / activeSecondsArr.length) : 0) / 86400],
         ['Avg Pickup Time', avgPickupSeconds / 86400],
         ['SLA Hit %', slaPct + '%'],
         ['Total Work Hours', workHours + ' hrs'],
@@ -3301,7 +3596,7 @@ function generateTechnicianTabs_(startDate, endDate) {
         techSheet.getRange(row, col + 1).setFontSize(16).setFontWeight('bold').setFontColor('#9C27B0');
         // If this KPI is a duration/pickup numeric fraction, format it as hh:mm:ss
         try {
-          if (/avg duration/i.test(kpis[i][0]) || /avg pickup/i.test(kpis[i][0])) {
+          if (/avg duration/i.test(kpis[i][0]) || /avg pickup/i.test(kpis[i][0]) || /active time/i.test(kpis[i][0])) {
             techSheet.getRange(row, col + 1).setNumberFormat('hh:mm:ss');
           }
         } catch (e) { /* ignore formatting errors */ }
@@ -3338,7 +3633,7 @@ function generateTechnicianTabs_(startDate, endDate) {
           const d = new Date(r[startIdx]).toISOString().split('T')[0];
           if (!dailyMap[d]) dailyMap[d] = { sessions: [], totalWorkSeconds: 0 };
           dailyMap[d].sessions.push(r);
-          dailyMap[d].totalWorkSeconds += Number(r[workIdx] || 0);
+          dailyMap[d].totalWorkSeconds += parseDurationSeconds_(r[workIdx] || 0);
         } catch (e) { }
       });
       dates.forEach(d => {
@@ -3350,7 +3645,7 @@ function generateTechnicianTabs_(startDate, endDate) {
         totalWorkRow.push(secs / 86400);
         totalWorkAll += secs;
         if (data && data.sessions.length > 0) {
-          const durations = data.sessions.map(s => Number(s[durationIdx] || 0)).filter(Boolean);
+          const durations = data.sessions.map(s => parseDurationSeconds_(s[durationIdx] || 0)).filter(Boolean);
           if (durations.length > 0) {
             const avg = durations.reduce((a,b)=>a+b,0) / durations.length;
             avgSessionRow.push(avg / 86400);
@@ -3359,7 +3654,7 @@ function generateTechnicianTabs_(startDate, endDate) {
           } else {
             avgSessionRow.push(0);
           }
-          const pickups = data.sessions.map(s => Number(s[pickupIdx] || 0)).filter(p=>p>0);
+          const pickups = data.sessions.map(s => parseDurationSeconds_(s[pickupIdx] || 0)).filter(p=>p>0);
           if (pickups.length > 0) {
             const avgp = pickups.reduce((a,b)=>a+b,0) / pickups.length;
             avgPickupRow.push(avgp / 86400);
@@ -3472,6 +3767,13 @@ function generateTechnicianTabs_(startDate, endDate) {
           techSheet.getRange(detailRow + 2, durCol, detailRows.length, 1).setNumberFormat('hh:mm:ss');
           techSheet.getRange(detailRow + 2, pickupCol, detailRows.length, 1).setNumberFormat('hh:mm:ss');
         } catch (e) { /* ignore formatting errors */ }
+        // Make the entire session details block collapsible (title + header + rows)
+        try {
+          const blockRows = 2 + detailRows.length; // header row and at least one data row
+          const groupRange = techSheet.getRange(detailRow, 1, blockRows, Math.max(techSheet.getLastColumn(), 8));
+          groupRange.shiftRowGroupDepth(1);
+          try { const grp = techSheet.getRowGroup(detailRow, 1); if (grp) grp.collapse(); } catch (e) {}
+        } catch (e) { Logger.log('Collapsible session details grouping failed: ' + e.toString()); }
       }
       techSheet.setColumnWidth(1, 100);
       techSheet.setColumnWidth(2, 150);
@@ -3479,6 +3781,33 @@ function generateTechnicianTabs_(startDate, endDate) {
       techSheet.setColumnWidth(4, 120);
       techSheet.setColumnWidth(5, 120);
       techSheet.setColumnWidth(6, 120);
+
+      // Insert Digium wide-format call summary for this tech at row 18, column H (8)
+      try {
+        // Pull Digium per technican if extension(s) exist; fallback to none if missing
+        let digiumWide = null;
+        const norm = (s) => String(s || '').trim().toLowerCase();
+        const extList = extMap[norm(techName)] || [];
+        if (extList && extList.length) {
+          try {
+            const dr = fetchDigiumCallReports_(startDate, endDate, { breakdown: 'by_day', account_ids: extList });
+            if (dr && dr.ok && dr.dates && dr.rows) digiumWide = dr;
+          } catch (e) { Logger.log('Digium per-tech fetch failed for '+techName+': ' + e.toString()); }
+        }
+        if (digiumWide) {
+          const startCol = 8; // H
+          const startRow = 18;
+          const header = ['Metric'].concat(digiumWide.dates || []);
+          techSheet.getRange(startRow, startCol, 1, header.length).setValues([header]);
+          if (digiumWide.rows && digiumWide.rows.length) {
+            techSheet.getRange(startRow + 1, startCol, digiumWide.rows.length, digiumWide.rows[0].length).setValues(digiumWide.rows);
+          }
+          try { techSheet.getRange(startRow, startCol, 1, header.length).setFontWeight('bold').setBackground('#E5E7EB').setFontColor('#000000'); } catch (e) {}
+          techSheet.setColumnWidth(startCol, 140);
+          // Convert duration rows to hh:mm:ss on this sheet only
+          try { convertSecondsToDayFractionForTableAt_(techSheet, startRow, startCol); } catch (e) {}
+        }
+      } catch (e) { Logger.log('Failed to write Digium data to tech sheet ' + safeName + ': ' + e.toString()); }
 
       
     }
