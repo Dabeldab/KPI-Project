@@ -12,6 +12,9 @@ const NODE_CANDIDATES_DEFAULT = [5648341, 300589800, 1367438801, 863388310, -2];
 /* ===== Runtime settings ===== */
 const FORCE_TEXT_OUTPUT = true;
 const SHEETS_SESSIONS_TABLE = 'Sessions'; // Main data storage sheet
+// If true, write raw API values into the Sessions sheet (preserve empty strings
+// and original formatting) instead of converting timestamps/durations to Dates/numbers.
+const STORE_RAW_SESSIONS = true;
 
 /* ===== Menu ===== */
 function onOpen() {
@@ -40,6 +43,9 @@ const PROP_KEYS = {
   RESCUE_BASE:  'RESCUE_BASE',
   RESCUE_USER:  'RESCUE_USER',
   RESCUE_PASS:  'RESCUE_PASS',
+  DIGIUM_HOST:   'DIGIUM_HOST',
+  DIGIUM_USER:   'DIGIUM_USER',
+  DIGIUM_PASS:   'DIGIUM_PASS',
   NODE_JSON:    'NODE_CANDIDATES_JSON'
 };
 
@@ -53,6 +59,9 @@ function getCfg_() {
     rescueBase: getProp_(PROP_KEYS.RESCUE_BASE, 'https://secure.logmeinrescue.com/API'),
     user: getProp_(PROP_KEYS.RESCUE_USER, ''),
     pass: getProp_(PROP_KEYS.RESCUE_PASS, ''),
+    digiumHost: getProp_(PROP_KEYS.DIGIUM_HOST, 'https://nova.digiumcloud.net/xml'),
+    digiumUser: getProp_(PROP_KEYS.DIGIUM_USER, ''),
+    digiumPass: getProp_(PROP_KEYS.DIGIUM_PASS, ''),
     nodes: (() => {
       const j = getProp_(PROP_KEYS.NODE_JSON, '[]');
       try { return JSON.parse(j); } catch(e) { return NODE_CANDIDATES_DEFAULT; }
@@ -73,6 +82,11 @@ function uiConfigureSecrets() {
     <p>Email:<br><input type="email" id="user"></p>
     <p>Password:<br><input type="password" id="pass"></p>
     <p>Node IDs (JSON array):<br><input type="text" id="nodes" placeholder='[5648341, 300589800]'></p>
+    <hr>
+    <h3>Digium / Switchvox (optional)</h3>
+    <p>Digium Host (XML-RPC endpoint):<br><input type="text" id="dig_host" placeholder="https://nova.digiumcloud.net/xml"></p>
+    <p>Digium Username:<br><input type="text" id="dig_user"></p>
+    <p>Digium Password:<br><input type="password" id="dig_pass"></p>
     <button onclick="save()">Save</button>
     <button onclick="google.script.host.close()">Cancel</button>
     <script>
@@ -81,7 +95,11 @@ function uiConfigureSecrets() {
         const user = document.getElementById('user').value;
         const pass = document.getElementById('pass').value;
         const nodes = document.getElementById('nodes').value;
+        const digHost = document.getElementById('dig_host').value;
+        const digUser = document.getElementById('dig_user').value;
+        const digPass = document.getElementById('dig_pass').value;
         google.script.run.saveSecrets(base, user, pass, nodes);
+        if (digHost || digUser || digPass) google.script.run.saveDigiumSecrets(digHost, digUser, digPass);
         google.script.host.close();
       }
     </script>
@@ -98,6 +116,15 @@ function saveSecrets(base, user, pass, nodes) {
     try { JSON.parse(nodes); setProp_(PROP_KEYS.NODE_JSON, nodes); } catch(e) {}
   }
   SpreadsheetApp.getActive().toast('Secrets saved');
+}
+
+function saveDigiumSecrets(host, user, pass) {
+  try {
+    if (host) setProp_('DIGIUM_HOST', host);
+    if (user) setProp_('DIGIUM_USER', user);
+    if (pass) setProp_('DIGIUM_PASS', pass);
+    SpreadsheetApp.getActive().toast('Digium secrets saved');
+  } catch (e) { Logger.log('saveDigiumSecrets error: ' + e.toString()); }
 }
 
 /* ===== HTTP Helpers ===== */
@@ -121,6 +148,325 @@ function extractCookie_(response) {
   if (!setCookie) return null;
   const cookies = Array.isArray(setCookie) ? setCookie : [setCookie];
   return cookies.map(c => c.split(';')[0]).join('; ');
+}
+
+/* ===== Digium / Switchvox XML-RPC helpers ===== */
+// Helper: escape text for XML content
+function xmlEscape_(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+// Generic XML-RPC caller. Uses HTTP Basic Auth against the provided host.
+function xmlRpcCall_(host, methodName, params, user, pass) {
+  // Build a minimal XML-RPC request (params should be an array of simple values or objects already serialized)
+  let body = '<?xml version="1.0"?>\n<methodCall><methodName>' + methodName + '</methodName><params>';
+  (params || []).forEach(p => {
+    body += '<param><value>';
+    if (typeof p === 'number') body += '<int>' + String(p) + '</int>';
+    else if (typeof p === 'boolean') body += '<boolean>' + (p ? '1' : '0') + '</boolean>';
+  else body += '<string>' + xmlEscape_(String(p)) + '</string>';
+    body += '</value></param>';
+  });
+  body += '</params></methodCall>';
+
+  // Use application/xml per Digium error response which explicitly requires application/xml or application/json
+  const headers = { 'Content-Type': 'application/xml; charset=UTF-8', 'Accept': 'application/xml' };
+  if (user && pass) headers['Authorization'] = 'Basic ' + Utilities.base64Encode(user + ':' + pass);
+  const opts = { method: 'post', contentType: 'application/xml; charset=UTF-8', payload: body, headers: headers, muteHttpExceptions: true };
+  try {
+    const resp = UrlFetchApp.fetch(host, opts);
+    const code = resp.getResponseCode();
+    const txt = resp.getContentText();
+    if (code >= 200 && code < 300) {
+      try {
+        const xml = XmlService.parse(txt);
+        return { ok: true, xml: xml, raw: txt };
+      } catch (e) {
+        return { ok: false, error: 'XML parse error: ' + e.toString(), raw: txt };
+      }
+    }
+    return { ok: false, error: 'HTTP ' + code, raw: txt };
+  } catch (e) {
+    return { ok: false, error: e.toString() };
+  }
+}
+
+// Fetch Digium call summary for a date range. This is a small wrapper and uses placeholder method names.
+// The Switchvox API uses XML-RPC; exact method names and params must be taken from the Digium docs.
+function fetchDigiumCallSummary_(startDate, endDate) {
+  const cfg = getCfg_();
+  const host = cfg.digiumHost;
+  const user = cfg.digiumUser;
+  const pass = cfg.digiumPass;
+  if (!host || !user || !pass) {
+    Logger.log('fetchDigiumCallSummary_: Digium credentials not configured');
+    return { ok: false, reason: 'missing_credentials' };
+  }
+
+  // NOTE: The method name and param structure below are placeholders. Refer to the Switchvox API docs
+  // (http://developers.digium.com/switchvox) for the correct method to request call logs or CDRs.
+  const method = 'switchvox.calls.getList'; // placeholder — replace with real method
+  const params = [ { start: startDate.toISOString(), end: endDate.toISOString() } ];
+  const r = xmlRpcCall_(host, method, params, user, pass);
+  if (!r.ok) {
+    Logger.log('fetchDigiumCallSummary_ failed: ' + (r.error || r.raw));
+    return { ok: false, error: r.error || r.raw };
+  }
+
+  // TODO: parse r.xml to extract totals per day and raw call rows
+  // For now, return the raw XML so we can iterate on parsing once we confirm method/response shape.
+  return { ok: true, xml: r.xml, raw: r.raw };
+}
+
+// Send a Digium-style <request method="..."> XML envelope. Returns {ok, raw, xml (XmlService.Document)}
+function digiumApiCall_(methodName, parametersXmlString, user, pass, host) {
+  try {
+    const body = '<?xml version="1.0"?>\n' +
+      '<request method="' + xmlEscape_(methodName) + '">\n' +
+      '  <parameters>' + (parametersXmlString || '') + '</parameters>\n' +
+      '</request>';
+
+    const headers = { 'Content-Type': 'application/xml; charset=UTF-8', 'Accept': 'application/xml' };
+    if (user && pass) headers['Authorization'] = 'Basic ' + Utilities.base64Encode(user + ':' + pass);
+    const opts = { method: 'post', contentType: 'application/xml; charset=UTF-8', payload: body, headers: headers, muteHttpExceptions: true };
+    const resp = UrlFetchApp.fetch(host, opts);
+    const code = resp.getResponseCode();
+    const txt = resp.getContentText();
+    if (code >= 200 && code < 300) {
+      try {
+        const xml = XmlService.parse(txt);
+        return { ok: true, raw: txt, xml: xml };
+      } catch (e) {
+        return { ok: false, error: 'XML parse error: ' + e.toString(), raw: txt };
+      }
+    }
+    return { ok: false, error: 'HTTP ' + code, raw: txt };
+  } catch (e) {
+    return { ok: false, error: e.toString() };
+  }
+}
+
+// Fetch callReports.search for a date range and return parsed wide-format data when possible.
+function fetchDigiumCallReports_(startDate, endDate, options) {
+  const cfg = getCfg_();
+  const host = cfg.digiumHost;
+  const user = cfg.digiumUser;
+  const pass = cfg.digiumPass;
+  if (!host || !user || !pass) return { ok: false, reason: 'missing_credentials' };
+
+  const fmt = (d) => {
+    const dt = (d instanceof Date) ? d : new Date(d);
+    const Y = dt.getFullYear();
+    const M = String(dt.getMonth()+1).padStart(2,'0');
+    const D = String(dt.getDate()).padStart(2,'0');
+    return `${Y}-${M}-${D} 00:00:00`;
+  };
+
+  const startStr = fmt(startDate);
+  const endStr = (() => { const dt = (endDate instanceof Date) ? endDate : new Date(endDate); return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')} 23:59:59`; })();
+
+  const fields = (options && options.report_fields) || [
+    'total_calls','total_incoming_calls','total_outgoing_calls','talking_duration','call_duration','avg_talking_duration','avg_call_duration'
+  ];
+
+  const breakdown = (options && options.breakdown) || 'day'; // prefer per-day breakdown for wide output
+
+  // Build report_fields XML
+  let reportFieldsXml = '<report_fields>'; 
+  fields.forEach(f => { reportFieldsXml += '<report_field>' + xmlEscape_(f) + '</report_field>'; });
+  reportFieldsXml += '</report_fields>';
+
+  // ignore_weekends: 0 => do not ignore weekends (user requested we do NOT ignore weekends)
+  const paramsXml = `\n    <start_date>${xmlEscape_(startStr)}</start_date>\n    <end_date>${xmlEscape_(endStr)}</end_date>\n    <ignore_weekends>0</ignore_weekends>\n    <breakdown>${xmlEscape_(breakdown)}</breakdown>\n    ${reportFieldsXml}\n    <format>xml</format>\n  `;
+
+  const r = digiumApiCall_('switchvox.callReports.search', paramsXml, user, pass, host);
+  // Save raw response for inspection
+  try {
+    const ss = SpreadsheetApp.getActive();
+    let rawSh = ss.getSheetByName('Digium_Raw');
+    if (!rawSh) rawSh = ss.insertSheet('Digium_Raw');
+    rawSh.clear();
+    rawSh.getRange(1,1).setValue('Request (XML)');
+    rawSh.getRange(2,1).setValue(paramsXml);
+    rawSh.getRange(4,1).setValue('Raw XML Response');
+    rawSh.getRange(5,1).setValue(r.raw || (r.error || ''));
+  } catch (e) { Logger.log('Failed to write Digium_Raw: ' + e.toString()); }
+
+  if (!r.ok) return { ok: false, error: r.error || r.raw };
+
+  // Try to parse per-day results. Best-effort: look for <day date="YYYY-MM-DD">...</day>
+  try {
+    const doc = r.xml;
+    const root = doc.getRootElement();
+
+    // Build dates array from start to end
+    const dates = [];
+    const d = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
+    const ed = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate());
+    while (d <= ed) {
+      dates.push(d.toISOString().split('T')[0]);
+      d.setDate(d.getDate() + 1);
+    }
+
+    const fieldMap = {};
+    // Initialize map for each date
+    dates.forEach(dt => { fieldMap[dt] = {}; fields.forEach(f => fieldMap[dt][f] = 0); });
+
+    // Helper: find all <day> elements anywhere
+    const findDays = (el) => {
+      const out = [];
+      const children = el.getChildren();
+      children.forEach(c => {
+        if (String(c.getName()).toLowerCase() === 'day' && c.getAttribute('date')) out.push(c);
+        out.push(...findDays(c));
+      });
+      return out;
+    };
+
+    const days = findDays(root);
+    if (days && days.length) {
+      days.forEach(dayEl => {
+        const dateAttr = dayEl.getAttribute('date') ? dayEl.getAttribute('date').getValue() : null;
+        const dateKey = dateAttr ? dateAttr.split(' ')[0] : null;
+        if (!dateKey) return;
+        fields.forEach(f => {
+          const child = dayEl.getChild(f);
+          if (child) {
+            const txt = (child.getText() || '').trim();
+            const num = Number(txt || 0);
+            if (!isNaN(num)) fieldMap[dateKey][f] = num;
+          }
+        });
+      });
+    } else {
+      // Fallback 1: Digium returned aggregated attributes on a <rows ... /> element (no per-day breakdown)
+      // Example: <rows total_calls="69" total_incoming_calls="43" ... />
+      const rowsEl = root.getChild('result') ? root.getChild('result').getChild('rows') : root.getChild('rows');
+      if (rowsEl && rowsEl.getAttributes && rowsEl.getAttributes().length > 0) {
+        // Build a single-date column representing the requested range
+        const rangeLabel = `${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]}`;
+        const single = {};
+        fields.forEach(f => { single[f] = 0; });
+        rowsEl.getAttributes().forEach(attr => {
+          const name = attr.getName();
+          const val = Number(attr.getValue()) || 0;
+          if (fields.indexOf(name) >= 0) single[name] = val;
+        });
+        // Return single-column wide data labeled with the range
+        const wideRows = fields.map(f => [ (human && human[f]) || f, single[f] ]);
+        const singleDates = [rangeLabel];
+        return { ok: true, dates: singleDates, rows: wideRows, raw: r.raw };
+      }
+
+      // Fallback 2: search for elements named like the fields directly under root/result rows
+      const traverse = (el, currentDate) => {
+        const name = String(el.getName()).toLowerCase();
+        if (name === 'row' && el.getAttribute('date')) currentDate = el.getAttribute('date').getValue().split(' ')[0];
+        if (fields.indexOf(name) >= 0 && currentDate) {
+          const val = Number((el.getText()||'').trim()) || 0;
+          if (fieldMap[currentDate]) fieldMap[currentDate][name] = val;
+        }
+        el.getChildren().forEach(c => traverse(c, currentDate));
+      };
+      traverse(root, null);
+    }
+
+    // Build wide rows
+    const wideRows = [];
+    const human = {
+      total_calls: 'Total Calls', total_incoming_calls: 'Total Incoming Calls', total_outgoing_calls: 'Total Outgoing Calls',
+      talking_duration: 'Talking Duration (s)', call_duration: 'Call Duration (s)', avg_talking_duration: 'Avg Talking Duration (s)', avg_call_duration: 'Avg Call Duration (s)'
+    };
+    fields.forEach(f => {
+      const row = [ human[f] || f ];
+      dates.forEach(dKey => row.push(fieldMap[dKey] ? fieldMap[dKey][f] || 0 : 0));
+      wideRows.push(row);
+    });
+
+    return { ok: true, dates: dates, rows: wideRows, raw: r.raw };
+  } catch (e) {
+    return { ok: false, error: 'parse_failed: ' + e.toString(), raw: r.raw };
+  }
+}
+
+// Create a wide-format Digium calls sheet and write provided data (dates + metrics)
+function createDigiumCallsSheet_(wideData) {
+  // wideData: { dates: ['2025-11-01', ...], rows: [ ['Total Calls', 5, 3, ...], ['Total Duration', 3600, ...] ] }
+  const ss = SpreadsheetApp.getActive();
+  const name = 'Digium_Calls';
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  sh.clear();
+  const header = ['Metric'].concat(wideData.dates || []);
+  sh.getRange(1,1,1,header.length).setValues([header]);
+  for (let i=0;i<(wideData.rows||[]).length;i++) {
+    sh.getRange(2+i,1,1,wideData.rows[i].length).setValues([wideData.rows[i]]);
+  }
+  // Basic styling
+  try { sh.getRange(1,1,1,header.length).setFontWeight('bold').setBackground('#1976D2').setFontColor('#FFFFFF'); } catch(e){}
+  return sh;
+}
+
+// High-level helper: ingest Digium calls for an ISO date range (YYYY-MM-DD) and write wide-format summary.
+// This is a convenience entrypoint you can run from the Apps Script editor.
+function ingestDigiumRangeToSheets_(startISO, endISO) {
+  try {
+    const startDate = new Date(startISO + 'T00:00:00Z');
+    const endDate = new Date(endISO + 'T23:59:59Z');
+    // Use the new callReports.search flow (will save raw XML and attempt to parse per-day metrics)
+    const res = fetchDigiumCallReports_(startDate, endDate, {});
+    if (!res.ok) {
+      SpreadsheetApp.getActive().toast('Digium fetch failed: ' + (res.error || res.reason || 'unknown'));
+      return { ok: false, error: res.error || res.reason };
+    }
+
+    // If the helper returned parsed wide-format data, write it; otherwise fall back to raw saving
+    const ss = SpreadsheetApp.getActive();
+    if (res.dates && res.rows) {
+      createDigiumCallsSheet_({ dates: res.dates, rows: res.rows });
+      SpreadsheetApp.getActive().toast('Digium response parsed and saved to Digium_Calls');
+      return { ok: true };
+    } else {
+      let rawSh = ss.getSheetByName('Digium_Raw');
+      if (!rawSh) rawSh = ss.insertSheet('Digium_Raw');
+      rawSh.clear();
+      rawSh.getRange(1,1).setValue('Raw XML Response');
+      rawSh.getRange(2,1).setValue(res.raw || '');
+      SpreadsheetApp.getActive().toast('Digium response saved to Digium_Raw (no parsed metrics)');
+      return { ok: true };
+    }
+  } catch (e) {
+    Logger.log('ingestDigiumRangeToSheets_ error: ' + e.toString());
+    return { ok: false, error: e.toString() };
+  }
+}
+
+// No-arg wrapper so the function shows in the Apps Script Run list and can be executed interactively.
+function ingestDigiumRangeToSheets() {
+  const ui = SpreadsheetApp.getUi();
+  const now = new Date();
+  const y = new Date(now.getFullYear(), now.getMonth(), now.getDate()-1);
+  const defaultStart = y.toISOString().split('T')[0];
+  const defaultEnd = defaultStart;
+  const res = ui.prompt('Digium Ingest', `Enter start and end dates (YYYY-MM-DD,YYYY-MM-DD) or single date.`, ui.ButtonSet.OK_CANCEL);
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+  const txt = res.getResponseText().trim();
+  if (!txt) {
+    ui.alert('No dates entered');
+    return;
+  }
+  const parts = txt.split(',').map(s => s.trim()).filter(Boolean);
+  const start = parts[0] || defaultStart;
+  const end = parts[1] || start;
+  ui.showModalDialog(HtmlService.createHtmlOutput(`<p>Starting ingest for ${start} → ${end}. This may take a moment.</p>`).setWidth(300).setHeight(80), 'Digium Ingest');
+  const out = ingestDigiumRangeToSheets_(start, end);
+  if (out && out.ok) ui.alert('Digium ingest finished (raw saved to Digium_Raw).'); else ui.alert('Digium ingest failed: ' + (out && out.error ? out.error : 'unknown'));
 }
 
 /* ===== API Functions (per LogMeIn documentation) ===== */
@@ -330,6 +676,43 @@ function parsePipe_(okBody, delimiter) {
   return { headers: header, rows: out };
 }
 
+// Log unmapped header names (helpful when API changes header labels)
+function logUnmappedHeader_(header, sample) {
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const sheetName = 'Debug_Unmapped_Headers';
+    let sh = ss.getSheetByName(sheetName);
+    if (!sh) {
+      sh = ss.insertSheet(sheetName);
+      sh.getRange(1,1,1,5).setValues([['Header','Sample','FirstSeen','LastSeen','Count']]);
+      sh.setColumnWidth(1, 300);
+      sh.setColumnWidth(2, 300);
+      sh.setColumnWidth(3, 180);
+      sh.setColumnWidth(4, 180);
+      sh.setColumnWidth(5, 80);
+    }
+    const headerLower = String(header || '').toLowerCase();
+    const dataRange = sh.getRange(2,1,Math.max(0, sh.getLastRow()-1),1);
+    const existing = dataRange.getValues().map(r => String(r[0] || '').toLowerCase());
+    const foundIdx = existing.indexOf(headerLower);
+    const now = new Date().toISOString();
+    if (foundIdx >= 0) {
+      const rowNum = foundIdx + 2;
+      // preserve original sample if present, update last seen and increment count
+      const sampleCell = sh.getRange(rowNum, 2);
+      if (!sampleCell.getValue()) sampleCell.setValue(sample || '');
+      sh.getRange(rowNum, 4).setValue(now);
+      const countCell = sh.getRange(rowNum, 5);
+      const prev = Number(countCell.getValue()) || 1;
+      countCell.setValue(prev + 1);
+    } else {
+      sh.appendRow([String(header || ''), String(sample || ''), now, now, 1]);
+    }
+  } catch (e) {
+    Logger.log('logUnmappedHeader_ failed: ' + e.toString());
+  }
+}
+
 /* ===== Mapping to Schema ===== */
 function mapRow_(rec) {
   if (!rec || typeof rec !== 'object') return null;
@@ -341,23 +724,50 @@ function mapRow_(rec) {
   };
   const toSec = (val) => {
     const s = String(val||'').trim();
-    if (!s) return 0;
+    // Preserve empty/blank values as empty string so Sessions sheet reflects the API
+    if (!s) return '';
+    // If it's a plain integer string, return a Number so numeric formulas can consume it
     if (/^\d+$/.test(s)) return Number(s);
+    // Parse HH:MM:SS style strings
     const m = s.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
     if (m) return (Number(m[1])*3600 + Number(m[2])*60 + Number(m[3]))|0;
-    return 0;
+    // Otherwise, preserve the original string value
+    return s;
   };
   const toTs = (s) => {
+    // Preserve original timestamp string from API; do not coerce here so Sessions
+    // sheet shows raw API values. Caller may parse/convert as needed elsewhere.
     const v = String(s||'').trim();
-    if (!v) return null;
-    try {
-      const d = new Date(v);
-      if (isNaN(d.getTime())) return null;
-      return d.toISOString();
-    } catch (e) {
-      return null;
-    }
+    if (!v) return '';
+    return v;
   };
+  // Detect and log any header keys present in the incoming record that our mapping
+  // doesn't explicitly handle. This helps capture new API header names for later
+  // mapping updates.
+  try {
+    const knownVariants = [
+      'session id','session type','status','technician id','technician name','technician email','technician group',
+      'your name:','your name','customer name','customer','caller name','caller_name','customer_name','customername','contact name','client name','yourname',
+      'your email:','customer email','customer_email','email','tracking id','customer ip','device id','platform','browser type','host name',
+      'start time','end time','last action time','active time','work time','total time','waiting time','channel id','channel name',
+      'company name:','company name','company','company_name','companyname','caller phone','caller_phone','phone','phone number','customer_phone','telephone','tel','mobile','mobile phone',
+      'resolved unresolved','calling card','browser type','connecting time','time in transfer','reconnecting time','rebooting time','ingested_at'
+    ];
+    const knownSet = new Set(knownVariants.map(k => String(k).toLowerCase().trim()));
+    Object.keys(rec || {}).forEach(k => {
+      try {
+        if (!k) return;
+        const kl = String(k).toLowerCase().trim();
+        if (!knownSet.has(kl)) {
+          const v = rec[k];
+          if (v != null && String(v).trim().length) {
+            // Log unmapped header for later inspection (non-blocking)
+            try { logUnmappedHeader_(k, String(v).slice(0, 200)); } catch (e) {}
+          }
+        }
+      } catch (e) {}
+    });
+  } catch (e) {}
   return {
     session_id: g(rec, ['Session ID'], ''),
     session_type: g(rec, ['Session Type'], ''),
@@ -366,8 +776,8 @@ function mapRow_(rec) {
     technician_name: g(rec, ['Technician Name'], ''),
     technician_email: g(rec, ['Technician Email'], ''),
     technician_group: g(rec, ['Technician Group'], ''),
-    customer_name: g(rec, ['Your Name:'], ''),
-    customer_email: g(rec, ['Your Email:', 'Customer Email'], ''),
+  customer_name: g(rec, ['Your Name:', 'Your Name', 'Customer Name', 'Customer', 'Caller Name', 'caller_name', 'customer_name', 'CustomerName', 'Contact Name', 'Client Name', 'YourName'], ''),
+  customer_email: g(rec, ['Your Email:', 'Customer Email', 'customer_email', 'email', 'Email'], ''),
     tracking_id: g(rec, ['Tracking ID'], ''),
     ip_address: g(rec, ['Customer IP'], ''),
     device_id: g(rec, ['Device ID'], ''),
@@ -383,9 +793,9 @@ function mapRow_(rec) {
     pickup_seconds: toSec(g(rec, ['Waiting Time'], '')),
     channel_id: g(rec, ['Channel ID'], ''),
     channel_name: g(rec, ['Channel Name'], ''),
-    company_name: g(rec, ['Company name:'], ''),
-    caller_name: g(rec, ['Your Name:'], ''),
-    caller_phone: g(rec, ['Your Phone #:'], ''),
+  company_name: g(rec, ['Company name:', 'Company Name', 'Company', 'company_name', 'CompanyName'], ''),
+  caller_name: g(rec, ['Caller Name', 'Caller', 'caller_name', 'Your Name:', 'Your Name', 'Contact Name'], ''),
+  caller_phone: g(rec, ['Your Phone #:', 'Caller Phone', 'Phone', 'Phone Number', 'caller_phone', 'customer_phone', 'Telephone', 'Tel', 'Mobile', 'Mobile Phone'], ''),
     resolved_unresolved: g(rec, ['Resolved Unresolved'], ''),
     calling_card: g(rec, ['Calling Card'], ''),
     browser_type: g(rec, ['Browser Type'], ''),
@@ -423,17 +833,17 @@ function getOrCreateSessionsSheet_(ss) {
   // Headers matching LogMeIn Rescue API field names from mapRow_ function
   // Order: Session info, Technician info, Customer info, Network info, Timestamps, Durations, Other
   const headers = [
-    'session_id', 'session_type', 'session_status',
-    'technician_id', 'technician_name', 'technician_email', 'technician_group',
-    'customer_name', 'customer_email',
-    'tracking_id', 'ip_address', 'device_id', 'platform', 'browser', 'host',
+    'technician_id', 'session_id', 'session_status',
+    'group_name', 'technician_name', 'platform', 'technician_email',
+    'session_status', 'tracking_id',
+    'tracking_id', 'custom_column', 'ip_address', 'reconnecting_time', 'technician_group', 'host',
     'start_time', 'end_time', 'last_action_time',
     'duration_active_seconds', 'duration_work_seconds', 'duration_total_seconds',
-    'pickup_seconds', 'channel_id', 'channel_name',
+    'connecting_time', 'channel_idx', 'channel_id',
     'company_name', 'caller_name', 'caller_phone',
-    'resolved_unresolved', 'calling_card', 'browser_type',
-    'connecting_time', 'waiting_time', 'total_time', 'active_time', 'work_time',
-    'hold_time', 'time_in_transfer', 'reconnecting_time', 'rebooting_time',
+    'incident_tools_used', 'calling_card', 'technician_group',
+    'connecting_timex', 'connecting_time', 'waiting_time', 'work_time', 'work_time',
+    'active_time', 'time_in_transfer', 'reconnecting_time', 'rebooting_time',
     'ingested_at'
   ];
   
@@ -448,7 +858,7 @@ function getOrCreateSessionsSheet_(ss) {
     headerRange.clear();
     headerRange.setValues([headers]);
     headerRange.setFontWeight('bold')
-      .setBackground('#1A73E8')
+      .setBackground('#07123B')
       .setFontColor('#FFFFFF')
       .setHorizontalAlignment('left')
       .setVerticalAlignment('middle');
@@ -468,7 +878,71 @@ function getOrCreateSessionsSheet_(ss) {
   sh.setColumnWidth(18, 180); // last_action_time
   sh.setColumnWidth(39, 180); // ingested_at
   
+  // Apply consistent styling
+  try { applyProfessionalTableStyling_(sh, headers.length); } catch (e) { Logger.log('Styling sessions sheet failed: ' + e.toString()); }
+
+  // Hide duplicate duration columns that duplicate other time fields
+  try {
+    const hdrs = headers.map(h => String(h||'').toLowerCase());
+    const duplicates = ['duration_active_seconds','duration_work_seconds','duration_total_seconds'];
+    duplicates.forEach(d => {
+      const i = hdrs.indexOf(d);
+      if (i >= 0) {
+        try { sh.hideColumns(i+1); } catch(e) {}
+      }
+    });
+  } catch(e) { Logger.log('Failed to hide duplicate duration columns: ' + e.toString()); }
+
   return sh;
+}
+
+// Apply consistent, professional styling to a sheet's table area.
+// headerCols: number of header columns (optional). If omitted, uses sheet.getLastColumn().
+function applyProfessionalTableStyling_(sheet, headerCols) {
+  try {
+    const lastRow = Math.max(sheet.getLastRow(), 1);
+    const lastCol = headerCols || sheet.getLastColumn();
+    // Freeze header
+    sheet.setFrozenRows(1);
+
+    // Header styling
+    const headerRange = sheet.getRange(1, 1, 1, lastCol);
+    headerRange.setFontWeight('bold')
+  .setBackground('#07123B')
+      .setFontColor('#FFFFFF')
+      .setFontSize(11)
+      .setHorizontalAlignment('left')
+      .setFontFamily('Arial');
+
+    // Apply subtle banding to data rows
+    if (lastRow > 1) {
+      try { sheet.getRange(2, 1, Math.max(1, lastRow - 1), lastCol).applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY); } catch (e) {}
+    }
+
+    // Create a filter for easy sorting/searching (ignore errors if already present)
+    try { sheet.getRange(1, 1, Math.max(1, lastRow), lastCol).createFilter(); } catch (e) {}
+
+    // Default font + vertical alignment for table
+    try { sheet.getRange(1, 1, Math.max(1, lastRow), lastCol).setFontFamily('Arial').setVerticalAlignment('middle'); } catch (e) {}
+
+    // Align numeric-like columns to the right based on header keywords
+    try {
+      const hdrs = headerRange.getValues()[0].map(h => String(h || '').toLowerCase());
+      const numericKeywords = ['session', 'sessions', 'duration', 'time', 'total', 'pickup', 'id', 'count', 'seconds', 'hours', 'work'];
+      hdrs.forEach((h, i) => {
+        try {
+          if (numericKeywords.some(k => h.indexOf(k) !== -1)) {
+            sheet.getRange(2, i + 1, Math.max(1, lastRow - 1), 1).setHorizontalAlignment('right');
+          } else {
+            sheet.getRange(2, i + 1, Math.max(1, lastRow - 1), 1).setHorizontalAlignment('left');
+          }
+        } catch (e) {}
+      });
+    } catch (e) {}
+
+  } catch (e) {
+    Logger.log('applyProfessionalTableStyling_ failed: ' + e.toString());
+  }
 }
 
 function writeRowsToSheets_(ss, rows, clearExisting = false) {
@@ -498,6 +972,71 @@ function writeRowsToSheets_(ss, rows, clearExisting = false) {
   // Filter by session_id
   const toInsert = rows.filter(r => r && r.session_id && !existingIds.has(String(r.session_id)));
   if (!toInsert.length) return 0;
+
+  // Heuristic normalization to fix common header/value shifts seen in some API responses.
+  // If the API returns different header labels the parsed fields can shift; apply
+  // content-based fixes so columns like caller_name / caller_phone / company_name
+  // contain sensible values.
+  const isPhone = (s) => { if (!s) return false; const t = String(s).replace(/[^0-9]/g,''); return t.length >= 6; };
+  const isName = (s) => { if (!s) return false; const t = String(s).trim(); if (t.length < 2) return false; if (/\d/.test(t)) return false; if (/\b(rc|sp|ps)\b/i.test(t)) return false; return /^[A-Za-z .,'-]+$/.test(t); };
+  const isStatus = (s) => { if (!s) return false; return /closed|waiting|active|connected|resolved|unresolved|connecting|in session|closed by/i.test(String(s)); };
+
+  toInsert.forEach(r => {
+    try {
+      // Pattern observed: company_name contains phone, caller_name contains status text,
+      // caller_phone contains the actual caller name. Shift into correct fields.
+      if (isStatus(r.caller_name) && isPhone(r.company_name) && isName(r.caller_phone)) {
+        // Move status into session_status
+        r.session_status = r.caller_name;
+        // Move caller name from caller_phone into caller_name
+        r.caller_name = r.caller_phone;
+        // Move phone from company_name into caller_phone
+        r.caller_phone = r.company_name;
+        // Clear company_name (unknown)
+        r.company_name = '';
+      }
+
+      // If company_name looks like a phone but caller_phone is empty, move it
+      if (!r.caller_phone && isPhone(r.company_name)) {
+        r.caller_phone = r.company_name;
+        r.company_name = '';
+      }
+
+      // If caller_phone appears numeric and company_name looks like a name, swap
+      if (isPhone(r.caller_phone) && isName(r.company_name)) {
+        const tmp = r.caller_phone;
+        r.caller_phone = tmp;
+        // company_name likely already correct; leave as-is
+      }
+    } catch (e) { /* ignore per-row normalization errors */ }
+  });
+
+  // Additional normalization: some API rows arrive shifted so session_id contains a timestamp
+  // Detect session_id values that look like dates/times and shift them into start_time
+  const looksLikeDateTime = (s) => {
+    if (!s) return false;
+    const t = String(s).trim();
+    // common patterns: MM/DD/YYYY or YYYY-MM-DD or include ':' for time
+    if (/\d{1,2}\/\d{1,2}\/\d{2,4}/.test(t)) return true;
+    if (/\d{4}-\d{2}-\d{2}/.test(t)) return true;
+    if (/\d{1,2}:\d{2}:\d{2}/.test(t)) return true;
+    return false;
+  };
+  toInsert.forEach(r => {
+    try {
+      if (looksLikeDateTime(r.session_id) && !r.start_time) {
+        // move timestamp into start_time and attempt to get a better session id
+        const ts = r.session_id;
+        r.start_time = ts;
+        // prefer tracking_id as fallback session id
+        if (r.tracking_id && String(r.tracking_id).length) {
+          r.session_id = String(r.tracking_id);
+        } else {
+          r.session_id = '';
+        }
+      }
+    } catch(e) {}
+  });
   
   // Convert ISO timestamp strings to Date objects for proper timezone handling
   const toDate = (isoStr) => {
@@ -527,14 +1066,17 @@ function writeRowsToSheets_(ss, rows, clearExisting = false) {
     r.technician_id, r.technician_name, r.technician_email, r.technician_group,
     (r.customer_name || r.caller_name), r.customer_email,
     r.tracking_id, r.ip_address, r.device_id, r.platform, r.browser, r.host,
-    toDate(r.start_time), toDate(r.end_time), toDate(r.last_action_time),
+    (typeof STORE_RAW_SESSIONS !== 'undefined' && STORE_RAW_SESSIONS) ? (r.start_time || '') : toDate(r.start_time),
+    (typeof STORE_RAW_SESSIONS !== 'undefined' && STORE_RAW_SESSIONS) ? (r.end_time || '') : toDate(r.end_time),
+    (typeof STORE_RAW_SESSIONS !== 'undefined' && STORE_RAW_SESSIONS) ? (r.last_action_time || '') : toDate(r.last_action_time),
+    // durations/pickups/work times: keep original mapped values (may be Number or ''/string)
     r.duration_active_seconds, r.duration_work_seconds, r.duration_total_seconds,
     r.pickup_seconds, r.channel_id, r.channel_name,
     r.company_name, r.caller_name, r.caller_phone,
     r.resolved_unresolved, r.calling_card, r.browser_type,
     r.connecting_time, r.waiting_time, r.total_time, r.active_time, r.work_time,
     r.hold_time, r.time_in_transfer, r.reconnecting_time, r.rebooting_time,
-    toDate(r.ingested_at)
+    (typeof STORE_RAW_SESSIONS !== 'undefined' && STORE_RAW_SESSIONS) ? (r.ingested_at || '') : toDate(r.ingested_at)
   ]);
   
   const newRowStart = sh.getLastRow() + 1;
@@ -543,7 +1085,8 @@ function writeRowsToSheets_(ss, rows, clearExisting = false) {
   // Set date format for timestamp columns (columns 16, 17, 18, and 39)
   // start_time (col 16), end_time (col 17), last_action_time (col 18), ingested_at (col 39)
   const dateFormat = 'mm/dd/yyyy hh:mm:ss AM/PM';
-  if (values.length > 0) {
+  if (!STORE_RAW_SESSIONS && values.length > 0) {
+    // Only apply date formatting when we converted values to Date objects
     sh.getRange(newRowStart, 16, values.length, 1).setNumberFormat(dateFormat); // start_time
     sh.getRange(newRowStart, 17, values.length, 1).setNumberFormat(dateFormat); // end_time
     sh.getRange(newRowStart, 18, values.length, 1).setNumberFormat(dateFormat); // last_action_time
@@ -1215,9 +1758,10 @@ function fetchChannelSummaryData_(cfg, startDate, endDate) {
     // Set timezone to EDT/EST with DST detection
     setTimezoneEDT_(cfg.rescueBase, cookie);
     
-    // Set up for summary report (can use Session area or Performance area)
-    // Using Session area to get channel-level session summaries
-    setReportAreaSession_(cfg.rescueBase, cookie);
+  // Set up for summary report (prefer Performance area for channel metrics)
+  // Performance area tends to return more robust channel-level metrics when used with SUMMARY.
+  // If Performance area is not supported, the helper will fallback to Session area internally.
+  setReportAreaPerformance_(cfg.rescueBase, cookie);
     
     // Set output format and delimiter BEFORE setting report type
     setOutputXMLOrFallback_(cfg.rescueBase, cookie);
@@ -1229,14 +1773,17 @@ function fetchChannelSummaryData_(cfg, startDate, endDate) {
     setReportDate_(cfg.rescueBase, cookie, startStr, endStr);
     setReportTimeAllDay_(cfg.rescueBase, cookie);
     
-    // IMPORTANT: Set report type to SUMMARY (must be set AFTER other settings)
-    // Per API documentation: setReportType with type=SUMMARY
-    setReportTypeSummary_(cfg.rescueBase, cookie);
+  // IMPORTANT: Set report type to SUMMARY (must be set AFTER other settings)
+  // Per API documentation: setReportType with type=SUMMARY
+  setReportTypeSummary_(cfg.rescueBase, cookie);
+  // Small delay to give the Rescue API session state a moment to settle in case the server
+  // returns previous state briefly (helps avoid intermittent LISTALL responses).
+  try { Utilities.sleep(250); } catch (e) { /* ignore in non-runtime tests */ }
     
     // Verify report type was set correctly using getReportType (non-blocking)
     try {
       const currentReportType = getReportType_(cfg.rescueBase, cookie);
-      Logger.log(`Current report type after setting: ${currentReportType}`);
+      Logger.log(`Current report type after setting (channel summary): ${currentReportType}`);
       if (!currentReportType || currentReportType !== 'SUMMARY') {
         Logger.log(`WARNING: Report type is ${currentReportType}, expected SUMMARY. Attempting to re-set...`);
         setReportTypeSummary_(cfg.rescueBase, cookie);
@@ -1474,28 +2021,22 @@ function createDailySummarySheet_(ss, startDate, endDate) {
     totalSessionsRow.push(totalSessionsAll);
     summaryRows.push(totalSessionsRow);
     
-    // Total duration/Work Time per day
+    // Total duration/Work Time per day (store as numeric time fractions)
     const totalDurationRow = ['Total duration/ Total Work Time'];
     let totalWorkSecondsAll = 0;
     dates.forEach(d => {
       const data = dailyData[d];
       if (data && data.totalWorkSeconds > 0) {
-        const hours = Math.floor(data.totalWorkSeconds / 3600);
-        const minutes = Math.floor((data.totalWorkSeconds % 3600) / 60);
-        const seconds = data.totalWorkSeconds % 60;
-        totalDurationRow.push(`${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`);
+        totalDurationRow.push(data.totalWorkSeconds / 86400);
         totalWorkSecondsAll += data.totalWorkSeconds;
       } else {
-        totalDurationRow.push('0:00:00');
+        totalDurationRow.push(0);
       }
     });
-    const totalHours = Math.floor(totalWorkSecondsAll / 3600);
-    const totalMins = Math.floor((totalWorkSecondsAll % 3600) / 60);
-    const totalSecs = totalWorkSecondsAll % 60;
-    totalDurationRow.push(`${totalHours}:${String(totalMins).padStart(2, '0')}:${String(totalSecs).padStart(2, '0')}`);
+    totalDurationRow.push(totalWorkSecondsAll / 86400);
     summaryRows.push(totalDurationRow);
     
-    // Avg Session duration per day
+    // Avg Session duration per day (numeric time fractions)
     const avgSessionRow = ['Avg Session'];
     let totalAvgSeconds = 0;
     let daysWithData = 0;
@@ -1505,29 +2046,25 @@ function createDailySummarySheet_(ss, startDate, endDate) {
         const durations = data.sessions.map(s => Number(s[durationIdx] || 0)).filter(Boolean);
         if (durations.length > 0) {
           const avg = durations.reduce((a, b) => a + b, 0) / durations.length;
-          const mins = Math.floor(avg / 60);
-          const secs = Math.floor(avg % 60);
-          avgSessionRow.push(`0:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`);
+          avgSessionRow.push(avg / 86400);
           totalAvgSeconds += avg;
           daysWithData++;
         } else {
-          avgSessionRow.push('0:00:00');
+          avgSessionRow.push(0);
         }
       } else {
-        avgSessionRow.push('0:00:00');
+        avgSessionRow.push(0);
       }
     });
     if (daysWithData > 0) {
       const overallAvg = totalAvgSeconds / daysWithData;
-      const mins = Math.floor(overallAvg / 60);
-      const secs = Math.floor(overallAvg % 60);
-      avgSessionRow.push(`0:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`);
+      avgSessionRow.push(overallAvg / 86400);
     } else {
-      avgSessionRow.push('0:00:00');
+      avgSessionRow.push(0);
     }
     summaryRows.push(avgSessionRow);
     
-    // Avg Pick-up Speed per day
+    // Avg Pick-up Speed per day (numeric time fractions)
     const avgPickupRow = ['Avg Pick-up Speed'];
     let totalPickupSeconds = 0;
     let totalPickupCount = 0;
@@ -1537,30 +2074,26 @@ function createDailySummarySheet_(ss, startDate, endDate) {
         const pickups = data.sessions.map(s => Number(s[pickupIdx] || 0)).filter(p => p > 0);
         if (pickups.length > 0) {
           const avg = pickups.reduce((a, b) => a + b, 0) / pickups.length;
-          const mins = Math.floor(avg / 60);
-          const secs = Math.floor(avg % 60);
-          avgPickupRow.push(`0:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`);
+          avgPickupRow.push(avg / 86400);
           totalPickupSeconds += avg * pickups.length;
           totalPickupCount += pickups.length;
         } else {
-          avgPickupRow.push('0:00:00');
+          avgPickupRow.push(0);
         }
       } else {
-        avgPickupRow.push('0:00:00');
+        avgPickupRow.push(0);
       }
     });
     if (totalPickupCount > 0) {
       const overallAvg = totalPickupSeconds / totalPickupCount;
-      const mins = Math.floor(overallAvg / 60);
-      const secs = Math.floor(overallAvg % 60);
-      avgPickupRow.push(`0:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`);
+      avgPickupRow.push(overallAvg / 86400);
     } else {
-      avgPickupRow.push('0:00:00');
+      avgPickupRow.push(0);
     }
     summaryRows.push(avgPickupRow);
     
     // Percentage of daily calls/total sessions
-    const pctRow = ['Percentage of daily calls/total sessions'];
+  const pctRow = ['Percentage of daily calls/total sessions'];
     dates.forEach(d => {
       const data = dailyData[d];
       if (data && totalSessionsAll > 0) {
@@ -1574,9 +2107,9 @@ function createDailySummarySheet_(ss, startDate, endDate) {
     summaryRows.push(pctRow);
     
     // Average REAL (placeholder - need to understand what this means)
-    const avgRealRow = ['Average REAL'];
-    dates.forEach(() => avgRealRow.push('0:00:00'));
-    avgRealRow.push('0:00:00');
+  const avgRealRow = ['Average REAL'];
+  dates.forEach(() => avgRealRow.push(0));
+  avgRealRow.push(0);
     summaryRows.push(avgRealRow);
     
     // Empty row
@@ -1664,20 +2197,20 @@ function createDailySummarySheet_(ss, startDate, endDate) {
     
     Object.keys(techStats).sort((a, b) => techStats[b].sessions - techStats[a].sessions).forEach(tech => {
       const stats = techStats[tech];
-      const pct = totalSessionsAll > 0 ? ((stats.sessions / totalSessionsAll) * 100).toFixed(2) : '0';
-      const sessionsPerHr = (stats.sessions / Math.max(1, (stats.workSeconds / 3600))).toFixed(2);
+      // pct as numeric fraction (0..1)
+      const pct = totalSessionsAll > 0 ? (stats.sessions / totalSessionsAll) : 0;
+      // sessions per hour numeric
+      const sessionsPerHr = stats.workSeconds > 0 ? (stats.sessions / (stats.workSeconds / 3600)) : 0;
       const avgPickup = stats.pickups.length > 0 ? (stats.pickups.reduce((a, b) => a + b, 0) / stats.pickups.length) : 0;
-      const avgPickupStr = avgPickup > 0 ? `0:${String(Math.floor(avgPickup / 60)).padStart(2, '0')}:${String(Math.floor(avgPickup % 60)).padStart(2, '0')}` : '0:00:00';
       const avgDur = stats.durations.length > 0 ? (stats.durations.reduce((a, b) => a + b, 0) / stats.durations.length) : 0;
-      const avgDurStr = avgDur > 0 ? `0:${String(Math.floor(avgDur / 60)).padStart(2, '0')}:${String(Math.floor(avgDur % 60)).padStart(2, '0')}` : '0:00:00';
-      const workTime = stats.workSeconds > 0 ? `0:${String(Math.floor(stats.workSeconds / 60)).padStart(2, '0')}:${String(Math.floor(stats.workSeconds % 60)).padStart(2, '0')}` : '0:00:00';
-      
-      const techRow = [tech, stats.sessions, pct, sessionsPerHr, avgPickupStr, avgDurStr, workTime, ...Array(dates.length - 6).fill('')];
+      const workTime = stats.workSeconds || 0;
+      // store pickups/durations/workTime as numeric time fractions (seconds/86400)
+      const techRow = [tech, stats.sessions, pct, sessionsPerHr, avgPickup / 86400, avgDur / 86400, workTime / 86400, ...Array(dates.length - 6).fill('')];
       summaryRows.push(techRow);
     });
     
     // Write to sheet
-    if (summaryRows.length > 0) {
+      if (summaryRows.length > 0) {
       summarySheet.getRange(1, 1, summaryRows.length, summaryRows[0].length).setValues(summaryRows);
       summarySheet.getRange(1, 1, 1, summaryRows[0].length).setFontWeight('bold').setBackground('#E5E7EB');
       summarySheet.getRange(2, 1, 1, summaryRows[0].length).setFontWeight('bold');
@@ -1687,6 +2220,58 @@ function createDailySummarySheet_(ss, startDate, endDate) {
       for (let i = 2; i <= summaryRows[0].length; i++) {
         summarySheet.setColumnWidth(i, 120);
       }
+      try { applyProfessionalTableStyling_(summarySheet, summaryRows[0].length); } catch (e) { Logger.log('Styling daily summary failed: ' + e.toString()); }
+
+      // Post-formatting: ensure duration/pickup cells are numeric time fractions and formatted as hh:mm:ss
+      try {
+        const lastCol = summaryRows[0].length;
+        // load column A to find metric rows
+        const colA = summarySheet.getRange(1,1,summaryRows.length,1).getValues().map(r => String((r[0]||'')).trim().toLowerCase());
+        const findRow = (label) => colA.findIndex(v => v === label.toLowerCase());
+
+        const totalSessionsRowIdx = findRow('total sessions');
+        if (totalSessionsRowIdx >= 0) {
+          summarySheet.getRange(totalSessionsRowIdx + 1, 2, 1, lastCol - 1).setNumberFormat('0');
+        }
+
+        const totalDurationRowIdx = findRow('total duration/ total work time');
+        if (totalDurationRowIdx >= 0) {
+          summarySheet.getRange(totalDurationRowIdx + 1, 2, 1, lastCol - 1).setNumberFormat('hh:mm:ss');
+        }
+
+        const avgSessionRowIdx = findRow('avg session');
+        if (avgSessionRowIdx >= 0) {
+          summarySheet.getRange(avgSessionRowIdx + 1, 2, 1, lastCol - 1).setNumberFormat('hh:mm:ss');
+        }
+
+        const avgPickupRowIdx = findRow('avg pick-up speed');
+        if (avgPickupRowIdx >= 0) {
+          summarySheet.getRange(avgPickupRowIdx + 1, 2, 1, lastCol - 1).setNumberFormat('hh:mm:ss');
+        }
+
+        const avgRealRowIdx = findRow('average real');
+        if (avgRealRowIdx >= 0) {
+          summarySheet.getRange(avgRealRowIdx + 1, 2, 1, lastCol - 1).setNumberFormat('hh:mm:ss');
+        }
+
+        // Technician summary formatting: find the header 'Technician Name' and format columns for tech rows
+        const techHeaderIdx = colA.findIndex(v => v.indexOf('technician name') === 0 || v.indexOf('technician') === 0);
+        if (techHeaderIdx >= 0) {
+          const techDataStartRow = techHeaderIdx + 2; // data starts after header row
+          const techDataRows = Object.keys(techStats).length;
+          if (techDataRows > 0) {
+            const techStartCol = 2; // Total Sessions column
+            // Total Sessions integer
+            summarySheet.getRange(techDataStartRow, techStartCol, techDataRows, 1).setNumberFormat('0');
+            // % Of Total sessions -> percent
+            summarySheet.getRange(techDataStartRow, techStartCol + 1, techDataRows, 1).setNumberFormat('0.0%');
+            // Sessions per HR -> one decimal
+            summarySheet.getRange(techDataStartRow, techStartCol + 2, techDataRows, 1).setNumberFormat('0.0');
+            // Avg Pick-up Speed, Avg Duration, Average Work Time -> hh:mm:ss (cols 5,6,7)
+            summarySheet.getRange(techDataStartRow, techStartCol + 3, techDataRows, 3).setNumberFormat('hh:mm:ss');
+          }
+        }
+      } catch (e) { Logger.log('Daily summary post-formatting failed: ' + e.toString()); }
     }
     
     Logger.log('Daily summary sheet created');
@@ -1739,7 +2324,7 @@ function createSupportDataSheet_(ss, startDate, endDate) {
     
     // Header
     supportSheet.getRange(1, 1).setValue('📊 SUPPORT DATA SUMMARY');
-    supportSheet.getRange(1, 1).setFontSize(18).setFontWeight('bold').setFontColor('#1A73E8');
+  supportSheet.getRange(1, 1).setFontSize(18).setFontWeight('bold').setFontColor('#E61C37');
     supportSheet.getRange(1, 1, 1, 8).merge();
     
     supportSheet.getRange(2, 1).setValue('Date Range:');
@@ -1753,8 +2338,8 @@ function createSupportDataSheet_(ss, startDate, endDate) {
     const totalWorkHours = (totalWorkSeconds / 3600).toFixed(1);
     const avgPickup = filtered.length > 0 ? 
       Math.round(filtered.reduce((sum, row) => sum + (Number(row[pickupIdx]) || 0), 0) / filtered.length) : 0;
-    const resolvedCount = filtered.filter(row => row[resolvedIdx] === 'Resolved').length;
-    const resolutionRate = totalSessions > 0 ? ((resolvedCount / totalSessions) * 100).toFixed(1) : '0';
+  // resolved/unresolved columns exist in Sessions but Support_Data will not report resolution metrics
+  const resolvedCount = filtered.filter(row => row[resolvedIdx] === 'Resolved').length;
     
     // Count Nova Wave sessions (calling card contains "Nova wave chat")
     const novaWaveCount = callingCardIdx >= 0 ? 
@@ -1763,14 +2348,13 @@ function createSupportDataSheet_(ss, startDate, endDate) {
         return callingCard.includes('nova wave chat');
       }).length : 0;
     
+    // Support_Data top KPIs: keep totals and timing metrics only (no resolution metrics)
+    // Use numeric time fraction for Avg Pickup so it can be formatted as hh:mm:ss
     const kpis = [
       ['Total Sessions', totalSessions],
       ['Nova Wave Sessions', novaWaveCount],
-      ['Total Work Hours', totalWorkHours + ' hrs'],
-      ['Avg Pickup Time', avgPickup + ' sec'],
-      ['Resolution Rate', resolutionRate + '%'],
-      ['Resolved Sessions', resolvedCount],
-      ['Unresolved Sessions', totalSessions - resolvedCount]
+      ['Total Work Hours', Number(totalWorkHours)],
+      ['Avg Pickup Time', avgPickup / 86400]
     ];
     
     for (let i = 0; i < kpis.length; i++) {
@@ -1779,17 +2363,18 @@ function createSupportDataSheet_(ss, startDate, endDate) {
       supportSheet.getRange(row, col).setValue(kpis[i][0]);
       supportSheet.getRange(row, col).setFontSize(11).setFontColor('#666666');
       supportSheet.getRange(row, col + 1).setValue(kpis[i][1]);
-      supportSheet.getRange(row, col + 1).setFontSize(14).setFontWeight('bold').setFontColor('#1A73E8');
+  supportSheet.getRange(row, col + 1).setFontSize(14).setFontWeight('bold').setFontColor('#E61C37');
       supportSheet.getRange(row, col, 1, 2).setBorder(true, true, true, true, true, true);
     }
     
     // Technician Performance Table
     const tableRow = kpiRow + 3;
     supportSheet.getRange(tableRow, 1).setValue('Technician Performance');
-    supportSheet.getRange(tableRow, 1).setFontSize(14).setFontWeight('bold');
-    const tableHeaders = ['Technician', 'Sessions', 'Nova Wave Sessions', 'Avg Pickup (sec)', 'Avg Duration (min)', 'Work Hours', 'Resolution Rate'];
-    supportSheet.getRange(tableRow + 1, 1, 1, tableHeaders.length).setValues([tableHeaders]);
-    supportSheet.getRange(tableRow + 1, 1, 1, tableHeaders.length).setFontWeight('bold').setBackground('#1A73E8').setFontColor('#FFFFFF');
+  supportSheet.getRange(tableRow, 1).setFontSize(14).setFontWeight('bold').setFontColor('#E61C37');
+  // Technician performance table (exclude resolution rate column)
+  const tableHeaders = ['Technician', 'Sessions', 'Nova Wave Sessions', 'Avg Pickup', 'Avg Duration', 'Work Hours'];
+  supportSheet.getRange(tableRow + 1, 1, 1, tableHeaders.length).setValues([tableHeaders]);
+  supportSheet.getRange(tableRow + 1, 1, 1, tableHeaders.length).setFontWeight('bold').setBackground('#07123B').setFontColor('#FFFFFF');
     
     // Calculate per-technician stats
     const techStats = {};
@@ -1821,94 +2406,148 @@ function createSupportDataSheet_(ss, startDate, endDate) {
     
     const techRows = Object.keys(techStats).sort((a, b) => techStats[b].sessions - techStats[a].sessions).map(tech => {
       const stats = techStats[tech];
-      const avgPickup = stats.pickups.length > 0 ? Math.round(stats.pickups.reduce((a, b) => a + b, 0) / stats.pickups.length) : 0;
-      const avgDur = stats.durations.length > 0 ? (stats.durations.reduce((a, b) => a + b, 0) / stats.durations.length / 60).toFixed(1) : '0';
-      const workHours = (stats.workSeconds / 3600).toFixed(1);
-      const resRate = stats.sessions > 0 ? ((stats.resolved / stats.sessions) * 100).toFixed(1) : '0';
-      return [tech, stats.sessions, stats.novaWave, avgPickup, avgDur, workHours, resRate + '%'];
+      const avgPickup = stats.pickups.length > 0 ? (stats.pickups.reduce((a, b) => a + b, 0) / stats.pickups.length) : 0;
+      const avgDur = stats.durations.length > 0 ? (stats.durations.reduce((a, b) => a + b, 0) / stats.durations.length) : 0;
+      const workHoursNum = stats.workSeconds / 3600;
+      // store average pickup and duration as numeric time fractions, work hours as numeric hours
+      return [tech, stats.sessions, stats.novaWave, avgPickup / 86400, avgDur / 86400, workHoursNum];
     });
     
     if (techRows.length > 0) {
       supportSheet.getRange(tableRow + 2, 1, techRows.length, tableHeaders.length).setValues(techRows);
+      // format avg pickup/duration as times and work hours as one-decimal number
+      try {
+        supportSheet.getRange(tableRow + 2, 4, techRows.length, 1).setNumberFormat('hh:mm:ss');
+        supportSheet.getRange(tableRow + 2, 5, techRows.length, 1).setNumberFormat('hh:mm:ss');
+        supportSheet.getRange(tableRow + 2, 6, techRows.length, 1).setNumberFormat('0.0');
+      } catch (e) { /* ignore */ }
     }
     
-    // Channel Performance Summary (from API)
+    // Channel Performance Summary (daily wide format)
+    // Build a wide table with rows for the requested KPIs and columns for each day in the range.
     const channelRow = tableRow + techRows.length + 4;
-    supportSheet.getRange(channelRow, 1).setValue('Channel Performance Summary (from API)');
+    supportSheet.getRange(channelRow, 1).setValue('Channel Performance Summary (daily)');
     supportSheet.getRange(channelRow, 1).setFontSize(14).setFontWeight('bold');
-    
-    // Fetch channel summary data from API using SUMMARY report type
-    const cfg = getCfg_();
-    const channelSummaryData = fetchChannelSummaryData_(cfg, startDate, endDate);
-    
-    if (channelSummaryData.length > 0) {
-      // Get all unique column names from the channel summary data
-      const allColumnNames = new Set();
-      channelSummaryData.forEach(row => {
-        Object.keys(row).forEach(key => allColumnNames.add(key));
-      });
-      
-      // Sort columns for consistent display (put Channel Name first, then common metrics)
-      const sortedColumns = Array.from(allColumnNames).sort((a, b) => {
-        const priority = ['Channel Name', 'Channel', 'Channel ID', 'Sessions', 'Total Sessions', 
-                          'Avg Duration', 'Average Duration', 'Avg Pickup', 'Average Pickup',
-                          'Total Time', 'Active Time', 'Work Time', 'Waiting Time'];
-        const aIdx = priority.indexOf(a);
-        const bIdx = priority.indexOf(b);
-        if (aIdx >= 0 && bIdx >= 0) return aIdx - bIdx;
-        if (aIdx >= 0) return -1;
-        if (bIdx >= 0) return 1;
-        return a.localeCompare(b);
-      });
-      
-      // Set headers
-      supportSheet.getRange(channelRow + 1, 1, 1, sortedColumns.length).setValues([sortedColumns]);
-      supportSheet.getRange(channelRow + 1, 1, 1, sortedColumns.length).setFontWeight('bold').setBackground('#34A853').setFontColor('#FFFFFF');
-      
-      // Build rows with all available columns
-      const channelRows = channelSummaryData.map(channelData => {
-        return sortedColumns.map(col => {
-          const value = channelData[col];
-          if (value === null || value === undefined) return '';
-          return String(value);
-        });
-      });
-      
-      if (channelRows.length > 0) {
-        supportSheet.getRange(channelRow + 2, 1, channelRows.length, sortedColumns.length).setValues(channelRows);
-      }
-    } else {
-      // Fallback to calculated data if API doesn't return channel summary
-      const channelHeaders = ['Channel', 'Sessions', 'Avg Pickup (sec)', 'Avg Duration (min)'];
-      supportSheet.getRange(channelRow + 1, 1, 1, channelHeaders.length).setValues([channelHeaders]);
-      supportSheet.getRange(channelRow + 1, 1, 1, channelHeaders.length).setFontWeight('bold').setBackground('#34A853').setFontColor('#FFFFFF');
-      
-      const channelStats = {};
-      filtered.forEach(row => {
-        const channel = row[channelIdx] || 'Unknown';
-        if (!channelStats[channel]) {
-          channelStats[channel] = {
-            sessions: 0,
-            durations: [],
-            pickups: []
-          };
-        }
-        channelStats[channel].sessions++;
-        if (row[durationIdx]) channelStats[channel].durations.push(Number(row[durationIdx]));
-        if (row[pickupIdx]) channelStats[channel].pickups.push(Number(row[pickupIdx]));
-      });
-      
-      const channelRows = Object.keys(channelStats).sort((a, b) => channelStats[b].sessions - channelStats[a].sessions).map(channel => {
-        const stats = channelStats[channel];
-        const avgPickup = stats.pickups.length > 0 ? Math.round(stats.pickups.reduce((a, b) => a + b, 0) / stats.pickups.length) : 0;
-        const avgDur = stats.durations.length > 0 ? (stats.durations.reduce((a, b) => a + b, 0) / stats.durations.length / 60).toFixed(1) : '0';
-        return [channel, stats.sessions, avgPickup, avgDur];
-      });
-      
-      if (channelRows.length > 0) {
-        supportSheet.getRange(channelRow + 2, 1, channelRows.length, channelHeaders.length).setValues(channelRows);
-      }
+
+    // Group sessions by day from the already-filtered session data
+    const dates = [];
+    let currentDate = new Date(startDate);
+    const endDateObj = new Date(endDate);
+    while (currentDate <= endDateObj) {
+      dates.push(currentDate.toISOString().split('T')[0]);
+      currentDate.setDate(currentDate.getDate() + 1);
     }
+
+    // Build a map of daily sessions
+    const dailyData = {};
+    filtered.forEach(row => {
+      try {
+        const d = new Date(row[startIdx]).toISOString().split('T')[0];
+        if (!dailyData[d]) dailyData[d] = { sessions: [], totalWorkSeconds: 0 };
+        dailyData[d].sessions.push(row);
+        dailyData[d].totalWorkSeconds += Number(row[workIdx] || 0);
+      } catch (e) { /* ignore malformed rows */ }
+    });
+
+    // Header row: Metric | date... | Totals/Averages
+    const headerRow = ['Metric'];
+    dates.forEach(d => {
+      const dObj = new Date(d + 'T00:00:00');
+      headerRow.push(`${dObj.getMonth()+1}/${dObj.getDate()}/${dObj.getFullYear()}`);
+    });
+    headerRow.push('Totals/Averages');
+
+    // Total sessions per day
+    const totalSessionsRow = ['Total sessions'];
+    let totalSessionsAll = 0;
+    dates.forEach(d => {
+      const count = dailyData[d] ? dailyData[d].sessions.length : 0;
+      totalSessionsRow.push(count);
+      totalSessionsAll += count;
+    });
+    totalSessionsRow.push(totalSessionsAll);
+
+    // Total Work Time per day (as time fractions - numeric values so sheet formats stay correct)
+    const totalWorkRow = ['Total Work Time'];
+    let totalWorkSecondsAll = 0;
+    dates.forEach(d => {
+      const secs = dailyData[d] ? dailyData[d].totalWorkSeconds : 0;
+      totalWorkSecondsAll += secs;
+      totalWorkRow.push((secs || 0) / 86400); // store as fraction of day
+    });
+    totalWorkRow.push(totalWorkSecondsAll / 86400);
+
+    // Avg Session per day (average of duration_total_seconds)
+    const avgSessionRow = ['Avg Session'];
+    let totalAvgSeconds = 0;
+    let daysWithData = 0;
+    dates.forEach(d => {
+      const data = dailyData[d];
+      if (data && data.sessions.length > 0) {
+        const durations = data.sessions.map(s => Number(s[durationIdx] || 0)).filter(Boolean);
+          if (durations.length > 0) {
+            const avg = durations.reduce((a,b) => a+b, 0) / durations.length;
+            avgSessionRow.push(avg / 86400);
+            totalAvgSeconds += avg;
+            daysWithData++;
+          } else {
+            avgSessionRow.push(0);
+          }
+      } else {
+        avgSessionRow.push(0);
+      }
+    });
+    if (daysWithData > 0) {
+      const overallAvg = totalAvgSeconds / daysWithData;
+      avgSessionRow.push(overallAvg / 86400);
+    } else {
+      avgSessionRow.push(0);
+    }
+
+    // Avg Pick-up Speed per day
+    const avgPickupRow = ['Avg Pick-up Speed'];
+    let totalPickupSeconds = 0;
+    let totalPickupCount = 0;
+    dates.forEach(d => {
+      const data = dailyData[d];
+      if (data && data.sessions.length > 0) {
+        const pickups = data.sessions.map(s => Number(s[pickupIdx] || 0)).filter(p => p > 0);
+        if (pickups.length > 0) {
+          const avg = pickups.reduce((a,b) => a+b, 0) / pickups.length;
+          avgPickupRow.push(avg / 86400);
+          totalPickupSeconds += avg * pickups.length;
+          totalPickupCount += pickups.length;
+        } else {
+          avgPickupRow.push(0);
+        }
+      } else {
+        avgPickupRow.push(0);
+      }
+    });
+    if (totalPickupCount > 0) {
+      const overallAvg = totalPickupSeconds / totalPickupCount;
+      avgPickupRow.push(overallAvg / 86400);
+    } else {
+      avgPickupRow.push(0);
+    }
+
+    // Write table to sheet
+    const wideRows = [headerRow, totalSessionsRow, totalWorkRow, avgSessionRow, avgPickupRow];
+    supportSheet.getRange(channelRow + 1, 1, wideRows.length, wideRows[0].length).setValues(wideRows);
+    // Make sure header is visible: use light background and dark font so titles aren't hidden
+    supportSheet.getRange(channelRow + 1, 1, 1, wideRows[0].length).setFontWeight('bold').setBackground('#E5E7EB').setFontColor('#000000');
+    // Explicit number formatting per KPI row so integers remain integers and times remain times
+    const numCols = wideRows[0].length;
+    try {
+      // Total sessions row (row index channelRow+2): integers
+      supportSheet.getRange(channelRow + 2, 2, 1, numCols - 1).setNumberFormat('0');
+      // Total work row (time fractions)
+      supportSheet.getRange(channelRow + 3, 2, 1, numCols - 1).setNumberFormat('hh:mm:ss');
+      // Avg session row (time fractions)
+      supportSheet.getRange(channelRow + 4, 2, 1, numCols - 1).setNumberFormat('hh:mm:ss');
+      // Avg pickup row (time fractions)
+      supportSheet.getRange(channelRow + 5, 2, 1, numCols - 1).setNumberFormat('hh:mm:ss');
+    } catch (e) { Logger.log('Formatting support data wide table failed: ' + e.toString()); }
     
     // Formatting
     supportSheet.setColumnWidth(1, 200);
@@ -1918,6 +2557,7 @@ function createSupportDataSheet_(ss, startDate, endDate) {
     supportSheet.setColumnWidth(5, 120);
     supportSheet.setColumnWidth(6, 120);
     supportSheet.setFrozenRows(1);
+  try { applyProfessionalTableStyling_(supportSheet, wideRows[0].length); } catch (e) { Logger.log('Styling support sheet failed: ' + e.toString()); }
     
     Logger.log('Support Data sheet created');
   } catch (e) {
@@ -2039,7 +2679,7 @@ function createFilterControl_(ss) {
   if (!sh) sh = ss.insertSheet('Dashboard_Config');
   sh.clear();
   sh.getRange(1, 1).setValue('📊 Dashboard Control Panel');
-  sh.getRange(1, 1).setFontSize(18).setFontWeight('bold').setFontColor('#1A73E8');
+  sh.getRange(1, 1).setFontSize(18).setFontWeight('bold').setFontColor('#07123B');
   sh.getRange(1, 1, 1, 3).merge();
   sh.getRange(3, 1).setValue('Time Frame:');
   sh.getRange(3, 1).setFontWeight('bold');
@@ -2075,59 +2715,117 @@ function createMainAnalyticsPage_(ss) {
   sh.getRange(2, 4).setValue('Last Updated:');
   sh.getRange(2, 5).setValue(new Date().toLocaleString());
   const kpiRow = 4;
-  const kpiCards = [
+    const kpiCards = [
     ['Total Sessions', '=COUNTA(Sessions!A2:A)'], // Column A is session_id
     ['Active Sessions', '=COUNTIFS(Sessions!C2:C, "Active")'], // Column C is session_status
     ['Nova Wave Sessions', ''], // Will be calculated dynamically in refreshAnalyticsDashboard_ based on time frame
-    ['Avg Duration', '=IF(COUNT(Sessions!U2:U)>0, ROUND(AVERAGE(Sessions!U2:U)/60, 1)&" min", "0 min")'], // Column U is duration_total_seconds
-    ['Avg Pickup Time', '=IF(COUNT(Sessions!V2:V)>0, ROUND(AVERAGE(Sessions!V2:V))&" sec", "0 sec")'], // Column V is pickup_seconds
-    ['Longest Session', '=IF(MAX(Sessions!U2:U)>0, ROUND(MAX(Sessions!U2:U)/60, 1)&" min", "0 min")'],
-    ['SLA Hit %', '=IF(COUNT(Sessions!V2:V)>0, TEXT(COUNTIFS(Sessions!V2:V, "<=30")/COUNT(Sessions!V2:V), "0.0%"), "0%")'],
-    ['Avg Sessions/Hour', '=IF(COUNTA(Sessions!A2:A)>0, ROUND(COUNTA(Sessions!A2:A)/8, 1), "0")'] // Column A is session_id
+    // Use numeric formulas returning time fractions (seconds/86400) instead of TEXT so cells remain numeric
+    ['Avg Duration', '=IF(COUNT(Sessions!U2:U)>0, AVERAGE(Sessions!U2:U)/86400, 0)'], // Column U is duration_total_seconds
+    ['Avg Pickup Time', '=IF(COUNT(Sessions!V2:V)>0, AVERAGE(Sessions!V2:V)/86400, 0)'], // Column V is pickup_seconds
+    ['Longest Session', '=IF(MAX(Sessions!U2:U)>0, MAX(Sessions!U2:U)/86400, 0)'],
+    // SLA as numeric fraction (0..1) so we can apply a percentage format
+    ['SLA Hit %', '=IF(COUNT(Sessions!V2:V)>0, COUNTIFS(Sessions!V2:V, "<=60")/COUNT(Sessions!V2:V), 0)'],
+    ['Avg Sessions/Hour', '=IF(COUNTA(Sessions!A2:A)>0, ROUND(COUNTA(Sessions!A2:A)/8, 1), 0)'] // Column A is session_id
   ];
+  // Build polished KPI cards (3 cards per row). Each card is 3 columns wide × 3 rows tall.
+  const cardWidth = 3;
+  const cardHeight = 3;
   for (let i = 0; i < kpiCards.length; i++) {
-    const row = kpiRow + Math.floor(i / 3);
-    const col = (i % 3) * 3 + 1;
-    sh.getRange(row, col).setValue(kpiCards[i][0]);
-    sh.getRange(row, col).setFontSize(10).setFontColor('#666666');
-    // Nova Wave Sessions (i=2) will be set dynamically, others use formulas
-    if (i !== 2) {
-      sh.getRange(row, col + 1).setFormula(kpiCards[i][1]);
+    const cardTop = kpiRow + Math.floor(i / 3) * cardHeight;
+    const cardLeft = (i % 3) * cardWidth + 1;
+    const title = kpiCards[i][0];
+    const formula = kpiCards[i][1];
+
+  // Card header strip
+  const hdrRange = sh.getRange(cardTop, cardLeft, 1, cardWidth);
+  hdrRange.merge();
+  hdrRange.setValue(title).setFontSize(10).setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#1A73E8').setHorizontalAlignment('left');
+
+    // Card value area (prominent)
+    const valRange = sh.getRange(cardTop + 1, cardLeft, 1, cardWidth);
+    valRange.merge();
+    if (i !== 2 && formula) {
+      // place formula for dynamic KPIs
+      valRange.setFormula(formula);
+      // Apply appropriate number formats so numeric results display correctly
+      try {
+        if (/avg duration/i.test(title) || /avg pickup/i.test(title) || /longest session/i.test(title)) {
+          valRange.setNumberFormat('hh:mm:ss');
+        } else if (/sla hit/i.test(title)) {
+          valRange.setNumberFormat('0.0%');
+        } else if (/total sessions/i.test(title)) {
+          valRange.setNumberFormat('0');
+        } else if (/avg sessions\/hour/i.test(title)) {
+          valRange.setNumberFormat('0.0');
+        }
+      } catch (e) { /* ignore formatting errors */ }
+    } else {
+      // placeholder value for Nova Wave Sessions (filled by refreshAnalyticsDashboard_)
+      valRange.setValue('—');
     }
-    sh.getRange(row, col + 1).setFontSize(16).setFontWeight('bold').setFontColor('#1A73E8');
-    sh.getRange(row, col, 1, 2).setBorder(true, true, true, true, true, true);
+  valRange.setFontSize(20).setFontWeight('bold').setFontColor('#0F172A').setHorizontalAlignment('center').setVerticalAlignment('middle').setBackground('#FFFFFF');
+
+    // Card footer / note (small muted text)
+    const noteRange = sh.getRange(cardTop + 2, cardLeft, 1, cardWidth);
+  noteRange.merge();
+  noteRange.setValue(' ').setFontSize(9).setFontColor('#666666').setBackground('#F3F4F6');
+
+    // Card border
+    try { sh.getRange(cardTop, cardLeft, cardHeight, cardWidth).setBorder(true, true, true, true, true, true); } catch (e) {}
   }
+  // Highlight specific KPI value rows for visual separation
+  try {
+    const cardCols = cardWidth * 3; // total columns spanned by KPI grid
+    // Row 7 (kpiRow + 3) - give a blue background across KPI width
+    const visualRow1 = kpiRow + 3;
+    sh.getRange(visualRow1, 1, 1, cardCols).setBackground('#1A73E8').setFontColor('#FFFFFF');
+    // Find SLA Hit % position (index 6) and color the value row below its header
+    const slaIndex = kpiCards.findIndex(k => /SLA Hit %/i.test(k[0]));
+    if (slaIndex >= 0) {
+      const slaGroupTop = kpiRow + Math.floor(slaIndex / 3) * cardHeight;
+      const slaValueRow = slaGroupTop + 1; // row below header
+      sh.getRange(slaValueRow, 1, 1, cardCols).setBackground('#1A73E8').setFontColor('#FFFFFF');
+    }
+  } catch (e) { Logger.log('Failed to apply KPI separator rows: ' + e.toString()); }
   
   // Add Live Active Sessions section (current sessions)
-  const liveRow = kpiRow + 3;
+  // Place live area below KPI cards
+  const cardRows = Math.ceil(kpiCards.length / 3) * cardHeight;
+  const liveRow = kpiRow + cardRows + 2;
   sh.getRange(liveRow, 1).setValue('🟢 LIVE ACTIVE SESSIONS');
-  sh.getRange(liveRow, 1).setFontSize(14).setFontWeight('bold').setFontColor('#34A853');
+  sh.getRange(liveRow, 1).setFontSize(14).setFontWeight('bold').setFontColor('#0F172A');
   sh.getRange(liveRow, 1, 1, 6).merge();
   const liveHeaders = ['Technician', 'Customer', 'Start Time', 'Live Duration', 'Channel', 'Session ID'];
   sh.getRange(liveRow + 1, 1, 1, liveHeaders.length).setValues([liveHeaders]);
+  // clearly visible header - use green for live sessions
   sh.getRange(liveRow + 1, 1, 1, liveHeaders.length).setFontWeight('bold').setBackground('#34A853').setFontColor('#FFFFFF');
   sh.getRange(liveRow + 1, 1, 1, liveHeaders.length).setBorder(false, false, false, false, false, false); // Remove borders
-  const tableRow = liveRow + 18;
+  // reserve space for live rows (approx)
+  const liveSectionHeight = 12;
+  const tableRow = liveRow + liveSectionHeight + 2;
   sh.getRange(tableRow, 1).setValue('Team Performance');
-  sh.getRange(tableRow, 1).setFontSize(14).setFontWeight('bold');
+  sh.getRange(tableRow, 1).setFontSize(14).setFontWeight('bold').setFontColor('#0F172A');
   const headers = ['Technician', 'Total Sessions', 'Avg Duration', 'Avg Pickup', 'SLA Hit %', 'Sessions/Hour', 'Total Work Time'];
   sh.getRange(tableRow + 1, 1, 1, headers.length).setValues([headers]);
   sh.getRange(tableRow + 1, 1, 1, headers.length).setFontWeight('bold').setBackground('#1A73E8').setFontColor('#FFFFFF');
   sh.getRange(tableRow + 1, 1, 1, headers.length).setBorder(false, false, false, false, false, false); // Remove borders
   const activeRow = tableRow + 15;
   sh.getRange(activeRow, 1).setValue('Active Sessions (Selected Time Frame)');
-  sh.getRange(activeRow, 1).setFontSize(14).setFontWeight('bold');
+  sh.getRange(activeRow, 1).setFontSize(14).setFontWeight('bold').setFontColor('#0F172A');
   const activeHeaders = ['Technician', 'Customer Name', 'Start Time', 'Duration', 'Session ID', 'Calling Card'];
   sh.getRange(activeRow + 1, 1, 1, activeHeaders.length).setValues([activeHeaders]);
-  sh.getRange(activeRow + 1, 1, 1, activeHeaders.length).setFontWeight('bold').setBackground('#34A853').setFontColor('#FFFFFF');
+  // Use blue header for clarity (white text on blue background)
+  sh.getRange(activeRow + 1, 1, 1, activeHeaders.length).setFontWeight('bold').setBackground('#1A73E8').setFontColor('#FFFFFF');
   sh.getRange(activeRow + 1, 1, 1, activeHeaders.length).setBorder(false, false, false, false, false, false); // Remove borders
-  const queueRow = 80; // Changed from activeRow + 18 to fixed row 80
-  sh.getRange(queueRow, 1).setValue('Waiting Queue');
-  sh.getRange(queueRow, 1).setFontSize(14).setFontWeight('bold');
+  // Place Waiting Queue to the right of Live Active Sessions (row 16, starting at column J)
+  const queueRow = 16;
+  const queueCol = 9; // column I (moved one left)
+  sh.getRange(queueRow, queueCol).setValue('⏳ Waiting Queue');
+  sh.getRange(queueRow, queueCol).setFontSize(14).setFontWeight('bold').setFontColor('#0F172A');
   const queueHeaders = ['Channel', 'Customer', 'Waiting Since', 'Wait Duration'];
-  sh.getRange(queueRow + 1, 1, 1, queueHeaders.length).setValues([queueHeaders]);
-  sh.getRange(queueRow + 1, 1, 1, queueHeaders.length).setFontWeight('bold').setBackground('#EA8600').setFontColor('#FFFFFF');
-  sh.getRange(queueRow + 1, 1, 1, queueHeaders.length).setBorder(false, false, false, false, false, false); // Remove borders
+  sh.getRange(queueRow + 1, queueCol, 1, queueHeaders.length).setValues([queueHeaders]);
+  sh.getRange(queueRow + 1, queueCol, 1, queueHeaders.length).setFontWeight('bold').setBackground('#EA8600').setFontColor('#FFFFFF');
+  sh.getRange(queueRow + 1, queueCol, 1, queueHeaders.length).setBorder(false, false, false, false, false, false); // Remove borders
   sh.setColumnWidth(1, 150);
   sh.setColumnWidth(2, 120);
   sh.setColumnWidth(3, 150);
@@ -2135,7 +2833,15 @@ function createMainAnalyticsPage_(ss) {
   sh.setColumnWidth(5, 150);
   sh.setColumnWidth(6, 120);
   sh.setColumnWidth(7, 150);
+  // Ensure waiting queue columns (J-M) are visible and wide enough
+  try {
+    sh.setColumnWidth(10, 150);
+    sh.setColumnWidth(11, 150);
+    sh.setColumnWidth(12, 160);
+    sh.setColumnWidth(13, 120);
+  } catch (e) {}
   sh.setFrozenRows(1);
+  try { applyProfessionalTableStyling_(sh, sh.getLastColumn()); } catch (e) { Logger.log('Styling analytics dashboard failed: ' + e.toString()); }
 }
 
 function refreshDashboardFromAPI() {
@@ -2204,7 +2910,7 @@ function refreshAnalyticsDashboard_(startDate, endDate) {
       teamData[tech].sessions++;
       if (row[pickupIdx]) {
         teamData[tech].pickups.push(Number(row[pickupIdx]));
-        if (Number(row[pickupIdx]) <= 30) teamData[tech].slaHits++;
+  if (Number(row[pickupIdx]) <= 60) teamData[tech].slaHits++;
       }
       if (row[durationIdx]) {
         teamData[tech].durations.push(Number(row[durationIdx]));
@@ -2293,9 +2999,17 @@ function refreshAnalyticsDashboard_(startDate, endDate) {
     });
     const dashboardSheet = ss.getSheetByName('Analytics_Dashboard');
     if (dashboardSheet) {
-      // Update LIVE Active Sessions (headers at row 8, data starts at row 9)
-      const liveHeaderRow = 8; // liveRow + 1 = 7 + 1 = 8
-      const liveDataRow = 9; // liveHeaderRow + 1
+  // Compute positions so refresh uses the same layout as creation
+  const kpiRow = 4;
+  const kpiCardsCount = 8; // keep in sync with createMainAnalyticsPage_
+  const cardHeight = 3;
+  const cardRows = Math.ceil(kpiCardsCount / 3) * cardHeight;
+  const liveRow = kpiRow + cardRows + 2;
+  const liveSectionHeight = 12; // reservation used during creation
+  const liveHeaderRow = liveRow + 1;
+  const liveDataRow = liveHeaderRow + 1;
+  // Column where the Waiting Queue is placed (matches createMainAnalyticsPage_ layout)
+  const queueCol = 9; // column I (to the right side of the main table)
       
       // Ensure headers are always present
       const liveHeaders = ['Technician', 'Customer', 'Start Time', 'Live Duration', 'Channel', 'Session ID'];
@@ -2312,24 +3026,21 @@ function refreshAnalyticsDashboard_(startDate, endDate) {
         dashboardSheet.getRange(liveDataRow, 1).setFontStyle('italic').setFontColor('#999999');
       }
       
-      // Update Team Performance section
-      // Row 25: "Team Performance" title (keep it)
-      // Row 26: Headers (keep/update them)
-      // Row 27+: Data rows
-      const teamTitleRow = 25;
-      const teamHeaderRow = 26;
-      const teamDataRow = 27;
-      
+      // Update Team Performance section (positioned after live area)
+      const teamTitleRow = liveRow + liveSectionHeight + 1; // title row just after live reservation
+      const teamHeaderRow = teamTitleRow + 1;
+      const teamDataRow = teamHeaderRow + 1;
+
       // Ensure title is present
-      dashboardSheet.getRange(teamTitleRow, 1).setValue('Team Performance');
-      dashboardSheet.getRange(teamTitleRow, 1).setFontSize(14).setFontWeight('bold');
-      
+  dashboardSheet.getRange(teamTitleRow, 1).setValue('Team Performance');
+  dashboardSheet.getRange(teamTitleRow, 1).setFontSize(14).setFontWeight('bold').setFontColor('#0F172A');
+
       // Ensure headers are always present
       const teamHeaders = ['Technician', 'Total Sessions', 'Avg Duration', 'Avg Pickup', 'SLA Hit %', 'Sessions/Hour', 'Total Work Time'];
       dashboardSheet.getRange(teamHeaderRow, 1, 1, teamHeaders.length).setValues([teamHeaders]);
       dashboardSheet.getRange(teamHeaderRow, 1, 1, teamHeaders.length).setFontWeight('bold').setBackground('#1A73E8').setFontColor('#FFFFFF');
       dashboardSheet.getRange(teamHeaderRow, 1, 1, teamHeaders.length).setBorder(false, false, false, false, false, false); // Remove borders
-      
+
       // Clear data rows and populate
       dashboardSheet.getRange(teamDataRow, 1, 100, 7).clearContent();
       if (teamRows.length > 0) {
@@ -2339,18 +3050,21 @@ function refreshAnalyticsDashboard_(startDate, endDate) {
       // Always get currently logged in technicians from API (refreshes regardless of time frame)
       // Uses isAnyTechAvailableOnChannel API per documentation
       const loggedInTechs = fetchLoggedInTechnicians_(cfg);
-      
-      // Update Currently Logged In Technicians (row 33)
-      const techStatusRow = 33;
-      dashboardSheet.getRange(techStatusRow, 1).setValue('👥 Currently Logged In Technicians');
-      dashboardSheet.getRange(techStatusRow, 1).setFontSize(14).setFontWeight('bold').setFontColor('#1A73E8');
-      dashboardSheet.getRange(techStatusRow, 1, 1, 3).merge();
-      dashboardSheet.getRange(techStatusRow + 1, 1, 100, 2).clearContent();
+
+      // Place Currently Logged In technicians to the right of Team Performance (same column as Waiting Queue)
+      // Move to row 28 as requested and align to the queue column
+      const techStatusRow = 28;
+      dashboardSheet.getRange(techStatusRow, queueCol).setValue('👥 Currently Logged In Technicians');
+      dashboardSheet.getRange(techStatusRow, queueCol).setFontSize(14).setFontWeight('bold').setFontColor('#07123B');
+      // Merge the title across two columns (name + status)
+      try { dashboardSheet.getRange(techStatusRow, queueCol, 1, 2).merge(); } catch (e) {}
+      // Clear the area where we'll place logged-in rows (two columns: name, status)
+      dashboardSheet.getRange(techStatusRow + 1, queueCol, 100, 2).clearContent();
       if (loggedInTechs.length > 0) {
-        dashboardSheet.getRange(techStatusRow + 1, 1, loggedInTechs.length, 2).setValues(loggedInTechs);
+        dashboardSheet.getRange(techStatusRow + 1, queueCol, loggedInTechs.length, 2).setValues(loggedInTechs);
       } else {
-        dashboardSheet.getRange(techStatusRow + 1, 1).setValue('No technicians currently logged in');
-        dashboardSheet.getRange(techStatusRow + 1, 1).setFontStyle('italic').setFontColor('#999999');
+        dashboardSheet.getRange(techStatusRow + 1, queueCol).setValue('No technicians currently logged in');
+        dashboardSheet.getRange(techStatusRow + 1, queueCol).setFontStyle('italic').setFontColor('#999999');
       }
       
       // Update Active Sessions section (shows sessions from selected time frame)
@@ -2364,13 +3078,13 @@ function refreshAnalyticsDashboard_(startDate, endDate) {
       // Update title to reflect selected time frame
       const configSheet = ss.getSheetByName('Dashboard_Config');
       const timeFrame = configSheet ? (configSheet.getRange('B3').getValue() || 'Selected Time Frame') : 'Selected Time Frame';
-      dashboardSheet.getRange(activeTitleRow, 1).setValue(`Active Sessions (${timeFrame})`);
-      dashboardSheet.getRange(activeTitleRow, 1).setFontSize(14).setFontWeight('bold');
+  dashboardSheet.getRange(activeTitleRow, 1).setValue(`Active Sessions (${timeFrame})`);
+  dashboardSheet.getRange(activeTitleRow, 1).setFontSize(14).setFontWeight('bold').setFontColor('#0F172A');
       
       // Ensure headers are always present (includes Customer Name and Calling Card)
       const activeHeaders = ['Technician', 'Customer Name', 'Start Time', 'Duration', 'Session ID', 'Calling Card'];
       dashboardSheet.getRange(activeHeaderRow, 1, 1, activeHeaders.length).setValues([activeHeaders]);
-      dashboardSheet.getRange(activeHeaderRow, 1, 1, activeHeaders.length).setFontWeight('bold').setBackground('#34A853').setFontColor('#FFFFFF');
+  dashboardSheet.getRange(activeHeaderRow, 1, 1, activeHeaders.length).setFontWeight('bold').setBackground('#1A73E8').setFontColor('#FFFFFF');
       dashboardSheet.getRange(activeHeaderRow, 1, 1, activeHeaders.length).setBorder(false, false, false, false, false, false); // Remove borders
       
       // Clear data rows and populate with sessions from selected time frame
@@ -2382,20 +3096,21 @@ function refreshAnalyticsDashboard_(startDate, endDate) {
         dashboardSheet.getRange(activeDataRow, 1).setFontStyle('italic').setFontColor('#999999');
       }
       
-      // Update Waiting Queue (row 80) - Keep columns visible even if empty
-      const queueHeaderRow = 80;
-      dashboardSheet.getRange(queueHeaderRow, 1).setValue('⏳ Waiting Queue');
-      dashboardSheet.getRange(queueHeaderRow, 1).setFontSize(14).setFontWeight('bold');
+    // Update Waiting Queue placed to the right of Live Active Sessions (row 16, column J)
+    const queueRow = 16;
+    /* queueCol already defined above to keep placement consistent */
+      dashboardSheet.getRange(queueRow, queueCol).setValue('⏳ Waiting Queue');
+      dashboardSheet.getRange(queueRow, queueCol).setFontSize(14).setFontWeight('bold');
       const queueHeaders = ['Channel', 'Customer', 'Waiting Since', 'Wait Duration'];
-      dashboardSheet.getRange(queueHeaderRow + 1, 1, 1, 4).setValues([queueHeaders]);
-      dashboardSheet.getRange(queueHeaderRow + 1, 1, 1, 4).setFontWeight('bold').setBackground('#EA8600').setFontColor('#FFFFFF');
-      dashboardSheet.getRange(queueHeaderRow + 1, 1, 1, 4).setBorder(false, false, false, false, false, false); // Remove borders
-      dashboardSheet.getRange(queueHeaderRow + 2, 1, 100, 4).clearContent();
+      dashboardSheet.getRange(queueRow + 1, queueCol, 1, 4).setValues([queueHeaders]);
+      dashboardSheet.getRange(queueRow + 1, queueCol, 1, 4).setFontWeight('bold').setBackground('#EA8600').setFontColor('#FFFFFF');
+      dashboardSheet.getRange(queueRow + 1, queueCol, 1, 4).setBorder(false, false, false, false, false, false); // Remove borders
+      dashboardSheet.getRange(queueRow + 2, queueCol, 100, 4).clearContent();
       if (waitingRows.length > 0) {
-        dashboardSheet.getRange(queueHeaderRow + 2, 1, waitingRows.length, 4).setValues(waitingRows);
+        dashboardSheet.getRange(queueRow + 2, queueCol, waitingRows.length, 4).setValues(waitingRows);
       } else {
-        dashboardSheet.getRange(queueHeaderRow + 2, 1).setValue('No sessions waiting');
-        dashboardSheet.getRange(queueHeaderRow + 2, 1).setFontStyle('italic').setFontColor('#999999');
+        dashboardSheet.getRange(queueRow + 2, queueCol).setValue('No sessions waiting');
+        dashboardSheet.getRange(queueRow + 2, queueCol).setFontStyle('italic').setFontColor('#999999');
       }
       
       // Update Nova Wave Sessions count for selected time frame
@@ -2409,8 +3124,61 @@ function refreshAnalyticsDashboard_(startDate, endDate) {
       const novaWaveRow = 4; // kpiRow (first row)
       const novaWaveCol = 8; // 3rd card value column (col 7 is label, col 8 is value)
       dashboardSheet.getRange(novaWaveRow, novaWaveCol).setValue(novaWaveCount);
-      dashboardSheet.getRange(novaWaveRow, novaWaveCol).setFontSize(16).setFontWeight('bold').setFontColor('#1A73E8');
-      
+      dashboardSheet.getRange(novaWaveRow, novaWaveCol).setFontSize(16).setFontWeight('bold').setFontColor('#E61C37');
+
+      // Re-apply consistent header styling after all data writes so refresh doesn't overwrite colors
+      try {
+        // KPI card headers (row 4) and KPI values (row 5)
+        const kpiRow = 4;
+        const kpiCols = 9; // covers the 3x3 card grid
+        dashboardSheet.getRange(kpiRow, 1, 1, kpiCols).setBackground('#1A73E8').setFontColor('#FFFFFF').setFontWeight('bold');
+        dashboardSheet.getRange(kpiRow + 1, 1, 1, kpiCols).setBackground('#FFFFFF').setFontColor('#0F172A').setFontWeight('bold');
+
+        // Recreate the visual separator row (same as creation)
+        const visualRow1 = kpiRow + 3;
+        dashboardSheet.getRange(visualRow1, 1, 1, kpiCols).setBackground('#1A73E8').setFontColor('#FFFFFF');
+
+        // Add special styling for SLA value row (keeps that card highlighted)
+        const slaIndex = 6; // SLA Hit % is the 7th card in the kpiCards array (0-based)
+        const cardHeight = 3;
+        const slaGroupTop = kpiRow + Math.floor(slaIndex / 3) * cardHeight;
+        const slaValueRow = slaGroupTop + 1; // value row under SLA header
+        try { dashboardSheet.getRange(slaValueRow, 1, 1, kpiCols).setBackground('#1A73E8').setFontColor('#FFFFFF').setFontWeight('bold'); } catch (e) {}
+
+        // Live header (green)
+        if (typeof liveHeaderRow !== 'undefined') {
+          dashboardSheet.getRange(liveHeaderRow, 1, 1, liveHeaders.length).setBackground('#34A853').setFontColor('#FFFFFF').setFontWeight('bold');
+        }
+
+        // Team header (blue)
+        if (typeof teamHeaderRow !== 'undefined') {
+          dashboardSheet.getRange(teamHeaderRow, 1, 1, teamHeaders.length).setBackground('#1A73E8').setFontColor('#FFFFFF').setFontWeight('bold');
+        }
+
+        // Active Sessions header (blue)
+        if (typeof activeHeaderRow !== 'undefined') {
+          dashboardSheet.getRange(activeHeaderRow, 1, 1, activeHeaders.length).setBackground('#1A73E8').setFontColor('#FFFFFF').setFontWeight('bold');
+        }
+
+        // Waiting Queue header (orange) — uses queueRow/queueCol
+        if (typeof queueRow !== 'undefined' && typeof queueCol !== 'undefined') {
+          dashboardSheet.getRange(queueRow + 1, queueCol, 1, 4).setBackground('#EA8600').setFontColor('#FFFFFF').setFontWeight('bold');
+        }
+
+        // Currently Logged In header (we merge 2 columns) - give it the same orange header style so it visually matches the waiting queue
+        if (typeof techStatusRow !== 'undefined' && typeof queueCol !== 'undefined') {
+          try { dashboardSheet.getRange(techStatusRow, queueCol, 1, 2).setBackground('#EA8600').setFontColor('#FFFFFF').setFontWeight('bold'); } catch (e) {}
+        }
+
+        // Ensure team data rows have dark font color (so values are visible)
+        if (typeof teamDataRow !== 'undefined' && teamRows && teamRows.length > 0) {
+          dashboardSheet.getRange(teamDataRow, 1, teamRows.length, teamHeaders.length).setFontColor('#0F172A');
+        }
+
+        // Re-run the professional table styling helper to restore banding/borders where necessary
+        try { applyProfessionalTableStyling_(dashboardSheet, dashboardSheet.getLastColumn()); } catch (e) { /* non-fatal */ }
+      } catch (e) { Logger.log('Re-applying header styles failed: ' + e.toString()); }
+
       dashboardSheet.getRange(2, 5).setValue(new Date().toLocaleString());
     }
   } catch (e) {
@@ -2448,17 +3216,24 @@ function generateTechnicianTabs_(startDate, endDate) {
     const headers = sessionsSheet.getRange(1, 1, 1, dataRange.getNumColumns()).getValues()[0];
     const startStr = startDate.toISOString().split('T')[0];
     const endStr = endDate.toISOString().split('T')[0];
-    const startIdx = headers.indexOf('start_time');
-    const techIdx = headers.indexOf('technician_name');
-    const statusIdx = headers.indexOf('session_status');
-    const durationIdx = headers.indexOf('duration_total_seconds');
-    const pickupIdx = headers.indexOf('pickup_seconds');
-    const workIdx = headers.indexOf('duration_work_seconds');
-    const customerIdx = headers.indexOf('customer_name'); // Column 8
-    const sessionIdIdx = headers.indexOf('session_id'); // Column 1
-    const phoneIdx = headers.indexOf('caller_phone'); // Column 26
-    const companyIdx = headers.indexOf('company_name'); // Column 24
-    const callingCardIdx = headers.indexOf('calling_card'); // Column 28
+    const getHeaderIndex = (variants) => {
+      for (const v of variants) {
+        const i = headers.findIndex(h => String(h || '').toLowerCase().trim() === v.toLowerCase().trim());
+        if (i >= 0) return i;
+      }
+      return -1;
+    };
+    const startIdx = getHeaderIndex(['start_time', 'start time', 'start_time_local']);
+    const techIdx = getHeaderIndex(['technician_name', 'technician', 'tech']);
+    const statusIdx = getHeaderIndex(['session_status', 'status']);
+    const durationIdx = getHeaderIndex(['duration_total_seconds', 'duration_seconds', 'duration_total']);
+    const pickupIdx = getHeaderIndex(['pickup_seconds', 'pickup_seconds_total', 'pickup']);
+    const workIdx = getHeaderIndex(['duration_work_seconds', 'work_seconds']);
+    const customerIdx = getHeaderIndex(['customer_name', 'customer', 'customer_name:']); // Column 8
+    const sessionIdIdx = getHeaderIndex(['session_id', 'session id', 'id']); // Column 1
+    const phoneIdx = getHeaderIndex(['caller_phone', 'caller phone', 'phone']); // Column 26
+    const companyIdx = getHeaderIndex(['company_name', 'company']); // Column 24
+    const callingCardIdx = getHeaderIndex(['calling_card', 'calling card']); // Column 28
     const filtered = allData.filter(row => {
       if (!row || !row[startIdx] || !row[techIdx]) return false;
       try {
@@ -2490,7 +3265,7 @@ function generateTechnicianTabs_(startDate, endDate) {
       const active = techRows.filter(r => r[statusIdx] === 'Active').length;
       const avgDur = durations.length > 0 ? (durations.reduce((a,b) => a+b, 0) / durations.length / 60).toFixed(1) : '0';
       const avgPickup = pickups.length > 0 ? (pickups.reduce((a,b) => a+b, 0) / pickups.length / 60).toFixed(1) : '0';
-      const slaHits = pickups.filter(p => p <= 30).length;
+  const slaHits = pickups.filter(p => p <= 60).length;
       const slaPct = pickups.length > 0 ? ((slaHits / pickups.length) * 100).toFixed(1) : '0';
       const days = Math.max(1, (new Date(endDate) - new Date(startDate)) / (1000*60*60*24));
       const sessionsPerHour = (techRows.length / days / 8).toFixed(1);
@@ -2503,17 +3278,19 @@ function generateTechnicianTabs_(startDate, endDate) {
           return callingCard.includes('nova wave chat');
         }).length : 0;
       
-      const kpiRow = 4;
+  const kpiRow = 4;
+      // Build KPI values. Durations/pickups are stored here as spreadsheet time fractions (seconds/86400)
+      const avgDurationSeconds = durations.length > 0 ? Math.round(durations.reduce((a,b)=>a+b,0) / durations.length) : 0;
+      const avgPickupSeconds = pickups.length > 0 ? Math.round(pickups.reduce((a,b)=>a+b,0) / pickups.length) : 0;
       const kpis = [
-        ['Total Sessions', String(techRows.length)],
-        ['Nova Wave Sessions', String(novaWaveCount)],
-        ['Avg Duration', avgDur + ' min'],
-        ['Avg Pickup Time', avgPickup + ' min'],
+        ['Total Sessions', techRows.length],
+        ['Nova Wave Sessions', novaWaveCount],
+        // Avg Duration and Avg Pickup stored as numeric time fractions so sheets can format them as hh:mm:ss
+        ['Avg Duration', avgDurationSeconds / 86400],
+        ['Avg Pickup Time', avgPickupSeconds / 86400],
         ['SLA Hit %', slaPct + '%'],
         ['Total Work Hours', workHours + ' hrs'],
-        ['Sessions/Hour', sessionsPerHour],
-        ['Completed', String(completed)],
-        ['Active', String(active)]
+        ['Sessions/Hour', sessionsPerHour]
       ];
       for (let i = 0; i < kpis.length; i++) {
         const row = kpiRow + Math.floor(i / 2);
@@ -2522,94 +3299,188 @@ function generateTechnicianTabs_(startDate, endDate) {
         techSheet.getRange(row, col).setFontSize(11).setFontColor('#666666');
         techSheet.getRange(row, col + 1).setValue(kpis[i][1]);
         techSheet.getRange(row, col + 1).setFontSize(16).setFontWeight('bold').setFontColor('#9C27B0');
+        // If this KPI is a duration/pickup numeric fraction, format it as hh:mm:ss
+        try {
+          if (/avg duration/i.test(kpis[i][0]) || /avg pickup/i.test(kpis[i][0])) {
+            techSheet.getRange(row, col + 1).setNumberFormat('hh:mm:ss');
+          }
+        } catch (e) { /* ignore formatting errors */ }
         techSheet.getRange(row, col, 1, 2).setBorder(true, true, true, true, true, true);
       }
-      const detailRow = kpiRow + Math.ceil(kpis.length / 2) + 2;
+      // --- Build wide per-day KPI summary for this technician ---
+      // Place the per-day summary directly under the KPI cards so it appears first
+      const summaryStart = kpiRow + Math.ceil(kpis.length / 2) + 2;
+      techSheet.getRange(summaryStart, 1).setValue('Per-day Performance Summary');
+      techSheet.getRange(summaryStart, 1).setFontSize(14).setFontWeight('bold');
+      // build dates array
+      const dates = [];
+      let currentDate = new Date(startDate);
+      const endDateObj = new Date(endDate);
+      while (currentDate <= endDateObj) {
+        dates.push(currentDate.toISOString().split('T')[0]);
+        currentDate.setDate(currentDate.getDate() + 1);
+      }
+      const headerRow = ['Metric', ...dates, 'Totals/Averages'];
+      const totalSessionsRow = ['Total sessions'];
+      const totalWorkRow = ['Total Work Time'];
+      const avgSessionRow = ['Avg Session'];
+      const avgPickupRow = ['Avg Pick-up Speed'];
+      let totalSessionsAll = 0;
+      let totalWorkAll = 0;
+      let totalAvgSeconds = 0;
+      let daysWithData = 0;
+      let totalPickupSeconds = 0;
+      let totalPickupCount = 0;
+      const dailyMap = {};
+      dates.forEach(d => { dailyMap[d] = { sessions: [], totalWorkSeconds: 0 }; });
+      techRows.forEach(r => {
+        try {
+          const d = new Date(r[startIdx]).toISOString().split('T')[0];
+          if (!dailyMap[d]) dailyMap[d] = { sessions: [], totalWorkSeconds: 0 };
+          dailyMap[d].sessions.push(r);
+          dailyMap[d].totalWorkSeconds += Number(r[workIdx] || 0);
+        } catch (e) { }
+      });
+      dates.forEach(d => {
+        const data = dailyMap[d];
+        const count = data && data.sessions ? data.sessions.length : 0;
+        totalSessionsRow.push(count);
+        totalSessionsAll += count;
+        const secs = data && data.totalWorkSeconds ? data.totalWorkSeconds : 0;
+        totalWorkRow.push(secs / 86400);
+        totalWorkAll += secs;
+        if (data && data.sessions.length > 0) {
+          const durations = data.sessions.map(s => Number(s[durationIdx] || 0)).filter(Boolean);
+          if (durations.length > 0) {
+            const avg = durations.reduce((a,b)=>a+b,0) / durations.length;
+            avgSessionRow.push(avg / 86400);
+            totalAvgSeconds += avg;
+            daysWithData++;
+          } else {
+            avgSessionRow.push(0);
+          }
+          const pickups = data.sessions.map(s => Number(s[pickupIdx] || 0)).filter(p=>p>0);
+          if (pickups.length > 0) {
+            const avgp = pickups.reduce((a,b)=>a+b,0) / pickups.length;
+            avgPickupRow.push(avgp / 86400);
+            totalPickupSeconds += avgp * pickups.length;
+            totalPickupCount += pickups.length;
+          } else {
+            avgPickupRow.push(0);
+          }
+        } else {
+          avgSessionRow.push(0);
+          avgPickupRow.push(0);
+        }
+      });
+      totalSessionsRow.push(totalSessionsAll);
+      totalWorkRow.push(totalWorkAll / 86400);
+      avgSessionRow.push(daysWithData>0 ? (totalAvgSeconds / daysWithData) / 86400 : 0);
+      avgPickupRow.push(totalPickupCount>0 ? (totalPickupSeconds / totalPickupCount) / 86400 : 0);
+      const wideRows = [headerRow, totalSessionsRow, totalWorkRow, avgSessionRow, avgPickupRow];
+      techSheet.getRange(summaryStart + 1, 1, wideRows.length, wideRows[0].length).setValues(wideRows);
+      // style header
+      try { techSheet.getRange(summaryStart + 1, 1, 1, wideRows[0].length).setFontWeight('bold').setBackground('#9C27B0').setFontColor('#FFFFFF'); } catch(e){}
+      // Format per-row: Total sessions should be an integer, the other rows are time fractions (hh:mm:ss)
+      try {
+        const valueCols = wideRows[0].length - 1; // excluding 'Metric' column
+        if (valueCols > 0) {
+          // Total sessions row -> integer
+          techSheet.getRange(summaryStart + 2, 2, 1, valueCols).setNumberFormat('0');
+          // Total Work Time -> hh:mm:ss
+          techSheet.getRange(summaryStart + 3, 2, 1, valueCols).setNumberFormat('hh:mm:ss');
+          // Avg Session -> hh:mm:ss
+          techSheet.getRange(summaryStart + 4, 2, 1, valueCols).setNumberFormat('hh:mm:ss');
+          // Avg Pick-up Speed -> hh:mm:ss
+          techSheet.getRange(summaryStart + 5, 2, 1, valueCols).setNumberFormat('hh:mm:ss');
+        }
+      } catch (e) { /* ignore formatting errors */ }
+
+      // --- Session Details (placed after the per-day summary) ---
+      const detailRow = summaryStart + 1 + wideRows.length + 2;
       techSheet.getRange(detailRow, 1).setValue('Session Details');
       techSheet.getRange(detailRow, 1).setFontSize(14).setFontWeight('bold');
-      // Column order: Date, Session ID, Status, Customer Name, Phone Number, Duration, Pickup
-      const detailHeaders = ['Date', 'Session ID', 'Status', 'Customer Name', 'Phone Number', 'Duration (hh:mm)', 'Pickup (sec)'];
+      // Column order: Date, Session ID, Customer Name, Phone Number, Duration, Pickup
+      const detailHeaders = ['Date', 'Session ID', 'Customer Name', 'Phone Number', 'Duration', 'Pickup'];
       techSheet.getRange(detailRow + 1, 1, 1, detailHeaders.length).setValues([detailHeaders]);
       techSheet.getRange(detailRow + 1, 1, 1, detailHeaders.length).setFontWeight('bold').setBackground('#9C27B0').setFontColor('#FFFFFF');
-      
-      // Get resolved_unresolved index for status information
+
+      // Resolve indices that might exist for fallback lookups
       const resolvedIdx = headers.indexOf('resolved_unresolved');
-      // callingCardIdx already defined above
-      
-      // Format duration from seconds to hh:mm
-      const formatDuration = (seconds) => {
-        if (!seconds || seconds === 0) return '0:00';
-        const totalSeconds = Math.floor(Number(seconds));
-        const hours = Math.floor(totalSeconds / 3600);
-        const minutes = Math.floor((totalSeconds % 3600) / 60);
-        return `${hours}:${String(minutes).padStart(2, '0')}`;
+      const callerNameIdx = getHeaderIndex(['caller_name', 'caller name', 'caller', 'Caller Name']);
+
+      // Helpers: content heuristics and formatting
+      const isStatus = (s) => { if (!s) return false; return /closed|waiting|active|connected|resolved|unresolved|connecting|in session|closed by/i.test(String(s)); };
+      const looksLikeName = (s) => { if (!s) return false; return /^[A-Za-z ,.'-]{3,}$/.test(String(s).trim()); };
+      const looksLikePhone = (s) => { if (!s) return false; return /\d{6,}|\(\d{3}\)\s*\d{3}/.test(String(s)); };
+      const secToTimeValue = (seconds) => {
+        const s = Math.max(0, Math.floor(Number(seconds) || 0));
+        return s / 86400; // spreadsheet time fraction
       };
-      
-      const detailRows = techRows.slice(0, 50).map(row => {
-        const date = row[startIdx] ? new Date(row[startIdx]).toISOString().split('T')[0] : '';
-        
-        // Status: combine session_status and resolved_unresolved if available
-        // Remove calling card info (rc, ps, sp, etc.)
-        let status = row[statusIdx] || '';
-        if (resolvedIdx >= 0 && row[resolvedIdx]) {
-          const resolved = String(row[resolvedIdx]).trim();
-          if (resolved && resolved !== '') {
-            // If resolved_unresolved has value like "Closed by technician" or "Closed by active customer", use it
-            if (resolved.toLowerCase().includes('closed by')) {
-              status = resolved;
-            } else if (status && resolved) {
-              status = `${status} - ${resolved}`;
-            } else if (resolved) {
-              status = resolved;
-            }
+
+      const pickCustomerFromRow = (row) => {
+        // Candidates in order of preference
+        const candIdx = [customerIdx, callerNameIdx, companyIdx, phoneIdx];
+        for (const ci of candIdx) {
+          if (ci >= 0) {
+            const v = (row[ci] || '').toString().trim();
+            if (v && looksLikeName(v) && !isStatus(v)) return v;
           }
         }
-        
-        // Remove calling card info from status (e.g., "calling card or applet - rc ps sp")
-        // Remove patterns like "- rc", "- ps", "- sp", "rc ps sp", "applet", "calling card"
-        if (status) {
-          status = String(status)
-            .replace(/calling card or applet\s*-?\s*/gi, '')
-            .replace(/\s*-?\s*(rc|ps|sp|applet|calling card)\s*/gi, '')
-            .replace(/\s*-\s*(rc|ps|sp)\s*/gi, '')
-            .replace(/\s+(rc|ps|sp)\s+/gi, ' ')
-            .trim();
+        // Try email/company fallback
+        if (customerIdx >= 0 && row[customerIdx]) {
+          const v = String(row[customerIdx]).trim();
+          if (v && !isStatus(v)) return v;
         }
-        
-        // Customer name from column 8
-        const customerName = row[customerIdx] || 'Anonymous';
-        
-        // Phone number from caller_phone (column 26)
-        const phoneNumber = row[phoneIdx] || '';
-        
-        // Duration in hh:mm format
-        const dur = row[durationIdx] ? formatDuration(row[durationIdx]) : '0:00';
-        
-        // Pickup time in seconds (not minutes)
-        const pickup = row[pickupIdx] ? String(Math.round(Number(row[pickupIdx]))) : '0';
-        
-        // New column order: Date, Session ID, Status, Customer Name, Phone Number, Duration, Pickup
-        return [
-          date, 
-          row[sessionIdIdx] || '', 
-          status,
-          customerName, 
-          phoneNumber, 
-          dur, 
-          pickup
-        ];
+        if (companyIdx >= 0 && row[companyIdx]) {
+          const v = String(row[companyIdx]).trim();
+          if (v && looksLikeName(v)) return v;
+        }
+        return 'Anonymous';
+      };
+
+      const detailRows = techRows.slice(0, 50).map(row => {
+        const date = row[startIdx] ? new Date(row[startIdx]).toISOString().split('T')[0] : '';
+        const customerName = pickCustomerFromRow(row);
+        // phone: prefer explicit phone column, otherwise try company or caller columns
+        let phoneNumber = '';
+        if (phoneIdx >= 0) phoneNumber = row[phoneIdx] || '';
+        if ((!phoneNumber || !looksLikePhone(phoneNumber)) && companyIdx >= 0) phoneNumber = row[companyIdx] || phoneNumber || '';
+        if ((!phoneNumber || !looksLikePhone(phoneNumber)) && callerNameIdx >= 0) phoneNumber = row[callerNameIdx] || phoneNumber || '';
+
+        // Duration and pickup as true time values (fraction of day)
+        const durTime = row[durationIdx] ? secToTimeValue(row[durationIdx]) : 0;
+        const pickupTime = row[pickupIdx] ? secToTimeValue(row[pickupIdx]) : 0;
+        // session id fallback: if session id looks like a timestamp, try tracking_id or other headers
+        let sessionId = row[sessionIdIdx] || '';
+        const looksLikeDateTime = (s) => { if (!s) return false; const t=String(s); return /\d{1,2}\/\d{1,2}\/\d{2,4}/.test(t) || /\d{4}-\d{2}-\d{2}/.test(t) || /\d{1,2}:\d{2}:\d{2}/.test(t); };
+        if (looksLikeDateTime(sessionId)) {
+          // try tracking id
+          const trackIdx = headers.findIndex(h => /tracking[_ ]?id/i.test(String(h||'')));
+          if (trackIdx >= 0 && row[trackIdx]) sessionId = String(row[trackIdx]);
+          else sessionId = '';
+        }
+
+        return [ date, sessionId, customerName, phoneNumber, durTime, pickupTime ];
       });
       if (detailRows.length > 0) {
         techSheet.getRange(detailRow + 2, 1, detailRows.length, detailHeaders.length).setValues(detailRows);
+        // Apply time format for duration and pickup columns
+        const durCol = detailHeaders.indexOf('Duration') + 1;
+        const pickupCol = detailHeaders.indexOf('Pickup') + 1;
+        try {
+          techSheet.getRange(detailRow + 2, durCol, detailRows.length, 1).setNumberFormat('hh:mm:ss');
+          techSheet.getRange(detailRow + 2, pickupCol, detailRows.length, 1).setNumberFormat('hh:mm:ss');
+        } catch (e) { /* ignore formatting errors */ }
       }
       techSheet.setColumnWidth(1, 100);
       techSheet.setColumnWidth(2, 150);
       techSheet.setColumnWidth(3, 150);
       techSheet.setColumnWidth(4, 120);
-      techSheet.setColumnWidth(5, 150);
+      techSheet.setColumnWidth(5, 120);
       techSheet.setColumnWidth(6, 120);
-      techSheet.setColumnWidth(7, 120);
-      techSheet.setColumnWidth(8, 100);
+
+      
     }
     Logger.log(`Generated ${techs.length} technician tabs`);
   } catch (e) {
@@ -2800,6 +3671,8 @@ function refreshAdvancedAnalyticsDashboard_(startDate, endDate) {
     
     // 8. Predictive Analytics
     currentRow = createPredictiveAnalytics_(analyticsSheet, currentRow);
+    // Re-apply visual polishing for readability after all sections are written
+    try { applyAdvancedAnalyticsStyling_(analyticsSheet); } catch (e) { Logger.log('applyAdvancedAnalyticsStyling_ failed: ' + e.toString()); }
     
   } catch (e) {
     Logger.log('refreshAdvancedAnalyticsDashboard_ error: ' + e.toString());
@@ -2859,7 +3732,7 @@ function createPeakHoursAnalysis_(sheet, startRow, startDate, endDate) {
     sheet.getRange(hourRow + 1, 1).setValue('Hour');
     sheet.getRange(hourRow + 1, 2).setValue('Sessions');
     sheet.getRange(hourRow + 1, 3).setValue('Percentage');
-    sheet.getRange(hourRow + 1, 1, 1, 3).setFontWeight('bold').setBackground('#1A73E8').setFontColor('#FFFFFF');
+  sheet.getRange(hourRow + 1, 1, 1, 3).setFontWeight('bold').setBackground('#07123B').setFontColor('#FFFFFF');
     
     const totalSessions = filtered.length;
     const hourData = [];
@@ -2880,7 +3753,7 @@ function createPeakHoursAnalysis_(sheet, startRow, startDate, endDate) {
     sheet.getRange(dayRow + 1, 1).setValue('Day');
     sheet.getRange(dayRow + 1, 2).setValue('Sessions');
     sheet.getRange(dayRow + 1, 3).setValue('Percentage');
-    sheet.getRange(dayRow + 1, 1, 1, 3).setFontWeight('bold').setBackground('#1A73E8').setFontColor('#FFFFFF');
+  sheet.getRange(dayRow + 1, 1, 1, 3).setFontWeight('bold').setBackground('#07123B').setFontColor('#FFFFFF');
     
     const dayData = dayNames.map((name, idx) => {
       const pct = totalSessions > 0 ? ((dayCounts[idx] / totalSessions) * 100).toFixed(1) : '0';
@@ -2904,6 +3777,87 @@ function createPeakHoursAnalysis_(sheet, startRow, startDate, endDate) {
   } catch (e) {
     Logger.log('createPeakHoursAnalysis_ error: ' + e.toString());
     return startRow + 50;
+  }
+}
+
+// Styling helper for Advanced_Analytics to improve readability without changing data
+function applyAdvancedAnalyticsStyling_(sheet) {
+  try {
+    if (!sheet) return;
+    const lastRow = sheet.getLastRow() || 1;
+    const lastCol = sheet.getLastColumn() || 1;
+
+    // Global font and sizing
+    sheet.getDataRange().setFontFamily('Arial').setFontSize(10).setVerticalAlignment('top');
+
+    // Freeze top area (title + timeframe rows)
+    try { sheet.setFrozenRows(3); } catch (e) {}
+
+    // Set widths for first several columns to improve readability
+    try {
+      const widths = [220, 140, 120, 120, 140, 120, 120, 120];
+      for (let c = 1; c <= Math.min(widths.length, lastCol); c++) sheet.setColumnWidth(c, widths[c-1]);
+      // For remaining columns, set a moderate width
+      for (let c = widths.length + 1; c <= Math.min(lastCol, 30); c++) {
+        if (sheet.getColumnWidth(c) < 100) sheet.setColumnWidth(c, 100);
+      }
+    } catch (e) { /* non-fatal */ }
+
+    // Apply subtle banding to the main body area (rows 4..lastRow)
+    if (lastRow > 4) {
+      try {
+        const bodyRange = sheet.getRange(4, 1, Math.max(1, lastRow - 3), lastCol);
+        // remove existing banding then apply light grey banding
+        try { bodyRange.applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY); } catch (e) {}
+        // add thin borders for readability
+        bodyRange.setBorder(true, true, true, true, false, false, '#E0E0E0', SpreadsheetApp.BorderStyle.SOLID);
+      } catch (e) { /* ignore */ }
+    }
+
+    // Make top title row prominent
+    try {
+      sheet.getRange(1, 1, 1, lastCol).setFontSize(16).setFontWeight('bold').setFontColor('#1A73E8');
+    } catch (e) {}
+
+    // Ensure table header rows (bold & dark background set by creators) keep contrast
+    try { sheet.getRange(1,1,3,lastCol).setWrap(true); } catch (e) {}
+
+    // Auto-resize first N columns where useful (safe operation)
+    try {
+      const autoCols = Math.min(lastCol, 8);
+      for (let c = 1; c <= autoCols; c++) sheet.autoResizeColumn(c);
+    } catch (e) {}
+
+    // Highlight header/title rows in the body (rows 4..lastRow): give them a light background and black text
+    try {
+      const bodyStart = 4;
+      if (lastRow >= bodyStart) {
+        const rowCount = lastRow - bodyStart + 1;
+        const vals = sheet.getRange(bodyStart, 1, rowCount, lastCol).getValues();
+        const weights = sheet.getRange(bodyStart, 1, rowCount, lastCol).getFontWeights();
+        for (let i = 0; i < vals.length; i++) {
+          try {
+            const rowVals = vals[i];
+            const rowWeights = weights[i];
+            const firstWeight = rowWeights && rowWeights.length ? rowWeights[0] : 'normal';
+            const nonEmpty = rowVals.reduce((acc, v) => acc + (v != null && String(v).trim() !== '' ? 1 : 0), 0);
+            // If the first cell is bold (commonly a section header) OR the row has multiple non-empty cells and at least one bold cell,
+            // treat it as a header/column title row and apply light background + black text for readability.
+            const anyBold = rowWeights.some(w => String(w).toLowerCase() === 'bold');
+            if (firstWeight === 'bold' || (nonEmpty > 1 && anyBold)) {
+              const rr = bodyStart + i;
+              try { sheet.getRange(rr, 1, 1, lastCol).setBackground('#E5E7EB').setFontColor('#000000'); } catch (e) {}
+            }
+          } catch (e) { /* per-row non-fatal */ }
+        }
+      }
+    } catch (e) { /* non-fatal overall */ }
+
+  // Do not clear background colors globally — this can remove section header backgrounds set earlier.
+  // Instead ensure header rows (1-3) keep their formatting and let section code control header colors.
+
+  } catch (e) {
+    Logger.log('applyAdvancedAnalyticsStyling_ error: ' + e.toString());
   }
 }
 
@@ -2957,7 +3911,7 @@ function createTechnicianEffectiveness_(sheet, startRow, startDate, endDate) {
       if (row[durationIdx]) techMetrics[tech].durations.push(Number(row[durationIdx]));
       if (row[pickupIdx]) {
         techMetrics[tech].pickups.push(Number(row[pickupIdx]));
-        if (Number(row[pickupIdx]) <= 30) techMetrics[tech].slaHits++;
+  if (Number(row[pickupIdx]) <= 60) techMetrics[tech].slaHits++;
       }
       if (row[workIdx]) techMetrics[tech].workSeconds += Number(row[workIdx]);
       if (row[resolvedIdx] === 'Resolved') techMetrics[tech].resolved++;
@@ -3012,7 +3966,7 @@ function createTechnicianEffectiveness_(sheet, startRow, startDate, endDate) {
     const tableRow = startRow + 2;
     const tableHeaders = ['Technician', 'Sessions', 'Sessions/Hr', 'SLA %', 'Resolution %', 'Avg Duration (min)', 'Composite Score'];
     sheet.getRange(tableRow, 1, 1, tableHeaders.length).setValues([tableHeaders]);
-    sheet.getRange(tableRow, 1, 1, tableHeaders.length).setFontWeight('bold').setBackground('#1A73E8').setFontColor('#FFFFFF');
+  sheet.getRange(tableRow, 1, 1, tableHeaders.length).setFontWeight('bold').setBackground('#07123B').setFontColor('#FFFFFF');
     
     const tableData = techScores.map(t => [
       t.tech,
@@ -3131,7 +4085,7 @@ function createRepeatCustomerAnalysis_(sheet, startRow, startDate, endDate) {
     sheet.getRange(tableRow, 1).setFontSize(14).setFontWeight('bold');
     const tableHeaders = ['Customer Name', 'Email', 'Session Count', 'Session IDs'];
     sheet.getRange(tableRow + 1, 1, 1, tableHeaders.length).setValues([tableHeaders]);
-    sheet.getRange(tableRow + 1, 1, 1, tableHeaders.length).setFontWeight('bold').setBackground('#1A73E8').setFontColor('#FFFFFF');
+  sheet.getRange(tableRow + 1, 1, 1, tableHeaders.length).setFontWeight('bold').setBackground('#07123B').setFontColor('#FFFFFF');
     
     const tableData = repeatCustomers.slice(0, 20).map(c => [
       c.name,
@@ -3276,7 +4230,7 @@ function calculatePeriodMetrics_(startDate, endDate) {
     
     const durations = filtered.map(r => Number(r[durationIdx] || 0)).filter(d => d > 0);
     const pickups = filtered.map(r => Number(r[pickupIdx] || 0)).filter(p => p > 0);
-    const slaHits = pickups.filter(p => p <= 30).length;
+  const slaHits = pickups.filter(p => p <= 60).length;
     const resolved = filtered.filter(r => r[resolvedIdx] === 'Resolved').length;
     
     return {

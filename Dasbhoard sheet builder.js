@@ -107,13 +107,13 @@ function createManagementViewSheet_(ss) {
   
   // KPI Chips Row
   const kpiRow = 4;
-  const kpis = [
+    const kpis = [
     ['Sessions (Today)', '=COUNTIFS(Performance!A:A, ">="&TODAY(), Performance!A:A, "<"&TODAY()+1)'],
     ['AHT', '=AVERAGE(Performance!G:G)'],
-    ['SLA Hit %', '=COUNTIFS(Performance!H:H, "<=30")/COUNT(Performance!H:H)'],
+    ['SLA Hit %', '=COUNTIFS(Performance!H:H, "<=60")/COUNT(Performance!H:H)'],
     ['CSAT', '4.7/5'], // Placeholder - would come from separate source
     ['Utilization', '=SUM(Performance!F:F)/(8*3600*COUNTUNIQUE(Performance!C:C))'], // Work time / scheduled time
-    ['SLA Target', '≤ 30s']
+    ['SLA Target', '≤ 60s']
   ];
   
   sh.getRange(kpiRow, 1, kpis.length, 2).setValues(kpis.map(k => [k[0], k[1]]));
@@ -156,7 +156,7 @@ function createRepQuickViewSheet_(ss) {
   sh.getRange(4, 2).setFormula('=AVERAGEIFS(Performance!G:G, Performance!C:C, "="&SUBSTITUTE(USEREMAIL(), "@nova.com", ""), Performance!A:A, ">="&TODAY())');
   
   sh.getRange(5, 1).setValue('Your SLA Hit %:');
-  sh.getRange(5, 2).setFormula('=COUNTIFS(Performance!C:C, "="&SUBSTITUTE(USEREMAIL(), "@nova.com", ""), Performance!H:H, "<=30", Performance!A:A, ">="&TODAY())/COUNTIFS(Performance!C:C, "="&SUBSTITUTE(USEREMAIL(), "@nova.com", ""), Performance!A:A, ">="&TODAY())');
+  sh.getRange(5, 2).setFormula('=COUNTIFS(Performance!C:C, "="&SUBSTITUTE(USEREMAIL(), "@nova.com", ""), Performance!H:H, "<=60", Performance!A:A, ">="&TODAY())/COUNTIFS(Performance!C:C, "="&SUBSTITUTE(USEREMAIL(), "@nova.com", ""), Performance!A:A, ">="&TODAY())');
   
   sh.setColumnWidth(1, 200);
   sh.setColumnWidth(2, 120);
@@ -249,7 +249,7 @@ function refreshDashboardData() {
         COUNT(DISTINCT session_id) as sessions,
         AVG(duration_total_seconds) as avg_aht_seconds,
         SUM(duration_work_seconds) as total_work_seconds,
-        COUNTIF(pickup_seconds <= 30) / COUNT(*) as sla_hit_pct,
+    COUNTIF(pickup_seconds <= 60) / COUNT(*) as sla_hit_pct,
         AVG(pickup_seconds) as avg_pickup_seconds
       FROM \`${ids.project}.${ids.dataset}.rescue_sessions_latest\`
       WHERE DATE(start_time) >= @weekAgo
