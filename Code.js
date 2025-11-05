@@ -1,229 +1,10 @@
-/************************************************************
- * Nova Support KPIs – Rescue LISTALL → Google Sheets
- * Simplified Sheets-only version (no BigQuery)
- * - Pulls data from LogMeIn Rescue API
- * - Stores directly in Google Sheets
- * - Analytics dashboard with time frame filtering
- ************************************************************/
-
-/* ===== Default nodes ===== */
-const NODE_CANDIDATES_DEFAULT = [5648341, 300589800, 1367438801, 863388310, -2];
-
-/* ===== Runtime settings ===== */
-const FORCE_TEXT_OUTPUT = true;
-const SHEETS_SESSIONS_TABLE = 'Sessions'; // Main data storage sheet
-// If true, write raw API values into the Sessions sheet (preserve empty strings
-// and original formatting) instead of converting timestamps/durations to Dates/numbers.
-const STORE_RAW_SESSIONS = true;
-
-/* ===== Menu ===== */
-function onOpen() {
-  SpreadsheetApp.getUi().createMenu('Rescue')
-    .addItem('Configure Secrets', 'uiConfigureSecrets')
-    .addSeparator()
-    .addItem('🔍 API Smoke Test', 'apiSmokeTest')
-    .addSeparator()
-    .addItem('Pull Yesterday → Sheets', 'pullDateRangeYesterday')
-    .addItem('Pull Today → Sheets', 'pullDateRangeToday')
-    .addItem('Pull Last Week → Sheets', 'pullDateRangeLastWeek')
-    .addItem('Pull This Week → Sheets', 'pullDateRangeThisWeek')
-    .addItem('Pull Previous Month → Sheets', 'pullDateRangePreviousMonth')
-    .addItem('Pull Current Month → Sheets', 'pullDateRangeCurrentMonth')
-    .addItem('Pull Custom Range → Sheets', 'uiIngestRangeToSheets')
-    .addSeparator()
-    .addItem('🚀 Analytics Dashboard', 'createAnalyticsDashboard')
-    .addItem('🔄 Refresh Dashboard (Pull from API)', 'refreshDashboardFromAPI')
-    .addItem('🧭 Migrate Sessions Headers (Official)', 'migrateSessionsHeaders')
-    .addSeparator()
-    .addItem('📈 Advanced Analytics Dashboard', 'createAdvancedAnalyticsDashboard')
-    .addToUi();
-}
-
-/* ===== Secrets / Config ===== */
-const PROP_KEYS = {
-  RESCUE_BASE:  'RESCUE_BASE',
-  RESCUE_USER:  'RESCUE_USER',
-  RESCUE_PASS:  'RESCUE_PASS',
-  DIGIUM_HOST:   'DIGIUM_HOST',
-  DIGIUM_USER:   'DIGIUM_USER',
-  DIGIUM_PASS:   'DIGIUM_PASS',
-  NODE_JSON:    'NODE_CANDIDATES_JSON'
-};
-
-function getProps_() { return PropertiesService.getScriptProperties(); }
-function setProp_(k, v) { getProps_().setProperty(k, v); }
-function getProp_(k, d) { const v = getProps_().getProperty(k); return v != null ? v : d; }
-
-function getCfg_() {
-  const props = getProps_();
-  return {
-    rescueBase: getProp_(PROP_KEYS.RESCUE_BASE, 'https://secure.logmeinrescue.com/API'),
-    user: getProp_(PROP_KEYS.RESCUE_USER, ''),
-    pass: getProp_(PROP_KEYS.RESCUE_PASS, ''),
-    digiumHost: getProp_(PROP_KEYS.DIGIUM_HOST, 'https://nova.digiumcloud.net/xml'),
-    digiumUser: getProp_(PROP_KEYS.DIGIUM_USER, ''),
-    digiumPass: getProp_(PROP_KEYS.DIGIUM_PASS, ''),
-    nodes: (() => {
-      const j = getProp_(PROP_KEYS.NODE_JSON, '[]');
-      try { return JSON.parse(j); } catch(e) { return NODE_CANDIDATES_DEFAULT; }
-    })()
-  };
-}
-
-/* ===== UI Configuration ===== */
-function uiConfigureSecrets() {
-  const html = HtmlService.createHtmlOutput(`
-    <style>
-      body { font-family: Arial; padding: 20px; }
-      input { width: 300px; margin: 5px 0; padding: 5px; }
-      button { padding: 10px 20px; margin: 10px 5px 0 0; }
-    </style>
-    <h3>Configure Rescue API Secrets</h3>
-    <p>Rescue Base URL:<br><input type="text" id="base" placeholder="https://secure.logmeinrescue.com/API"></p>
-    <p>Email:<br><input type="email" id="user"></p>
-    <p>Password:<br><input type="password" id="pass"></p>
-    <p>Node IDs (JSON array):<br><input type="text" id="nodes" placeholder='[5648341, 300589800]'></p>
-    <hr>
-    <h3>Digium / Switchvox (optional)</h3>
-    <p>Digium Host (XML-RPC endpoint):<br><input type="text" id="dig_host" placeholder="https://nova.digiumcloud.net/xml"></p>
-    <p>Digium Username:<br><input type="text" id="dig_user"></p>
-    <p>Digium Password:<br><input type="password" id="dig_pass"></p>
-    <button onclick="save()">Save</button>
-    <button onclick="google.script.host.close()">Cancel</button>
-    <script>
-      function save() {
-        const base = document.getElementById('base').value;
-        const user = document.getElementById('user').value;
-        const pass = document.getElementById('pass').value;
-        const nodes = document.getElementById('nodes').value;
-        const digHost = document.getElementById('dig_host').value;
-        const digUser = document.getElementById('dig_user').value;
-        const digPass = document.getElementById('dig_pass').value;
-        google.script.run.saveSecrets(base, user, pass, nodes);
-        if (digHost || digUser || digPass) google.script.run.saveDigiumSecrets(digHost, digUser, digPass);
-        google.script.host.close();
-      }
-    </script>
-  `).setWidth(400).setHeight(350);
-  SpreadsheetApp.getUi().showModalDialog(html, 'Configure Secrets');
-}
-
-function saveSecrets(base, user, pass, nodes) {
-  const props = getProps_();
-  if (base) setProp_(PROP_KEYS.RESCUE_BASE, base);
-  if (user) setProp_(PROP_KEYS.RESCUE_USER, user);
-  if (pass) setProp_(PROP_KEYS.RESCUE_PASS, pass);
-  if (nodes) {
-    try { JSON.parse(nodes); setProp_(PROP_KEYS.NODE_JSON, nodes); } catch(e) {}
-  }
-  SpreadsheetApp.getActive().toast('Secrets saved');
-}
-
-function saveDigiumSecrets(host, user, pass) {
+// Cache Performance SUMMARY results for a short period to avoid redundant API calls
+function getPerfSummaryCached_(cfg, startDate, endDate) {
   try {
-    if (host) setProp_('DIGIUM_HOST', host);
-    if (user) setProp_('DIGIUM_USER', user);
-    if (pass) setProp_('DIGIUM_PASS', pass);
-    SpreadsheetApp.getActive().toast('Digium secrets saved');
-  } catch (e) { Logger.log('saveDigiumSecrets error: ' + e.toString()); }
-}
-
-/* ===== HTTP Helpers ===== */
-function apiGet_(base, endpoint, params, cookie, tries, mute) {
-  const qs = Object.keys(params || {}).map(k => `${k}=${encodeURIComponent(params[k])}`).join('&');
-  const url = `${base}/${endpoint}${qs ? '?' + qs : ''}`;
-  const opts = {
-    method: 'get',
-    headers: Object.assign(
-      {'User-Agent': 'Mozilla/5.0'},
-      cookie ? {'Cookie': cookie} : {}
-    ),
-    muteHttpExceptions: !!mute
-  };
-  return UrlFetchApp.fetch(url, opts);
-}
-
-function extractCookie_(response) {
-  const headers = response.getHeaders();
-  const setCookie = headers['Set-Cookie'] || headers['set-cookie'];
-  if (!setCookie) return null;
-  const cookies = Array.isArray(setCookie) ? setCookie : [setCookie];
-  return cookies.map(c => c.split(';')[0]).join('; ');
-}
-
-/* ===== Digium / Switchvox XML-RPC helpers ===== */
-// Helper: escape text for XML content
-function xmlEscape_(s) {
-  if (s == null) return '';
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
-}
-
-// Generic XML-RPC caller. Uses HTTP Basic Auth against the provided host.
-function xmlRpcCall_(host, methodName, params, user, pass) {
-  // Build a minimal XML-RPC request (params should be an array of simple values or objects already serialized)
-  let body = '<?xml version="1.0"?>\n<methodCall><methodName>' + methodName + '</methodName><params>';
-  (params || []).forEach(p => {
-    body += '<param><value>';
-    if (typeof p === 'number') body += '<int>' + String(p) + '</int>';
-    else if (typeof p === 'boolean') body += '<boolean>' + (p ? '1' : '0') + '</boolean>';
-  else body += '<string>' + xmlEscape_(String(p)) + '</string>';
-    body += '</value></param>';
-  });
-  body += '</params></methodCall>';
-
-  // Use application/xml per Digium error response which explicitly requires application/xml or application/json
-  const headers = { 'Content-Type': 'application/xml; charset=UTF-8', 'Accept': 'application/xml' };
-  if (user && pass) headers['Authorization'] = 'Basic ' + Utilities.base64Encode(user + ':' + pass);
-  const opts = { method: 'post', contentType: 'application/xml; charset=UTF-8', payload: body, headers: headers, muteHttpExceptions: true };
-  try {
-    const resp = UrlFetchApp.fetch(host, opts);
-    const code = resp.getResponseCode();
-    const txt = resp.getContentText();
-    if (code >= 200 && code < 300) {
-      try {
-        const xml = XmlService.parse(txt);
-        return { ok: true, xml: xml, raw: txt };
-      } catch (e) {
-        return { ok: false, error: 'XML parse error: ' + e.toString(), raw: txt };
-      }
-    }
-    return { ok: false, error: 'HTTP ' + code, raw: txt };
-  } catch (e) {
-    return { ok: false, error: e.toString() };
-  }
-}
-
-// Fetch Digium call summary for a date range. This is a small wrapper and uses placeholder method names.
-// The Switchvox API uses XML-RPC; exact method names and params must be taken from the Digium docs.
-function fetchDigiumCallSummary_(startDate, endDate) {
-  const cfg = getCfg_();
-  const host = cfg.digiumHost;
-  const user = cfg.digiumUser;
-  const pass = cfg.digiumPass;
-  if (!host || !user || !pass) {
-    Logger.log('fetchDigiumCallSummary_: Digium credentials not configured');
-    return { ok: false, reason: 'missing_credentials' };
-  }
-
-  // NOTE: The method name and param structure below are placeholders. Refer to the Switchvox API docs
-  // (http://developers.digium.com/switchvox) for the correct method to request call logs or CDRs.
-  const method = 'switchvox.calls.getList'; // placeholder — replace with real method
-  const params = [ { start: startDate.toISOString(), end: endDate.toISOString() } ];
-  const r = xmlRpcCall_(host, method, params, user, pass);
-  if (!r.ok) {
-    Logger.log('fetchDigiumCallSummary_ failed: ' + (r.error || r.raw));
-    return { ok: false, error: r.error || r.raw };
-  }
-
-  // TODO: parse r.xml to extract totals per day and raw call rows
-  // For now, return the raw XML so we can iterate on parsing once we confirm method/response shape.
-  return { ok: true, xml: r.xml, raw: r.raw };
-}
+    const cache = CacheService.getScriptCache();
+    const key = `perf:${isoDate_(startDate)}:${isoDate_(endDate)}`;
+    const cached = cache.get(key);
+    // Removed helper utilities per request (positions locked and using Sessions directly)
 
 // Send a Digium-style <request method="..."> XML envelope. Returns {ok, raw, xml (XmlService.Document)}
 function digiumApiCall_(methodName, parametersXmlString, user, pass, host) {
@@ -245,317 +26,47 @@ function digiumApiCall_(methodName, parametersXmlString, user, pass, host) {
         return { ok: true, raw: txt, xml: xml };
       } catch (e) {
         return { ok: false, error: 'XML parse error: ' + e.toString(), raw: txt };
-      }
-    }
-    return { ok: false, error: 'HTTP ' + code, raw: txt };
-  } catch (e) {
-    return { ok: false, error: e.toString() };
-  }
-}
-
-// Fetch callReports.search for a date range and return parsed wide-format data when possible.
-function fetchDigiumCallReports_(startDate, endDate, options) {
-  const cfg = getCfg_();
-  const host = cfg.digiumHost;
-  const user = cfg.digiumUser;
-  const pass = cfg.digiumPass;
-  if (!host || !user || !pass) return { ok: false, reason: 'missing_credentials' };
-
-  const fmt = (d) => {
-    const dt = (d instanceof Date) ? d : new Date(d);
-    const Y = dt.getFullYear();
-    const M = String(dt.getMonth()+1).padStart(2,'0');
-    const D = String(dt.getDate()).padStart(2,'0');
-    return `${Y}-${M}-${D} 00:00:00`;
-  };
-
-  const startStr = fmt(startDate);
-  const endStr = (() => { const dt = (endDate instanceof Date) ? endDate : new Date(endDate); return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')} 23:59:59`; })();
-
-  const fields = (options && options.report_fields) || [
-    'total_calls','total_incoming_calls','total_outgoing_calls','talking_duration','call_duration','avg_talking_duration','avg_call_duration'
-  ];
-
-  // Human-friendly labels for metrics (used in wide table rows)
-  const human = {
-    total_calls: 'Total Calls', total_incoming_calls: 'Total Incoming Calls', total_outgoing_calls: 'Total Outgoing Calls',
-    talking_duration: 'Talking Duration (s)', call_duration: 'Call Duration (s)', avg_talking_duration: 'Avg Talking Duration (s)', avg_call_duration: 'Avg Call Duration (s)'
-  };
-
-  // prefer per-day breakdown for wide output; use Switchvox token 'by_day' per API docs
-  const breakdown = (options && options.breakdown) || 'by_day';
-
-  // Build report_fields XML
-  let reportFieldsXml = '<report_fields>'; 
-  fields.forEach(f => { reportFieldsXml += '<report_field>' + xmlEscape_(f) + '</report_field>'; });
-  reportFieldsXml += '</report_fields>';
-
-  // ignore_weekends: 0 => do not ignore weekends (user requested we do NOT ignore weekends)
-  // Optionally include account_ids (extensions) to filter results per account
-  let accountIdsXml = '';
-  if (options && options.account_ids) {
-    // accept comma-separated string or array
-    const ids = Array.isArray(options.account_ids) ? options.account_ids : String(options.account_ids).split(',').map(s=>s.trim()).filter(Boolean);
-    if (ids && ids.length) {
-      accountIdsXml = '\n    <account_ids>' + ids.map(id => '<account_id>' + xmlEscape_(id) + '</account_id>').join('') + '</account_ids>';
-    }
-  }
-
-  const paramsXml = `\n    <start_date>${xmlEscape_(startStr)}</start_date>\n    <end_date>${xmlEscape_(endStr)}</end_date>\n    <ignore_weekends>0</ignore_weekends>\n    <breakdown>${xmlEscape_(breakdown)}</breakdown>${accountIdsXml}\n    ${reportFieldsXml}\n    <format>xml</format>\n  `;
-
-  const r = digiumApiCall_('switchvox.callReports.search', paramsXml, user, pass, host);
-  // Save raw response for inspection — append rather than clear so history is preserved
-  try {
-    const ss = SpreadsheetApp.getActive();
-    let rawSh = ss.getSheetByName('Digium_Raw');
-    if (!rawSh) rawSh = ss.insertSheet('Digium_Raw');
-    const last = Math.max(1, rawSh.getLastRow());
-    const start = last + 2; // leave a blank row between entries
-    rawSh.getRange(start,1).setValue('Request (XML)');
-    rawSh.getRange(start+1,1).setValue(paramsXml);
-    rawSh.getRange(start+3,1).setValue('Raw XML Response');
-    rawSh.getRange(start+4,1).setValue(r.raw || (r.error || ''));
-  } catch (e) { Logger.log('Failed to append Digium_Raw: ' + e.toString()); }
-
-  // If Digium returned an error (for example "Invalid breakdown"), try a fallback without the breakdown
-  try {
-    if (r.ok && r.xml) {
-      const rootChk = r.xml.getRootElement ? r.xml.getRootElement() : null;
-      const errorsEl = rootChk ? rootChk.getChild('errors') : null;
-      if (errorsEl) {
-        const errEl = errorsEl.getChild('error');
-        const msg = errEl && errEl.getAttribute ? (errEl.getAttribute('message') ? errEl.getAttribute('message').getValue() : '') : '';
-        Logger.log('Digium returned errors: ' + msg);
-        // If breakdown is invalid, retry without breakdown param (aggregate totals)
-        if (/invalid breakdown/i.test(String(msg || ''))) {
-          try {
-            const ss2 = SpreadsheetApp.getActive();
-            let rawSh2 = ss2.getSheetByName('Digium_Raw');
-            if (!rawSh2) rawSh2 = ss2.insertSheet('Digium_Raw');
-            const last2 = Math.max(1, rawSh2.getLastRow());
-            const start2 = last2 + 2;
-            rawSh2.getRange(start2,1).setValue('Server reported invalid breakdown, retrying without <breakdown>');
-            // Remove the <breakdown>...</breakdown> element from the paramsXml
-            const paramsNoBreakdown = paramsXml.replace(/\s*<breakdown>.*?<\/breakdown>\s*/i, ' ');
-            rawSh2.getRange(start2+1,1).setValue('Retry Request (XML)');
-            rawSh2.getRange(start2+2,1).setValue(paramsNoBreakdown);
-            const r2 = digiumApiCall_('switchvox.callReports.search', paramsNoBreakdown, user, pass, host);
-            rawSh2.getRange(start2+4,1).setValue('Retry Raw XML Response');
-            rawSh2.getRange(start2+5,1).setValue(r2.raw || (r2.error || ''));
-            if (!r2.ok) return { ok: false, error: r2.error || r2.raw, raw: r.raw };
-            // Replace r with successful fallback response
-            r = r2;
-          } catch (e) {
-            Logger.log('Retry without breakdown failed: ' + e.toString());
-            return { ok: false, error: e.toString(), raw: r.raw };
-          }
-        } else {
-          return { ok: false, error: msg || (r.error || r.raw), raw: r.raw };
-        }
-      }
-    }
-  } catch (e) {
-    Logger.log('Error checking Digium errors element: ' + e.toString());
-  }
-
-  if (!r.ok) return { ok: false, error: r.error || r.raw };
-
-  // Helper: parse Digium numeric fields. Accept plain numbers or HH:MM:SS; return seconds (raw).
-  const parseDigiumNum = (txt) => {
-    if (txt == null) return 0;
-    const s = String(txt).trim();
-    if (!s) return 0;
-    // HH:MM:SS
-    if (/^\d{1,2}:\d{2}:\d{2}$/.test(s)) return parseDurationSeconds_(s);
-    const n = Number(s);
-    return isNaN(n) ? 0 : n;
-  };
-
-  // Try to parse per-day results. Best-effort: look for <day date="YYYY-MM-DD">...</day>
-  try {
-    const doc = r.xml;
-    const root = doc.getRootElement();
-
-    // Build dates array from start to end
-    const dates = [];
-    const d = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
-    const ed = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate());
-    while (d <= ed) {
-      dates.push(d.toISOString().split('T')[0]);
-      d.setDate(d.getDate() + 1);
-    }
-
-    const fieldMap = {};
-    // Initialize map for each date
-    dates.forEach(dt => { fieldMap[dt] = {}; fields.forEach(f => fieldMap[dt][f] = 0); });
-
-    // Helper: find all <day> elements anywhere
-    const findDays = (el) => {
-      const out = [];
-      const children = el.getChildren();
-      children.forEach(c => {
-        if (String(c.getName()).toLowerCase() === 'day' && c.getAttribute('date')) out.push(c);
-        out.push(...findDays(c));
-      });
-      return out;
-    };
-
-    const days = findDays(root);
-    if (days && days.length) {
-      days.forEach(dayEl => {
-        const dateAttr = dayEl.getAttribute('date') ? dayEl.getAttribute('date').getValue() : null;
-        const dateKey = dateAttr ? dateAttr.split(' ')[0] : null;
-        if (!dateKey) return;
-        fields.forEach(f => {
-          const child = dayEl.getChild(f);
-          if (child) {
-            const txt = (child.getText() || '').trim();
-            const num = parseDigiumNum(txt);
-            fieldMap[dateKey][f] = num;
-          }
-        });
-      });
-    } else {
-      // Try <rows><row .../></rows> where each row has date and metric attributes
-      const resultEl = root.getChild('result') || root;
-      const rowsEl = resultEl.getChild('rows');
-      const rowChildren = rowsEl ? rowsEl.getChildren('row') : null;
-      if (rowChildren && rowChildren.length) {
-        rowChildren.forEach(rowEl => {
-          let dateAttr = rowEl.getAttribute('date') ? rowEl.getAttribute('date').getValue() : null;
-          let dateKey = null;
-          if (dateAttr) {
-            // Convert MM/DD/YYYY to YYYY-MM-DD
-            const m = String(dateAttr).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-            if (m) dateKey = `${m[3]}-${('0'+m[1]).slice(-2)}-${('0'+m[2]).slice(-2)}`; else dateKey = dateAttr;
-          }
-          if (!dateKey) return;
-          if (!fieldMap[dateKey]) { fieldMap[dateKey] = {}; fields.forEach(f => fieldMap[dateKey][f] = 0); }
-          fields.forEach(f => {
-            const a = rowEl.getAttribute(f);
-            if (a) {
-              const num = parseDigiumNum(a.getValue());
-              fieldMap[dateKey][f] = num;
-            }
-          });
-        });
-      } else {
-        // Fallback: Digium returned aggregated attributes on a <rows ... /> element (no per-day breakdown)
-        // Example: <rows total_calls="69" total_incoming_calls="43" ... />
-        if (rowsEl && rowsEl.getAttributes && rowsEl.getAttributes().length > 0) {
-          // Build a single-date column representing the requested range
-          const rangeLabel = `${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]}`;
-          const single = {};
-          fields.forEach(f => { single[f] = 0; });
-          rowsEl.getAttributes().forEach(attr => {
-            const name = attr.getName();
-            const val = parseDigiumNum(attr.getValue());
-            if (fields.indexOf(name) >= 0) single[name] = val;
-          });
-          // Return single-column wide data labeled with the range
-          const wideRows = fields.map(f => [ (human && human[f]) || f, single[f] ]);
-          const singleDates = [rangeLabel];
-          return { ok: true, dates: singleDates, rows: wideRows, raw: r.raw };
-        }
-      }
-    }
-
-    // Build wide rows
-    const wideRows = [];
-    fields.forEach(f => {
-      const row = [ human[f] || f ];
-      dates.forEach(dKey => row.push(fieldMap[dKey] ? fieldMap[dKey][f] || 0 : 0));
-      wideRows.push(row);
-    });
-
-    return { ok: true, dates: dates, rows: wideRows, raw: r.raw };
-  } catch (e) {
-    return { ok: false, error: 'parse_failed: ' + e.toString(), raw: r.raw };
-  }
-}
-
-// Create a wide-format Digium calls sheet and write provided data (dates + metrics)
-function createDigiumCallsSheet_(wideData) {
-  // wideData: { dates: ['2025-11-01', ...], rows: [ ['Total Calls', 5, 3, ...], ['Total Duration', 3600, ...] ] }
-  const ss = SpreadsheetApp.getActive();
-  const name = 'Digium_Calls';
-  let sh = ss.getSheetByName(name);
-  if (!sh) sh = ss.insertSheet(name);
-  sh.clear();
-  const header = ['Metric'].concat(wideData.dates || []);
-  sh.getRange(1,1,1,header.length).setValues([header]);
-  for (let i=0;i<(wideData.rows||[]).length;i++) {
-    sh.getRange(2+i,1,1,wideData.rows[i].length).setValues([wideData.rows[i]]);
-  }
-  // Basic styling
-  try { sh.getRange(1,1,1,header.length).setFontWeight('bold').setBackground('#1976D2').setFontColor('#FFFFFF'); } catch(e){}
-  return sh;
-}
-
-// Convert numeric seconds in a wide table (with a Metric label column) to spreadsheet day-fractions
-// and apply hh:mm:ss formatting to the value cells. Looks for a header cell with text 'Metric'.
-function convertSecondsToDayFractionForTableAt_(sheet, headerRow, headerCol) {
-  try {
-    if (!sheet) return { ok: false, reason: 'no_sheet' };
-    const hdr = sheet.getRange(headerRow, headerCol).getValue();
-    if (!hdr || String(hdr).toLowerCase().indexOf('metric') < 0) return { ok: false, reason: 'no_metric_header' };
-    // Read a generous slice to determine the actual table width robustly
-    const maxScan = Math.max(10, Math.min(50, sheet.getLastColumn() - headerCol + 1));
-    const headerVals = sheet.getRange(headerRow, headerCol, 1, maxScan).getValues()[0];
-    const firstDataVals = sheet.getRange(headerRow + 1, headerCol, 1, maxScan).getValues()[0];
-    // Determine width where either header or first data row still has content
-    let width = 0;
-    for (let i = 0; i < maxScan; i++) {
-      const hv = headerVals[i];
-      const dv = firstDataVals[i];
-      const has = !((hv === '' || hv == null) && (dv === '' || dv == null));
-      if (has) width = i + 1; else break;
-    }
-    if (width <= 1) return { ok: false, reason: 'no_value_columns' };
-
-    // Read successive rows until we hit an empty first cell
-    const rows = [];
-    let r = headerRow + 1;
-    while (true) {
-      const first = sheet.getRange(r, headerCol).getValue();
-      if (first === '' || first == null) break;
-      const rowVals = sheet.getRange(r, headerCol, 1, width).getValues()[0];
-      rows.push({ row: r, vals: rowVals });
-      r++;
-      // Safety: avoid infinite loop
-      if (rows.length > 2000) break;
-    }
-
-    if (!rows.length) return { ok: true, converted: 0 };
-
-    // For each row, convert duration-like metrics to time fractions; leave count metrics as integers
-    rows.forEach(rr => {
-      const label = String(rr.vals[0] || '').toLowerCase();
+      // Removed helper utilities per request (Rescue_LISTALL raw dump, header fixers, strip formatting, re-ingest)
+    // Bulk read/write
+    const blockRange = sheet.getRange(headerRow + 1, headerCol, height, width);
+    const data = blockRange.getValues();
+    const newData = new Array(height);
+    const durationRows = [];
+    const countRows = [];
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i];
+      const label = String(row[0] || '').toLowerCase();
       const isDuration = /duration|time/.test(label);
-      const out = [];
-      out.push(rr.vals[0]); // metric label unchanged
-      for (let j = 1; j < rr.vals.length; j++) {
-        const v = rr.vals[j];
-        const n = (v === null || v === '') ? '' : (Number(v));
-        if (n == null || n === '' || isNaN(n)) { out.push(v); continue; }
-        out.push(isDuration ? (n / 86400) : n);
+      const out = row.slice();
+      for (let c = 1; c < width; c++) {
+        const v = out[c];
+        const n = (v === '' || v == null) ? '' : Number(v);
+        if (n === '' || isNaN(n)) continue;
+        out[c] = isDuration ? (n / 86400) : n;
       }
-      // Determine effective width for this row (trim trailing blanks)
-      let rowWidth = rr.vals.length;
-      for (let k = rr.vals.length - 1; k >= 1; k--) { // keep Metric column
-        if (rr.vals[k] === '' || rr.vals[k] == null) rowWidth--; else break;
-      }
-      if (rowWidth <= 1) return; // nothing to write
+      newData[i] = out;
+      if (isDuration) durationRows.push(i); else countRows.push(i);
+    }
 
-      // Write back converted row (only value columns) and set appropriate formats
-      try {
-        const range = sheet.getRange(rr.row, headerCol + 1, 1, rowWidth - 1).setValues([out.slice(1, rowWidth)]);
-        if (isDuration) range.setNumberFormat('hh:mm:ss'); else range.setNumberFormat('0');
-      } catch (e) {
-        Logger.log('convertSecondsToDayFractionForTableAt_ write failed for row ' + rr.row + ': ' + e.toString());
+    blockRange.setValues(newData);
+
+    function applyRuns(rows, fmt) {
+      if (!rows.length || width <= 1) return;
+      let runStart = rows[0], prev = rows[0];
+      for (let k = 1; k <= rows.length; k++) {
+        const curr = rows[k];
+        if (k === rows.length || curr !== prev + 1) {
+          sheet.getRange(headerRow + 1 + runStart, headerCol + 1, prev - runStart + 1, width - 1)
+               .setNumberFormat(fmt);
+          if (k < rows.length) runStart = curr;
+        }
+        prev = curr;
       }
-    });
-    return { ok: true, converted: rows.length };
+    }
+    applyRuns(durationRows, 'hh:mm:ss');
+    applyRuns(countRows, '0');
+
+    return { ok: true, converted: height };
   } catch (e) {
     Logger.log('convertSecondsToDayFractionForTableAt_ error: ' + e.toString());
     return { ok: false, error: e.toString() };
@@ -618,6 +129,31 @@ function getExtensionMap_() {
   return out;
 }
 
+// Return a roster of technician names from the extension_map sheet (preserves casing)
+// Only includes rows where is_active != 'false' (defaults to active when column missing)
+function getRosterTechnicianNames_() {
+  const names = [];
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const sh = ss.getSheetByName('extension_map');
+    if (!sh) return names;
+    const vals = sh.getDataRange().getValues();
+    if (!vals || vals.length < 2) return names;
+    const headers = vals[0].map(h => String(h || '').trim().toLowerCase());
+    const nameIdx = headers.indexOf('technician_name');
+    const activeIdx = headers.indexOf('is_active');
+    for (let i = 1; i < vals.length; i++) {
+      const row = vals[i];
+      const active = activeIdx >= 0 ? String(row[activeIdx] || '').toLowerCase() !== 'false' : true;
+      const name = nameIdx >= 0 ? String(row[nameIdx] || '').trim() : '';
+      if (active && name) names.push(name);
+    }
+  } catch (e) { Logger.log('getRosterTechnicianNames_ failed: ' + e.toString()); }
+  // de-dup, keep first casing
+  const seen = new Set();
+  return names.filter(n => { const k = n.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
+}
+
 // Test helper: writes a small Digium-style table to a test sheet and runs the converter so you can validate formatting.
 function writeDurationTestRow() {
   try {
@@ -658,13 +194,7 @@ function ingestDigiumRangeToSheets_(startISO, endISO) {
       SpreadsheetApp.getActive().toast('Digium response parsed and saved to Digium_Calls');
       return { ok: true };
     } else {
-      let rawSh = ss.getSheetByName('Digium_Raw');
-      if (!rawSh) rawSh = ss.insertSheet('Digium_Raw');
-      // Append the raw response rather than clearing the sheet so history is preserved
-      const last = Math.max(1, rawSh.getLastRow());
-      const start = last + 2;
-      rawSh.getRange(start,1).setValue('Raw XML Response');
-      rawSh.getRange(start+1,1).setValue(res.raw || '');
+      try { appendDigiumRaw_('', 'Raw XML Response', res.raw || ''); } catch (e) {}
       SpreadsheetApp.getActive().toast('Digium response appended to Digium_Raw (no parsed metrics)');
       return { ok: true };
     }
@@ -1090,68 +620,44 @@ function parseDurationSeconds_(val) {
 /* ===== Sheets Storage ===== */
 function getOrCreateSessionsSheet_(ss) {
   let sh = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
+  const isNew = !sh;
   if (!sh) {
     sh = ss.insertSheet(SHEETS_SESSIONS_TABLE);
   }
-  
-  // Use the exact column titles from LogMeIn Rescue API (Report Area: Session, Type: LISTALL)
-  // This ensures we store raw data exactly as returned to avoid mixed-column issues.
-  const headers = [
-    'Start Time','End Time','Last Action Time',
-    'Technician Name','Technician ID','Technician Email','Technician Group',
-    'Session ID','Session Type','Status',
-    'Your Name:','Your Phone #:','Company name:','Location Name:',
-    'Custom field 4','Custom field 5','Tracking ID','Customer IP','Device ID','Incident Tools Used',
-    'Resolved Unresolved','Channel ID','Channel Name','Calling Card',
-    'Connecting Time','Waiting Time','Total Time','Active Time','Work Time','Hold Time','Time in Transfer','Rebooting Time','Reconnecting Time',
-    'Platform','Browser Type','Host Name',
-    // Additional internal field for ingestion timestamp
-    'ingested_at'
-  ];
-  
-  // Check if header row exists and is correct
-  const headerRange = sh.getRange(1, 1, 1, headers.length);
-  const existingHeaders = headerRange.getValues()[0];
-  const needsHeaderUpdate = !existingHeaders || existingHeaders.length !== headers.length || 
-                           !existingHeaders[0] || existingHeaders[0] !== 'Start Time';
-  
-  if (needsHeaderUpdate) {
-    // Clear and set headers with improved styling
-    headerRange.clear();
+
+  // Only set headers/styling when creating a brand new sheet.
+  if (isNew) {
+    const headers = [
+      'Start Time','End Time','Last Action Time',
+      'Technician Name','Technician ID','Technician Email','Technician Group',
+      'Session ID','Session Type','Status',
+      'Your Name:','Your Phone #:','Company name:','Location Name:',
+      'Custom field 4','Custom field 5','Tracking ID','Customer IP','Device ID','Incident Tools Used',
+      'Resolved Unresolved','Channel ID','Channel Name','Calling Card',
+      'Connecting Time','Waiting Time','Total Time','Active Time','Work Time','Hold Time','Time in Transfer','Rebooting Time','Reconnecting Time',
+      'Platform','Browser Type','Host Name',
+      'ingested_at'
+    ];
+    const headerRange = sh.getRange(1, 1, 1, headers.length);
     headerRange.setValues([headers]);
-    headerRange.setFontWeight('bold')
-      .setBackground('#07123B')
-      .setFontColor('#FFFFFF')
-      .setHorizontalAlignment('left')
-      .setVerticalAlignment('middle');
-    sh.setFrozenRows(1);
-    Logger.log('Updated Sessions sheet headers');
+    try {
+      headerRange.setFontWeight('bold')
+        .setBackground('#07123B')
+        .setFontColor('#FFFFFF')
+        .setHorizontalAlignment('left')
+        .setVerticalAlignment('middle');
+      sh.setFrozenRows(1);
+    } catch (e) { /* styling optional */ }
   }
-  
-  // Set column widths for better readability
-  // Set key column widths for readability
-  sh.setColumnWidth(1, 160);  // Start Time
-  sh.setColumnWidth(2, 160);  // End Time
-  sh.setColumnWidth(3, 160);  // Last Action Time
-  sh.setColumnWidth(4, 180);  // Technician Name
-  sh.setColumnWidth(6, 200);  // Technician Email
-  sh.setColumnWidth(9, 160);  // Session Type
-  sh.setColumnWidth(11, 160); // Your Phone #:
-  sh.setColumnWidth(13, 180); // Company name:
-  sh.setColumnWidth(23, 160); // Channel Name
-  sh.setColumnWidth(headers.length, 180); // ingested_at
-  
-  // Apply consistent styling
-  try { applyProfessionalTableStyling_(sh, headers.length); } catch (e) { Logger.log('Styling sessions sheet failed: ' + e.toString()); }
 
-  // No duplicate columns in the official header set
-
+  // Do NOT alter existing formatting or column order when sheet already exists
   return sh;
 }
 
 // Migrate existing Sessions sheet to official LISTALL headers with correct column mapping.
 // Keeps raw values; attempts to map from prior normalized headers and synonyms.
-function migrateSessionsSheetToOfficial_() {
+/* Deprecated: migration utilities removed as positions are now locked by design */
+/* function migrateSessionsSheetToOfficial_() {
   const ss = SpreadsheetApp.getActive();
   const sh = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
   if (!sh) { SpreadsheetApp.getActive().toast('Sessions sheet not found'); return false; }
@@ -1245,12 +751,12 @@ function migrateSessionsSheetToOfficial_() {
   try { applyProfessionalTableStyling_(sh, newHeaders.length); } catch (e) {}
   SpreadsheetApp.getActive().toast(`Sessions migrated to official headers (${newHeaders.length} columns)`);
   return true;
-}
+} */
 
 // Public wrapper for menu/run list
-function migrateSessionsHeaders() {
+/* function migrateSessionsHeaders() {
   try { migrateSessionsSheetToOfficial_(); } catch (e) { SpreadsheetApp.getActive().toast('Migration failed: ' + e.toString()); }
-}
+} */
 
 // Apply consistent, professional styling to a sheet's table area.
 // headerCols: number of header columns (optional). If omitted, uses sheet.getLastColumn().
@@ -1684,11 +1190,12 @@ function ingestTimeRangeToSheets_(startTimestamp, endTimestamp, cfg, clearExisti
       const pullStartDate = new Date(startTimestamp);
       const pullEndDate = new Date(endTimestamp);
       
-      // Auto-refresh dashboard and create summaries with the pulled range
-      refreshAnalyticsDashboard_(pullStartDate, pullEndDate);
+  // Auto-refresh dashboard and create summaries with the pulled range
+  const perfMap = getPerfSummaryCached_(cfg, pullStartDate, pullEndDate);
+  refreshAnalyticsDashboard_(pullStartDate, pullEndDate, perfMap);
       createDailySummarySheet_(ss, pullStartDate, pullEndDate);
       createSupportDataSheet_(ss, pullStartDate, pullEndDate);
-      generateTechnicianTabs_(pullStartDate, pullEndDate);
+  generateTechnicianTabs_(pullStartDate, pullEndDate, perfMap);
       refreshAdvancedAnalyticsDashboard_(pullStartDate, pullEndDate);
       
       // Hide loading indicator
@@ -1920,6 +1427,107 @@ function fetchCurrentSessions_(cfg) {
 
 // Fetch performance summary data from API for accurate averages
 // Uses SUMMARY report type and performance area to get aggregated metrics
+
+  /* ===== Performance Raw Dump ===== */
+  function dumpPerformanceRawMenu() {
+    try {
+      const ss = SpreadsheetApp.getActive();
+      const configSheet = ss.getSheetByName('Dashboard_Config');
+      const timeFrame = configSheet ? (configSheet.getRange('B3').getValue() || 'Today') : 'Today';
+      const range = getTimeFrameRange_(timeFrame);
+      dumpPerformanceRaw_(range.startDate, range.endDate);
+      SpreadsheetApp.getActive().toast('Performance_Raw updated for ' + timeFrame, 4);
+    } catch (e) {
+      SpreadsheetApp.getActive().toast('Raw dump error: ' + e.toString().substring(0, 50));
+      Logger.log('dumpPerformanceRawMenu error: ' + e.toString());
+    }
+  }
+
+  function dumpPerformanceRaw_(startDate, endDate) {
+    try {
+      const ss = SpreadsheetApp.getActive();
+      const sessionsSheet = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
+      if (!sessionsSheet) return;
+      const dataRange = sessionsSheet.getDataRange();
+      if (dataRange.getNumRows() <= 1) return;
+
+      // Read data
+      const headers = sessionsSheet.getRange(1, 1, 1, dataRange.getNumColumns()).getValues()[0];
+      const values = sessionsSheet.getRange(2, 1, dataRange.getNumRows() - 1, dataRange.getNumColumns()).getValues();
+
+      // Header index resolver with robust matching
+      const idx = (variants) => {
+        for (const v of variants) {
+          const i = headers.findIndex(h => String(h || '').toLowerCase().trim() === String(v).toLowerCase().trim());
+          if (i >= 0) return i;
+        }
+        return -1;
+      };
+      const startIdx = idx(['Start Time','start_time']);
+      const techIdx = idx(['Technician Name','technician_name']);
+      const sesIdx = idx(['Session ID','session_id']);
+      const statusIdx = idx(['Status','session_status']);
+      const chanIdx = idx(['Channel Name','channel_name']);
+      const totalIdx = idx(['Total Time','duration_total_seconds','total_time']);
+      const activeIdx = idx(['Active Time','duration_active_seconds','active_time']);
+      const workIdx = idx(['Work Time','duration_work_seconds','work_time']);
+      const waitingIdx = idx(['Waiting Time','pickup_seconds','waiting_time']);
+      const connectingIdx = idx(['Connecting Time','connecting_time']);
+      const holdIdx = idx(['Hold Time','hold_time']);
+      const transferIdx = idx(['Time in Transfer','time_in_transfer']);
+      const rebootIdx = idx(['Rebooting Time','rebooting_time']);
+      const reconnectIdx = idx(['Reconnecting Time','reconnecting_time']);
+
+      // Filter by date range
+      const startStr = startDate.toISOString().split('T')[0];
+      const endStr = endDate.toISOString().split('T')[0];
+      const filtered = values.filter(r => {
+        const d = r[startIdx];
+        if (!d) return false;
+        try {
+          const ds = new Date(d).toISOString().split('T')[0];
+          return ds >= startStr && ds <= endStr;
+        } catch (e) { return false; }
+      });
+
+      // Create/clear output sheet
+      let out = ss.getSheetByName('Performance_Raw');
+      if (!out) out = ss.insertSheet('Performance_Raw');
+      out.clear();
+
+      const outHeaders = [
+        'Date','Technician Name','Session ID','Status','Channel Name',
+        'Total Time (sec)','Active Time (sec)','Work Time (sec)','Waiting Time (sec)',
+        'Connecting (sec)','Hold (sec)','Transfer (sec)','Reboot (sec)','Reconnect (sec)'
+      ];
+      out.getRange(1, 1, 1, outHeaders.length).setValues([outHeaders]).setFontWeight('bold').setBackground('#E5E7EB');
+
+      const rows = filtered.map(r => {
+        const ds = new Date(r[startIdx]).toISOString().split('T')[0];
+        const tName = r[techIdx] || '';
+        const sid = r[sesIdx] || '';
+        const status = r[statusIdx] || '';
+        const channel = r[chanIdx] || '';
+        const tot = parseDurationSeconds_(r[totalIdx] || 0);
+        const act = parseDurationSeconds_(r[activeIdx] || 0);
+        const work = parseDurationSeconds_(r[workIdx] || 0);
+        const wait = parseDurationSeconds_(r[waitingIdx] || 0);
+        const conn = parseDurationSeconds_(r[connectingIdx] || 0);
+        const hold = parseDurationSeconds_(r[holdIdx] || 0);
+        const trans = parseDurationSeconds_(r[transferIdx] || 0);
+        const reb = parseDurationSeconds_(r[rebootIdx] || 0);
+        const rec = parseDurationSeconds_(r[reconnectIdx] || 0);
+        return [ds, tName, sid, status, channel, tot, act, work, wait, conn, hold, trans, reb, rec];
+      });
+      if (rows.length) {
+        out.getRange(2, 1, rows.length, outHeaders.length).setValues(rows);
+      }
+      // Autosize a bit
+      try { out.autoResizeColumns(1, outHeaders.length); } catch (e) {}
+    } catch (e) {
+      Logger.log('dumpPerformanceRaw_ error: ' + e.toString());
+    }
+  }
 function fetchPerformanceSummaryData_(cfg, startDate, endDate) {
   const performanceData = {};
   try {
@@ -1940,8 +1548,8 @@ function fetchPerformanceSummaryData_(cfg, startDate, endDate) {
     setReportDate_(cfg.rescueBase, cookie, startStr, endStr);
     setReportTimeAllDay_(cfg.rescueBase, cookie);
     
-    const nodes = cfg.nodes.map(n => Number(n)).filter(Number.isFinite);
-    const noderefs = ['NODE', 'CHANNEL'];
+  const nodes = cfg.nodes.map(n => Number(n)).filter(Number.isFinite);
+  const noderefs = getSummaryNoderefs_();
     
     for (const nr of noderefs) {
       for (const node of nodes) {
@@ -2048,6 +1656,467 @@ function fetchPerformanceSummaryData_(cfg, startDate, endDate) {
   }
   
   return performanceData;
+}
+
+/* ===== Digium Map (raw, no formatting) ===== */
+function dumpDigiumMapMenu() {
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const configSheet = ss.getSheetByName('Dashboard_Config');
+    const timeFrame = configSheet ? (configSheet.getRange('B3').getValue() || 'Today') : 'Today';
+    const range = getTimeFrameRange_(timeFrame);
+    dumpDigiumMap_(range.startDate, range.endDate);
+    SpreadsheetApp.getActive().toast('Digium map written for ' + timeFrame, 4);
+  } catch (e) {
+    SpreadsheetApp.getActive().toast('Digium map error: ' + e.toString().substring(0, 50));
+    Logger.log('dumpDigiumMapMenu error: ' + e.toString());
+  }
+}
+
+function dumpDigiumMap_(startDate, endDate) {
+  try {
+    const cfg = getCfg_();
+    const host = cfg.digiumHost;
+    const user = cfg.digiumUser;
+    const pass = cfg.digiumPass;
+    if (!host || !user || !pass) {
+      SpreadsheetApp.getActive().toast('Digium credentials missing');
+      return;
+    }
+
+    // Build minimal parameters; omit breakdown for raw rows; include a broad set of report_fields if required
+    const fmt = (d) => {
+      const dt = (d instanceof Date) ? d : new Date(d);
+      const Y = dt.getFullYear();
+      const M = String(dt.getMonth()+1).padStart(2,'0');
+      const D = String(dt.getDate()).padStart(2,'0');
+      return `${Y}-${M}-${D}`;
+    };
+    const startStr = `${fmt(startDate)} 00:00:00`;
+    const endStr = `${fmt(endDate)} 23:59:59`;
+
+    // Try first without <breakdown> to get raw row listing
+    let paramsXml = `\n      <start_date>${xmlEscape_(startStr)}</start_date>\n      <end_date>${xmlEscape_(endStr)}</end_date>\n      <ignore_weekends>0</ignore_weekends>\n      <format>xml</format>\n    `;
+    let r = digiumApiCall_('switchvox.callReports.search', paramsXml, user, pass, host);
+    if (!r.ok || !r.xml) {
+      // Fallback: include a safe breakdown and common fields so we get structured rows
+      const fields = ['total_calls','total_incoming_calls','total_outgoing_calls','talking_duration','call_duration','avg_talking_duration','avg_call_duration'];
+      let reportFieldsXml = '<report_fields>' + fields.map(f=>`<report_field>${xmlEscape_(f)}</report_field>`).join('') + '</report_fields>';
+      paramsXml = `\n      <start_date>${xmlEscape_(startStr)}</start_date>\n      <end_date>${xmlEscape_(endStr)}</end_date>\n      <ignore_weekends>0</ignore_weekends>\n      <breakdown>by_day</breakdown>\n      ${reportFieldsXml}\n      <format>xml</format>\n    `;
+      r = digiumApiCall_('switchvox.callReports.search', paramsXml, user, pass, host);
+    }
+
+    const ss = SpreadsheetApp.getActive();
+    let sh = ss.getSheetByName('map');
+    if (!sh) sh = ss.insertSheet('map');
+    sh.clear();
+
+    if (!r.ok || !r.xml) {
+      // Write raw XML so you can inspect it
+      sh.getRange(1,1).setValue('Raw XML (unparsed)');
+      sh.getRange(2,1).setValue(r.raw || r.error || 'no response');
+      return;
+    }
+
+    // Parse generically: look for <rows><row .../> structure first
+    const doc = r.xml;
+    const root = doc.getRootElement();
+    let rowsEl = null;
+    // find first element named 'rows' in tree
+    const findRows = (el) => {
+      if (!el) return null;
+      if (String(el.getName()).toLowerCase() === 'rows') return el;
+      const kids = el.getChildren();
+      for (let i=0;i<kids.length;i++) { const res = findRows(kids[i]); if (res) return res; }
+      return null;
+    };
+    rowsEl = findRows(root);
+
+    if (!rowsEl) {
+      sh.getRange(1,1).setValue('No <rows> element found; writing raw XML');
+      sh.getRange(2,1).setValue(r.raw || '');
+      return;
+    }
+
+    const rowEls = rowsEl.getChildren('row');
+    if (!rowEls || !rowEls.length) {
+      // Maybe attributes exist directly on <rows>
+      const attrs = rowsEl.getAttributes ? rowsEl.getAttributes().map(a => a.getName()) : [];
+      if (attrs && attrs.length) {
+        const header = attrs;
+        sh.getRange(1,1,1,header.length).setValues([header]);
+        const vals = [rowsEl.getAttributes().map(a => a.getValue())];
+        sh.getRange(2,1,1,header.length).setValues(vals);
+        return;
+      }
+      sh.getRange(1,1).setValue('Empty <rows>');
+      return;
+    }
+
+    // Build header from union of all attribute names and first-level child element names
+    const attrSet = new Set();
+    const childSet = new Set();
+    rowEls.forEach(re => {
+      (re.getAttributes() || []).forEach(a => attrSet.add(a.getName()));
+      (re.getChildren() || []).forEach(c => childSet.add(c.getName()));
+    });
+    const header = Array.from(attrSet).concat(Array.from(childSet));
+    if (!header.length) {
+      sh.getRange(1,1).setValue('Rows found but no attributes/children; writing raw XML');
+      sh.getRange(2,1).setValue(r.raw || '');
+      return;
+    }
+    sh.getRange(1,1,1,header.length).setValues([header]);
+
+    const outRows = rowEls.map(re => {
+      const rowVals = [];
+      const attrMap = {};
+      (re.getAttributes() || []).forEach(a => { attrMap[a.getName()] = a.getValue(); });
+      const childMap = {};
+      (re.getChildren() || []).forEach(c => { childMap[c.getName()] = c.getText ? c.getText().trim() : ''; });
+      header.forEach(h => {
+        if (attrMap.hasOwnProperty(h)) rowVals.push(attrMap[h]);
+        else if (childMap.hasOwnProperty(h)) rowVals.push(childMap[h]);
+        else rowVals.push('');
+      });
+      return rowVals;
+    });
+    if (outRows.length) sh.getRange(2,1,outRows.length,header.length).setValues(outRows);
+    // No styling or links per request
+  } catch (e) {
+    Logger.log('dumpDigiumMap_ error: ' + e.toString());
+  }
+}
+
+/* ===== Rescue LISTALL Map (raw, no formatting) ===== */
+function dumpRescueListAllRawMenu() {
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const configSheet = ss.getSheetByName('Dashboard_Config');
+    const timeFrame = configSheet ? (configSheet.getRange('B3').getValue() || 'Today') : 'Today';
+    const range = getTimeFrameRange_(timeFrame);
+    dumpRescueListAllRaw_(range.startDate, range.endDate);
+    SpreadsheetApp.getActive().toast('Rescue LISTALL map written for ' + timeFrame, 4);
+  } catch (e) {
+    SpreadsheetApp.getActive().toast('Rescue map error: ' + e.toString().substring(0, 50));
+    Logger.log('dumpRescueListAllRawMenu error: ' + e.toString());
+  }
+}
+
+  try {
+    const cfg = getCfg_();
+    const base = cfg.rescueBase;
+    const cookie = login_(base, cfg.user, cfg.pass);
+    // Prepare LISTALL text pipe output
+    setReportAreaSession_(base, cookie);
+    setReportTypeListAll_(base, cookie);
+    setOutputXMLOrFallback_(base, cookie); // will set TEXT if FORCE_TEXT_OUTPUT
+    setDelimiter_(base, cookie, '|');
+    setReportDate_(base, cookie, isoDate_(startDate), isoDate_(endDate));
+    setReportTimeAllDay_(base, cookie);
+
+    const nodes = (cfg.nodes || []).map(n => Number(n)).filter(n => Number.isFinite(n));
+    const noderefs = ['NODE','CHANNEL'];
+
+    // Collect rows and union headers across nodes/noderefs
+    let headerUnion = [];
+    const rows = [];
+    const addHeaderUnion = (hs) => {
+      hs.forEach(h => { if (headerUnion.indexOf(h) === -1) headerUnion.push(h); });
+    };
+    for (let i = 0; i < noderefs.length; i++) {
+      const nr = noderefs[i];
+      for (let j = 0; j < nodes.length; j++) {
+        const node = nodes[j];
+        try {
+          const t = getReportTry_(base, cookie, node, nr);
+          if (!t || !/^OK/i.test(t)) continue;
+          const parsed = parsePipe_(t, '|');
+          if (!parsed || !parsed.headers || !parsed.rows) continue;
+          if (parsed.headers && parsed.headers.length) addHeaderUnion(parsed.headers);
+          parsed.rows.forEach(r => rows.push(r));
+          Utilities.sleep(150);
+        } catch (e) { Logger.log('dumpRescueListAllRaw_ fetch error: ' + e.toString()); }
+      }
+    }
+
+    const ss = SpreadsheetApp.getActive();
+    let sh = ss.getSheetByName('Rescue_Map');
+    if (!sh) sh = ss.insertSheet('Rescue_Map');
+    sh.clear();
+
+    if (!headerUnion.length) {
+      sh.getRange(1,1).setValue('No LISTALL data returned for selected range');
+      return;
+    }
+
+    // Write headers
+    sh.getRange(1,1,1,headerUnion.length).setValues([headerUnion]);
+
+    // Write rows preserving header order; avoid formatting or formulas
+    const out = rows.map(obj => headerUnion.map(h => (obj && obj.hasOwnProperty(h)) ? obj[h] : ''));
+    if (out.length) {
+      // Write in chunks to avoid size limits
+      const chunk = 1000;
+      for (let i = 0; i < out.length; i += chunk) {
+        const part = out.slice(i, i + chunk);
+        sh.getRange(2 + i, 1, part.length, headerUnion.length).setValues(part);
+      }
+    }
+    // No styling per request
+  } catch (e) {
+    Logger.log('dumpRescueListAllRaw_ error: ' + e.toString());
+  }
+}
+// dumpRescueListAllRaw removed per request (positions locked)
+
+/* ===== One-time header fix for Rescue_Map ===== */
+function fixRescueMapHeadersMenu() {
+  try {
+    const ok = fixRescueMapHeaders_('Technician Name');
+    SpreadsheetApp.getActive().toast(ok ? 'Rescue_Map headers adjusted' : 'Rescue_Map not found or no change');
+  } catch (e) {
+    SpreadsheetApp.getActive().toast('Header fix error: ' + e.toString().substring(0, 60));
+    Logger.log('fixRescueMapHeadersMenu error: ' + e.toString());
+  }
+}
+
+function fixRescueMapHeadersFromTechIdMenu() {
+  try {
+    const ok = fixRescueMapHeaders_('Technician ID');
+    SpreadsheetApp.getActive().toast(ok ? 'Rescue_Map headers adjusted (from Technician ID)' : 'Rescue_Map not found or no change');
+  } catch (e) {
+    SpreadsheetApp.getActive().toast('Header fix error: ' + e.toString().substring(0, 60));
+    Logger.log('fixRescueMapHeadersFromTechIdMenu error: ' + e.toString());
+  }
+}
+
+// Backward-compatible name expected by the menu (wrapper)
+function fixRescueMapFromTechIdMenu() {
+  try {
+    const ok = fixRescueMapHeaders_('Technician ID');
+    SpreadsheetApp.getActive().toast(ok ? 'Rescue_Map headers adjusted (from Technician ID)' : 'Rescue_Map not found or no change');
+  } catch (e) {
+    SpreadsheetApp.getActive().toast('Header fix error: ' + e.toString().substring(0, 60));
+    Logger.log('fixRescueMapFromTechIdMenu error: ' + e.toString());
+  }
+}
+
+function fixRescueMapHeaders_(anchorHeader) {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('sessions');
+  if (!sh) return false;
+  const lastCol = sh.getLastColumn();
+  if (lastCol < 2) return false;
+  const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0];
+  const findIdx = (vals, target) => vals.findIndex(h => String(h || '').trim().toLowerCase() === String(target).trim().toLowerCase());
+  const anchorIdx = findIdx(headers, anchorHeader || 'Technician Name');
+  if (anchorIdx < 0) return false;
+
+  // Step 1: shift all titles one column to the right starting AFTER Technician Name.
+  const srcCount = lastCol - (anchorIdx + 1);
+  if (srcCount > 0) {
+    // Ensure there is space to shift right by inserting a temporary column at the end
+    sh.insertColumnAfter(lastCol);
+    const srcRange = sh.getRange(1, srcStart, 1, srcCount);
+    const srcVals = srcRange.getValues();
+    sh.getRange(1, srcStart + 1, 1, srcCount).setValues(srcVals);
+    // Clear the original header cells we copied from
+    srcRange.clearContent();
+
+  // Step 2: delete the column immediately after Technician Name (contains 'Nova Point of Sale')
+  sh.deleteColumn(anchorIdx + 2); // +2 because getRange is 1-based
+
+  return true;
+}
+
+/* ===== Strip formatting from Sessions sheet only ===== */
+function stripSessionsFormattingMenu() {
+    const ok = stripSessionsFormatting_();
+    SpreadsheetApp.getActive().toast(ok ? 'Sessions formatting cleared' : 'Sessions sheet not found');
+  } catch (e) {
+    SpreadsheetApp.getActive().toast('Strip formatting error: ' + e.toString().substring(0,60));
+    Logger.log('stripSessionsFormattingMenu error: ' + e.toString());
+  }
+}
+
+function stripSessionsFormatting_() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
+  if (!sh) return false;
+  try {
+    // Clear cell-level formatting
+    sh.getDataRange().clearFormat();
+
+    // Remove alternating colors/banding limited to this sheet
+    try { (sh.getBandings() || []).forEach(b => b.remove()); } catch (e) {}
+
+    // Remove conditional formatting rules that target this sheet
+    try {
+      const rules = ss.getConditionalFormatRules();
+      const kept = [];
+      for (const r of rules) {
+        const ranges = r.getRanges ? r.getRanges() : [];
+        const touchesSessions = ranges && ranges.some(rg => rg.getSheet && rg.getSheet().getName && rg.getSheet().getName() === SHEETS_SESSIONS_TABLE);
+        if (!touchesSessions) kept.push(r);
+      }
+// fixRescueMapHeaders functions removed per request
+      if (kept.length !== rules.length) ss.setConditionalFormatRules(kept);
+    } catch (e) {}
+
+    // Remove sheet filter if present
+    try { const f = sh.getFilter(); if (f) f.remove(); } catch (e) {}
+
+    // Break any merged cells in the used grid
+    try { sh.getRange(1,1,sh.getMaxRows(), sh.getMaxColumns()).breakApart(); } catch (e) {}
+
+    // Remove row/column grouping within Sessions only
+    try {
+      sh.getRange(1, 1, Math.max(1, sh.getMaxRows()), 1).shiftRowGroupDepth(-8);
+      sh.getRange(1, 1, 1, Math.max(1, sh.getMaxColumns())).shiftColumnGroupDepth(-8);
+    } catch (e) {}
+
+    // Unfreeze any frozen rows/columns
+    try { sh.setFrozenRows(0); sh.setFrozenColumns(0); } catch (e) {}
+
+    return true;
+  } catch (e) {
+    Logger.log('stripSessionsFormatting_ error: ' + e.toString());
+    return false;
+  }
+}
+
+/* ===== Re-ingest Sessions using Rescue_Map header order (skip 5th column values) ===== */
+function reingestSessionsRescueMapMenu() {
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const configSheet = ss.getSheetByName('Dashboard_Config');
+    const timeFrame = configSheet ? (configSheet.getRange('B3').getValue() || 'Today') : 'Today';
+    const range = getTimeFrameRange_(timeFrame);
+    const res = reingestSessionsRescueMap_(range.startDate, range.endDate);
+    SpreadsheetApp.getActive().toast(res && res.ok ? `Sessions re-ingested (${res.rows} rows)` : ('Error: ' + (res && res.error ? res.error : 'unknown')));
+  } catch (e) {
+    SpreadsheetApp.getActive().toast('Re-ingest error: ' + e.toString().substring(0, 60));
+    Logger.log('reingestSessionsRescueMapMenu error: ' + e.toString());
+  }
+}
+
+function reingestSessionsRescueMap_(startDate, endDate) {
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const cfg = getCfg_();
+    const base = cfg.rescueBase;
+    const cookie = login_(base, cfg.user, cfg.pass);
+    setReportAreaSession_(base, cookie);
+    setReportTypeListAll_(base, cookie);
+    setOutputXMLOrFallback_(base, cookie); // TEXT pipe
+    setDelimiter_(base, cookie, '|');
+    setReportDate_(base, cookie, isoDate_(startDate), isoDate_(endDate));
+    setReportTimeAllDay_(base, cookie);
+
+    // Read desired header order from Rescue_Map if present
+    let desiredHeaders = null;
+    try {
+      const mapSh = ss.getSheetByName('Rescue_Map');
+      if (mapSh && mapSh.getLastColumn() > 0) {
+        desiredHeaders = mapSh.getRange(1,1,1,mapSh.getLastColumn()).getValues()[0].map(h => String(h||''));
+      }
+    } catch (e) { desiredHeaders = null; }
+
+    const nodes = (cfg.nodes || []).map(n => Number(n)).filter(n => Number.isFinite(n));
+    const noderefs = ['NODE','CHANNEL'];
+    let unionHeaders = [];
+    let allRowObjs = [];
+    const addUnion = (hs) => { hs.forEach(h => { if (unionHeaders.indexOf(h) === -1) unionHeaders.push(h); }); };
+
+    for (let i=0;i<noderefs.length;i++) {
+      const nr = noderefs[i];
+      for (let j=0;j<nodes.length;j++) {
+        const node = nodes[j];
+        const t = getReportTry_(base, cookie, node, nr);
+        if (!t || !/^OK/i.test(t)) continue;
+        if (parsed && parsed.headers && parsed.headers.length) addUnion(parsed.headers);
+        (parsed.rows || []).forEach(r => allRowObjs.push(r));
+        Utilities.sleep(120);
+      }
+    }
+
+    if (!desiredHeaders || !desiredHeaders.length) desiredHeaders = unionHeaders;
+    if (!desiredHeaders || !desiredHeaders.length) return { ok: false, error: 'No headers from API' };
+
+    // Prepare values aligned to desired headers, skipping 5th column values (1-based index = 5)
+    const skipIndex = 5; // omit data but keep header
+    const values = allRowObjs.map(obj => desiredHeaders.map((h, idx) => (idx+1) === skipIndex ? '' : (obj && obj.hasOwnProperty(h) ? obj[h] : '')));
+
+    // Write to Sessions sheet: headers then values, no formatting
+    let sh = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
+    if (!sh) sh = ss.insertSheet(SHEETS_SESSIONS_TABLE);
+    sh.clear();
+    if (desiredHeaders && desiredHeaders.length) sh.getRange(1,1,1,desiredHeaders.length).setValues([desiredHeaders]);
+    if (values && values.length) {
+      // chunked writes
+      const chunk = 1000;
+      for (let i=0;i<values.length;i+=chunk) {
+        const part = values.slice(i, i+chunk);
+        sh.getRange(2+i, 1, part.length, desiredHeaders.length).setValues(part);
+      }
+    }
+    return { ok: true, rows: values.length };
+  } catch (e) {
+    Logger.log('reingestSessionsRescueMap_ error: ' + e.toString());
+    return { ok: false, error: e.toString() };
+  }
+}
+
+/* ===== Shift Rescue_Map data left so that values from 'Session ID' align under 'Technician ID' (first 4 columns unchanged) ===== */
+function shiftRescueMapDataAlignMenu() {
+  try {
+    const ok = shiftRescueMapDataAlign_();
+    SpreadsheetApp.getActive().toast(ok ? 'Rescue_Map data shifted left (Session ID → Technician ID)' : 'Rescue_Map not found or nothing to shift');
+  } catch (e) {
+    SpreadsheetApp.getActive().toast('Shift error: ' + e.toString().substring(0, 60));
+    Logger.log('shiftRescueMapDataAlignMenu error: ' + e.toString());
+  }
+}
+  // stripSessionsFormatting removed per request
+
+function shiftRescueMapDataAlign_() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('sessions');
+  if (!sh) return false;
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  if (lastRow <= 1 || lastCol < 6) return false; // need headers + enough cols
+
+  const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0];
+  const findIdx = (vals, target) => vals.findIndex(h => String(h || '').trim().toLowerCase() === String(target).trim().toLowerCase());
+  const techIdIdx0 = findIdx(headers, 'Technician ID'); // 0-based
+  const sessionIdIdx0 = findIdx(headers, 'Session ID'); // 0-based
+  if (techIdIdx0 < 0 || sessionIdIdx0 < 0) return false;
+  if (sessionIdIdx0 <= techIdIdx0) return false; // nothing to shift
+
+  const delta = sessionIdIdx0 - techIdIdx0; // number of positions to shift left
+
+  // Read data block starting at Technician ID through end
+  const startCol = techIdIdx0 + 1; // 1-based
+  const width = lastCol - techIdIdx0;
+  const height = lastRow - 1;
+  if (width <= 0 || height <= 0) return false;
+  const range = sh.getRange(2, startCol, height, width);
+  const data = range.getValues();
+
+  // Shift each row left by 'delta' positions within this block
+  const shifted = data.map(row => {
+    const out = new Array(width);
+    for (let c = 0; c < width; c++) {
+      const src = c + delta;
+      out[c] = (src < width) ? row[src] : '';
+    }
+    return out;
+  });
+
+  range.setValues(shifted);
+  return true;
 }
 
 // Fetch channel summary data from API for Support_Data sheet
@@ -2229,7 +2298,6 @@ function fetchLoggedInTechnicians_(cfg) {
       }
     }
     
-    // Format as [Technician Name, Status]
     const result = Array.from(loggedInTechs).sort().map(name => [name, 'Logged In']);
     Logger.log(`fetchLoggedInTechnicians_: Found ${result.length} logged in technicians`);
     return result;
@@ -2296,6 +2364,7 @@ function createDailySummarySheet_(ss, startDate, endDate) {
       if (row[techIdx]) dailyData[dateStr].techs.add(row[techIdx]);
       if (row[workIdx]) dailyData[dateStr].totalWorkSeconds += parseDurationSeconds_(row[workIdx]);
     });
+                // reingestSessionsRescueMap removed per request
     
     // Get all dates in range
     const dates = [];
@@ -3207,8 +3276,10 @@ function refreshDashboardFromAPI() {
     const endISO = range.endDate.toISOString();
     Logger.log(`Pulling data for ${timeFrame}: ${startISO} to ${endISO}`);
     const rowsIngested = ingestTimeRangeToSheets_(startISO, endISO, cfg);
-    refreshAnalyticsDashboard_(range.startDate, range.endDate);
-    generateTechnicianTabs_(range.startDate, range.endDate);
+    // Cache performance summary once and reuse across dashboard + tech tabs
+    const perfMap = getPerfSummaryCached_(cfg, range.startDate, range.endDate);
+    refreshAnalyticsDashboard_(range.startDate, range.endDate, perfMap);
+    generateTechnicianTabs_(range.startDate, range.endDate, perfMap);
     refreshAdvancedAnalyticsDashboard_(range.startDate, range.endDate);
     configSheet.getRange('B9').setValue(new Date().toLocaleString());
     SpreadsheetApp.getActive().toast(`✅ Dashboard refreshed! ${rowsIngested} rows ingested for ${timeFrame}`, 5);
@@ -3218,7 +3289,7 @@ function refreshDashboardFromAPI() {
   }
 }
 
-function refreshAnalyticsDashboard_(startDate, endDate) {
+function refreshAnalyticsDashboard_(startDate, endDate, perfMapOpt) {
   try {
     const ss = SpreadsheetApp.getActive();
     const cfg = getCfg_();
@@ -3230,23 +3301,30 @@ function refreshAnalyticsDashboard_(startDate, endDate) {
     const headers = sessionsSheet.getRange(1, 1, 1, dataRange.getNumColumns()).getValues()[0];
     const startStr = startDate.toISOString().split('T')[0];
     const endStr = endDate.toISOString().split('T')[0];
-    const startIdx = headers.indexOf('start_time');
-    const techIdx = headers.indexOf('technician_name');
-    const statusIdx = headers.indexOf('session_status'); // Column 3
-    const durationIdx = headers.indexOf('duration_total_seconds');
-    const pickupIdx = headers.indexOf('pickup_seconds');
-    const workIdx = headers.indexOf('duration_work_seconds');
-    const customerIdx = headers.indexOf('customer_name'); // Column 8
-    const channelIdx = headers.indexOf('channel_name');
-    const sessionIdIdx = headers.indexOf('session_id'); // Column 1
-    const callingCardIdx = headers.indexOf('calling_card'); // Define once at the top
+    const getHeaderIndex = (variants) => {
+      for (const v of variants) {
+        const i = headers.findIndex(h => String(h || '').toLowerCase().trim() === String(v).toLowerCase().trim());
+        if (i >= 0) return i;
+      }
+      return -1;
+    };
+    const startIdx = getHeaderIndex(['Start Time','start_time','start time','start_time_local']);
+    const techIdx = getHeaderIndex(['Technician Name','technician_name','technician name','technician','tech']);
+    const statusIdx = getHeaderIndex(['Status','session_status','status']);
+    const durationIdx = getHeaderIndex(['Total Time','total_time','duration_total_seconds','duration_seconds','duration_total']);
+    const pickupIdx = getHeaderIndex(['Waiting Time','waiting_time','pickup_seconds','pickup_seconds_total','pickup']);
+    const workIdx = getHeaderIndex(['Work Time','work_time','duration_work_seconds','work_seconds']);
+    const customerIdx = getHeaderIndex(['Your Name:','Customer Name','customer_name','customer','customer_name:']);
+    const channelIdx = getHeaderIndex(['Channel Name','channel_name']);
+    const sessionIdIdx = getHeaderIndex(['Session ID','session_id','session id','id']);
+    const callingCardIdx = getHeaderIndex(['Calling Card','calling_card','calling card']);
     const filtered = allData.filter(row => {
       if (!row[startIdx]) return false;
       const rowDate = new Date(row[startIdx]).toISOString().split('T')[0];
       return rowDate >= startStr && rowDate <= endStr;
     });
-    // Get performance/summary data from API for accurate averages
-    const performanceData = fetchPerformanceSummaryData_(cfg, startDate, endDate);
+    // Get performance/summary data (reuse cache when provided)
+    const performanceData = perfMapOpt || getPerfSummaryCached_(cfg, startDate, endDate);
     
     // Build team data from filtered sessions (for session counts, SLA, work hours, durations)
     const teamData = {};
@@ -3256,15 +3334,15 @@ function refreshAnalyticsDashboard_(startDate, endDate) {
         teamData[tech] = { sessions: 0, pickups: [], durations: [], workSeconds: 0, slaHits: 0 };
       }
       teamData[tech].sessions++;
-      if (row[pickupIdx]) {
-        const ps = parseDurationSeconds_(row[pickupIdx]);
+      if (pickupIdx >= 0 && row[pickupIdx]) {
+        const ps = parseDurationSeconds_((row[pickupIdx]));
         teamData[tech].pickups.push(ps);
         if (ps <= 60) teamData[tech].slaHits++;
       }
-      if (row[durationIdx]) {
+      if (durationIdx >= 0 && row[durationIdx]) {
         teamData[tech].durations.push(parseDurationSeconds_(row[durationIdx]));
       }
-      if (row[workIdx]) teamData[tech].workSeconds += parseDurationSeconds_(row[workIdx]);
+      if (workIdx >= 0 && row[workIdx]) teamData[tech].workSeconds += parseDurationSeconds_(row[workIdx]);
     });
     
     // Merge performance data from API with session counts
@@ -3329,7 +3407,8 @@ function refreshAnalyticsDashboard_(startDate, endDate) {
         second: '2-digit',
         hour12: true 
       }) : '';
-      const duration = row[durationIdx] ? `${Math.floor(row[durationIdx]/60)}:${String(row[durationIdx]%60).padStart(2,'0')}` : '0:00';
+      const durSec = (durationIdx >= 0 && row[durationIdx]) ? parseDurationSeconds_(row[durationIdx]) : 0;
+      const duration = `${Math.floor(durSec/60)}:${String(durSec%60).padStart(2,'0')}`;
       const customerName = row[customerIdx] || 'Anonymous';
       const callingCard = row[callingCardIdx] || '';
       return [row[techIdx] || '', customerName, startTime, duration, row[sessionIdIdx] || '', callingCard];
@@ -3535,7 +3614,7 @@ function refreshAnalyticsDashboard_(startDate, endDate) {
   }
 }
 
-function generateTechnicianTabs_(startDate, endDate) {
+function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
   try {
     const ss = SpreadsheetApp.getActive();
     const cfg = getCfg_();
@@ -3601,16 +3680,28 @@ function generateTechnicianTabs_(startDate, endDate) {
         return false;
       }
     });
-  const techs = [...new Set(filtered.map(row => row[techIdx]).filter(Boolean))];
+  // Build tech list from roster (extension_map) plus any techs present in the filtered data
+  const rosterNames = getRosterTechnicianNames_();
+  const techSet = new Set((rosterNames || []).filter(Boolean));
+  filtered.forEach(row => { const t = row[techIdx]; if (t) techSet.add(String(t)); });
+  const techs = Array.from(techSet);
   // Pull performance summary once for the whole range; used for Avg Session (API)
-  const perfByTech = fetchPerformanceSummaryData_(cfg, startDate, endDate) || {};
+  const perfByTech = perfMapOpt || getPerfSummaryCached_(cfg, startDate, endDate) || {};
     for (const techName of techs) {
       const safeName = techName.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30);
       let techSheet = ss.getSheetByName(safeName);
       if (!techSheet) techSheet = ss.insertSheet(safeName);
-      const techRows = filtered.filter(row => row[techIdx] === techName);
+  const techRows = filtered.filter(row => row[techIdx] === techName);
       // Clear again to ensure clean slate (in case sheet existed)
       techSheet.clear();
+      // Important: clearing values does not remove row/column groups; fully reset any prior groups
+      try {
+        const maxRows = techSheet.getMaxRows();
+        const maxCols = techSheet.getMaxColumns();
+        // Shift depths negatively to zero out any existing groups (safe no-op if none)
+        techSheet.getRange(1, 1, Math.max(1, maxRows), 1).shiftRowGroupDepth(-8);
+        techSheet.getRange(1, 1, 1, Math.max(1, maxCols)).shiftColumnGroupDepth(-8);
+      } catch (e) { /* non-fatal */ }
       techSheet.getRange(1, 1).setValue(`👤 ${techName} - Personal Dashboard`);
       techSheet.getRange(1, 1).setFontSize(18).setFontWeight('bold').setFontColor('#9C27B0');
       techSheet.getRange(1, 1, 1, 5).merge();
@@ -3629,8 +3720,9 @@ function generateTechnicianTabs_(startDate, endDate) {
     const avgPickup = pickups.length > 0 ? (pickups.reduce((a,b) => a+b, 0) / pickups.length / 60).toFixed(1) : '0';
   const slaHits = pickups.filter(p => p <= 60).length;
       const slaPct = pickups.length > 0 ? ((slaHits / pickups.length) * 100).toFixed(1) : '0';
-      const days = Math.max(1, (new Date(endDate) - new Date(startDate)) / (1000*60*60*24));
-      const sessionsPerHour = (techRows.length / days / 8).toFixed(1);
+  const days = Math.max(1, (new Date(endDate) - new Date(startDate)) / (1000*60*60*24));
+  // Sessions per hour should be a numeric value (not text) and formatted as a decimal later
+  const sessionsPerHour = (techRows.length / days / 8);
   // Total Active Hours should reflect active time from sessions (not work time)
   const totalActiveSeconds = activeSecondsArr.reduce((a,b)=>a+b, 0);
   const activeHoursTotal = (totalActiveSeconds / 3600).toFixed(1);
@@ -3654,6 +3746,8 @@ function generateTechnicianTabs_(startDate, endDate) {
         ['Avg Pickup Time', avgPickupSeconds / 86400],
         ['SLA Hit %', slaPct + '%'],
         ['Total Active Hours', activeHoursTotal + ' hrs'],
+        // Total Login Time is the sum of active seconds across all sessions, shown as time
+        ['Total Login Time', totalActiveSeconds / 86400],
         ['Sessions/Hour', sessionsPerHour]
       ];
       for (let i = 0; i < kpis.length; i++) {
@@ -3665,8 +3759,12 @@ function generateTechnicianTabs_(startDate, endDate) {
         techSheet.getRange(row, col + 1).setFontSize(16).setFontWeight('bold').setFontColor('#9C27B0');
         // If this KPI is a duration/pickup numeric fraction, format it as hh:mm:ss
         try {
-          if (/avg duration/i.test(kpis[i][0]) || /avg pickup/i.test(kpis[i][0]) || /active time/i.test(kpis[i][0])) {
+          const label = String(kpis[i][0] || '');
+          if (/avg duration/i.test(label) || /avg pickup/i.test(label) || /active time/i.test(label) || /login time/i.test(label)) {
             techSheet.getRange(row, col + 1).setNumberFormat('hh:mm:ss');
+          } else if (/sessions\/hour/i.test(label)) {
+            // Ensure Sessions/Hour is displayed as a single-decimal number
+            techSheet.getRange(row, col + 1).setNumberFormat('0.0');
           }
         } catch (e) { /* ignore formatting errors */ }
         techSheet.getRange(row, col, 1, 2).setBorder(true, true, true, true, true, true);
@@ -3684,26 +3782,32 @@ function generateTechnicianTabs_(startDate, endDate) {
         dates.push(currentDate.toISOString().split('T')[0]);
         currentDate.setDate(currentDate.getDate() + 1);
       }
-      const headerRow = ['Metric', ...dates, 'Totals/Averages'];
-      const totalSessionsRow = ['Total sessions'];
-  const totalWorkRow = ['Total Active Time'];
-  const avgSessionRow = ['Avg Session (API)'];
-      const avgPickupRow = ['Avg Pick-up Speed'];
-      let totalSessionsAll = 0;
-      let totalWorkAll = 0;
+    const headerRow = ['Metric', ...dates, 'Totals/Averages'];
+    const totalSessionsRow = ['Total sessions'];
+    const totalActiveRow = ['Total Active Time'];
+    const totalWorkRow = ['Total Work Time'];
+    const totalLoginRow = ['Total Login Time'];
+    const avgSessionRow = ['Avg Session (API)'];
+    const avgPickupRow = ['Avg Pick-up Speed'];
+    let totalSessionsAll = 0;
+    let totalActiveAll = 0;
+    let totalWorkAll = 0;
+    let totalLoginAll = 0;
       let totalAvgSeconds = 0;
       let daysWithData = 0;
       let totalPickupSeconds = 0;
       let totalPickupCount = 0;
       const dailyMap = {};
-      dates.forEach(d => { dailyMap[d] = { sessions: [], totalActiveSeconds: 0 }; });
+      dates.forEach(d => { dailyMap[d] = { sessions: [], totalActiveSeconds: 0, totalWorkSeconds: 0 }; });
       techRows.forEach(r => {
         try {
           const d = new Date(r[startIdx]).toISOString().split('T')[0];
-          if (!dailyMap[d]) dailyMap[d] = { sessions: [], totalActiveSeconds: 0 };
+          if (!dailyMap[d]) dailyMap[d] = { sessions: [], totalActiveSeconds: 0, totalWorkSeconds: 0 };
           dailyMap[d].sessions.push(r);
           // Sum ACTIVE time for daily totals
           dailyMap[d].totalActiveSeconds += parseDurationSeconds_(r[activeIdx] || 0);
+          // Sum WORK time for daily totals (if present)
+          try { if (workIdx >= 0) dailyMap[d].totalWorkSeconds += parseDurationSeconds_(r[workIdx] || 0); } catch (e) {}
         } catch (e) { }
       });
       dates.forEach(d => {
@@ -3711,9 +3815,15 @@ function generateTechnicianTabs_(startDate, endDate) {
         const count = data && data.sessions ? data.sessions.length : 0;
         totalSessionsRow.push(count);
         totalSessionsAll += count;
-        const secs = data && data.totalActiveSeconds ? data.totalActiveSeconds : 0;
-        totalWorkRow.push(secs / 86400);
-        totalWorkAll += secs;
+        const activeSecs = data && data.totalActiveSeconds ? data.totalActiveSeconds : 0;
+        totalActiveRow.push(activeSecs / 86400);
+        totalActiveAll += activeSecs;
+  const workSecs = data && data.totalWorkSeconds ? data.totalWorkSeconds : 0;
+  totalWorkRow.push(workSecs / 86400);
+  totalWorkAll += workSecs;
+  // For Login Time, use the same source as Active (sum of active seconds for the day)
+  totalLoginRow.push(activeSecs / 86400);
+  totalLoginAll += activeSecs;
         // For Avg Session, prefer API performance average for this technician
         const perf = perfByTech[techName] || perfByTech[String(techName).trim()] || null;
         if (perf && perf.avgDuration) {
@@ -3749,11 +3859,13 @@ function generateTechnicianTabs_(startDate, endDate) {
           avgPickupRow.push(0);
         }
       });
-      totalSessionsRow.push(totalSessionsAll);
-      totalWorkRow.push(totalWorkAll / 86400);
+  totalSessionsRow.push(totalSessionsAll);
+  totalActiveRow.push(totalActiveAll / 86400);
+  totalWorkRow.push(totalWorkAll / 86400);
+  totalLoginRow.push(totalLoginAll / 86400);
       avgSessionRow.push(daysWithData>0 ? (totalAvgSeconds / daysWithData) / 86400 : 0);
       avgPickupRow.push(totalPickupCount>0 ? (totalPickupSeconds / totalPickupCount) / 86400 : 0);
-      const wideRows = [headerRow, totalSessionsRow, totalWorkRow, avgSessionRow, avgPickupRow];
+  const wideRows = [headerRow, totalSessionsRow, totalActiveRow, totalLoginRow, totalWorkRow, avgSessionRow, avgPickupRow];
       techSheet.getRange(summaryStart + 1, 1, wideRows.length, wideRows[0].length).setValues(wideRows);
       // style header
       try { techSheet.getRange(summaryStart + 1, 1, 1, wideRows[0].length).setFontWeight('bold').setBackground('#9C27B0').setFontColor('#FFFFFF'); } catch(e){}
@@ -3763,16 +3875,12 @@ function generateTechnicianTabs_(startDate, endDate) {
         if (valueCols > 0) {
           // Total sessions row -> integer
           techSheet.getRange(summaryStart + 2, 2, 1, valueCols).setNumberFormat('0');
-          // Total Work Time -> hh:mm:ss
-          techSheet.getRange(summaryStart + 3, 2, 1, valueCols).setNumberFormat('hh:mm:ss');
-          // Avg Session -> hh:mm:ss
-          techSheet.getRange(summaryStart + 4, 2, 1, valueCols).setNumberFormat('hh:mm:ss');
-          // Avg Pick-up Speed -> hh:mm:ss
-          techSheet.getRange(summaryStart + 5, 2, 1, valueCols).setNumberFormat('hh:mm:ss');
+          // Time rows -> hh:mm:ss (Active, Login, Work, Avg Session, Avg Pick-up)
+          techSheet.getRange(summaryStart + 3, 2, 5, valueCols).setNumberFormat('hh:mm:ss');
         }
       } catch (e) { /* ignore formatting errors */ }
 
-      // --- Session Details (placed after the per-day summary) ---
+  // --- Session Details (placed after the per-day summary) ---
       const detailRow = summaryStart + 1 + wideRows.length + 2;
       techSheet.getRange(detailRow, 1).setValue('Session Details');
       techSheet.getRange(detailRow, 1).setFontSize(14).setFontWeight('bold');
@@ -3848,12 +3956,18 @@ function generateTechnicianTabs_(startDate, endDate) {
           techSheet.getRange(detailRow + 2, durCol, detailRows.length, 1).setNumberFormat('hh:mm:ss');
           techSheet.getRange(detailRow + 2, pickupCol, detailRows.length, 1).setNumberFormat('hh:mm:ss');
         } catch (e) { /* ignore formatting errors */ }
-        // Make the entire session details block collapsible (title + header + rows)
+        // Group only the data rows so title + header remain visible when collapsed
         try {
-          const blockRows = 2 + detailRows.length; // header row and at least one data row
-          const groupRange = techSheet.getRange(detailRow, 1, blockRows, Math.max(techSheet.getLastColumn(), 8));
+          // Ensure any old grouping around this region is cleared so header/title do not collapse
+          try {
+            const clearStart = Math.max(1, detailRow);
+            const clearCount = Math.max(1, detailRows.length + 3); // title + header + data
+            techSheet.getRange(clearStart, 1, clearCount, 1).shiftRowGroupDepth(-8);
+          } catch (e) { /* ignore */ }
+          // Create a fresh group starting at the first data row only
+          const groupRange = techSheet.getRange(detailRow + 2, 1, detailRows.length, 1);
           groupRange.shiftRowGroupDepth(1);
-          try { const grp = techSheet.getRowGroup(detailRow, 1); if (grp) grp.collapse(); } catch (e) {}
+          try { const grp = techSheet.getRowGroup(detailRow + 2, 1); if (grp) grp.collapse(); } catch (e) {}
         } catch (e) { Logger.log('Collapsible session details grouping failed: ' + e.toString()); }
       }
       techSheet.setColumnWidth(1, 100);
