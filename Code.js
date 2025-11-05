@@ -4,7 +4,289 @@ function getPerfSummaryCached_(cfg, startDate, endDate) {
     const cache = CacheService.getScriptCache();
     const key = `perf:${isoDate_(startDate)}:${isoDate_(endDate)}`;
     const cached = cache.get(key);
-    // Removed helper utilities per request (positions locked and using Sessions directly)
+    if (cached) {
+      try { return JSON.parse(cached); } catch (e) {}
+    }
+    const map = fetchPerformanceSummaryData_(cfg, startDate, endDate) || {};
+    try { cache.put(key, JSON.stringify(map), 300); } catch (e) {}
+    return map;
+  } catch (e) {
+    Logger.log('getPerfSummaryCached_ error: ' + e.toString());
+    return fetchPerformanceSummaryData_(cfg, startDate, endDate) || {};
+  }
+}
+/************************************************************
+ * Nova Support KPIs – Rescue LISTALL → Google Sheets
+ * Simplified Sheets-only version (no BigQuery)
+ * - Pulls data from LogMeIn Rescue API
+ * - Stores directly in Google Sheets
+ * - Analytics dashboard with time frame filtering
+ ************************************************************/
+
+/* ===== Default nodes ===== */
+const NODE_CANDIDATES_DEFAULT = [5648341, 300589800, 1367438801, 863388310, -2];
+
+/* ===== Runtime settings ===== */
+const FORCE_TEXT_OUTPUT = true;
+const SHEETS_SESSIONS_TABLE = 'Sessions'; // Main data storage sheet
+// If true, write raw API values into the Sessions sheet (preserve empty strings
+// and original formatting) instead of converting timestamps/durations to Dates/numbers.
+const STORE_RAW_SESSIONS = true;
+
+/* ===== Menu ===== */
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('Rescue')
+    .addItem('Configure Secrets', 'uiConfigureSecrets')
+    .addSeparator()
+    .addItem('🔍 API Smoke Test', 'apiSmokeTest')
+    .addSeparator()
+    .addItem('Pull Yesterday → Sheets', 'pullDateRangeYesterday')
+    .addItem('Pull Today → Sheets', 'pullDateRangeToday')
+    .addItem('Pull Last Week → Sheets', 'pullDateRangeLastWeek')
+    .addItem('Pull This Week → Sheets', 'pullDateRangeThisWeek')
+    .addItem('Pull Previous Month → Sheets', 'pullDateRangePreviousMonth')
+    .addItem('Pull Current Month → Sheets', 'pullDateRangeCurrentMonth')
+    .addItem('Pull Custom Range → Sheets', 'uiIngestRangeToSheets')
+    .addSeparator()
+    .addItem('🚀 Analytics Dashboard', 'createAnalyticsDashboard')
+    .addItem('🔄 Refresh Dashboard (Pull from API)', 'refreshDashboardFromAPI')
+    .addItem('🧭 Migrate Sessions Headers (Official)', 'migrateSessionsHeaders')
+  .addItem('🧾 Dump Performance Raw', 'dumpPerformanceRawMenu')
+  .addItem('🗺️ Dump Digium Map (raw)', 'dumpDigiumMapMenu')
+  .addItem('🗺️ Dump Rescue LISTALL (raw)', 'dumpRescueListAllRawMenu')
+  .addItem('🧩 Fix Rescue_Map headers', 'fixRescueMapHeadersMenu')
+  .addItem('🧩 Fix Rescue_Map from Technician ID', 'fixRescueMapFromTechIdMenu')
+  .addItem('🧹 Strip Sessions formatting', 'stripSessionsFormattingMenu')
+  .addItem('↻ Re-ingest Sessions (Rescue_Map order, skip col 5)', 'reingestSessionsRescueMapMenu')
+  .addItem('⬅️ Shift Rescue_Map data (Session ID → Technician ID)', 'shiftRescueMapDataAlignMenu')
+    .addSeparator()
+    .addSubMenu(
+      SpreadsheetApp.getUi().createMenu('SUMMARY Mode')
+        .addItem('Use CHANNEL only (faster)', 'setSummaryModeChannelOnly')
+        .addItem('Use BOTH: NODE + CHANNEL', 'setSummaryModeBoth')
+    )
+    .addSeparator()
+    .addItem('📈 Advanced Analytics Dashboard', 'createAdvancedAnalyticsDashboard')
+    .addToUi();
+}
+
+/* ===== Secrets / Config ===== */
+const PROP_KEYS = {
+  RESCUE_BASE:  'RESCUE_BASE',
+  RESCUE_USER:  'RESCUE_USER',
+  RESCUE_PASS:  'RESCUE_PASS',
+  DIGIUM_HOST:   'DIGIUM_HOST',
+  DIGIUM_USER:   'DIGIUM_USER',
+  DIGIUM_PASS:   'DIGIUM_PASS',
+  NODE_JSON:    'NODE_CANDIDATES_JSON',
+  SUMMARY_MODE: 'SUMMARY_NODEREF_MODE' // 'CHANNEL_ONLY' (default) or 'BOTH'
+};
+
+function getProps_() { return PropertiesService.getScriptProperties(); }
+function setProp_(k, v) { getProps_().setProperty(k, v); }
+function getProp_(k, d) { const v = getProps_().getProperty(k); return v != null ? v : d; }
+
+function getCfg_() {
+  const props = getProps_();
+  return {
+    rescueBase: getProp_(PROP_KEYS.RESCUE_BASE, 'https://secure.logmeinrescue.com/API'),
+    user: getProp_(PROP_KEYS.RESCUE_USER, ''),
+    pass: getProp_(PROP_KEYS.RESCUE_PASS, ''),
+    digiumHost: getProp_(PROP_KEYS.DIGIUM_HOST, 'https://nova.digiumcloud.net/xml'),
+    digiumUser: getProp_(PROP_KEYS.DIGIUM_USER, ''),
+    digiumPass: getProp_(PROP_KEYS.DIGIUM_PASS, ''),
+    nodes: (() => {
+      const j = getProp_(PROP_KEYS.NODE_JSON, '[]');
+      try { return JSON.parse(j); } catch(e) { return NODE_CANDIDATES_DEFAULT; }
+    })()
+  };
+}
+
+// Determine which noderefs to use for SUMMARY calls.
+// Returns ['CHANNEL'] by default for efficiency; if Script Property SUMMARY_NODEREF_MODE is 'BOTH', returns ['NODE','CHANNEL'].
+function getSummaryNoderefs_() {
+  try {
+    const mode = getProp_(PROP_KEYS.SUMMARY_MODE, 'CHANNEL_ONLY');
+    if (String(mode).toUpperCase() === 'BOTH') return ['NODE','CHANNEL'];
+    return ['CHANNEL'];
+  } catch (e) {
+    return ['CHANNEL'];
+  }
+}
+
+// Quick UI toggles for SUMMARY noderef behavior
+function setSummaryModeChannelOnly() {
+  try {
+    setProp_(PROP_KEYS.SUMMARY_MODE, 'CHANNEL_ONLY');
+    SpreadsheetApp.getActive().toast('SUMMARY mode set to CHANNEL_ONLY');
+  } catch (e) {
+    Logger.log('setSummaryModeChannelOnly error: ' + e.toString());
+  }
+}
+
+function setSummaryModeBoth() {
+  try {
+    setProp_(PROP_KEYS.SUMMARY_MODE, 'BOTH');
+    SpreadsheetApp.getActive().toast('SUMMARY mode set to BOTH (NODE + CHANNEL)');
+  } catch (e) {
+    Logger.log('setSummaryModeBoth error: ' + e.toString());
+  }
+}
+
+/* ===== UI Configuration ===== */
+function uiConfigureSecrets() {
+  const html = HtmlService.createHtmlOutput(`
+    <style>
+      body { font-family: Arial; padding: 20px; }
+      input { width: 300px; margin: 5px 0; padding: 5px; }
+      button { padding: 10px 20px; margin: 10px 5px 0 0; }
+    </style>
+    <h3>Configure Rescue API Secrets</h3>
+    <p>Rescue Base URL:<br><input type="text" id="base" placeholder="https://secure.logmeinrescue.com/API"></p>
+    <p>Email:<br><input type="email" id="user"></p>
+    <p>Password:<br><input type="password" id="pass"></p>
+    <p>Node IDs (JSON array):<br><input type="text" id="nodes" placeholder='[5648341, 300589800]'></p>
+    <hr>
+    <h3>Digium / Switchvox (optional)</h3>
+    <p>Digium Host (XML-RPC endpoint):<br><input type="text" id="dig_host" placeholder="https://nova.digiumcloud.net/xml"></p>
+    <p>Digium Username:<br><input type="text" id="dig_user"></p>
+    <p>Digium Password:<br><input type="password" id="dig_pass"></p>
+    <button onclick="save()">Save</button>
+    <button onclick="google.script.host.close()">Cancel</button>
+    <script>
+      function save() {
+        const base = document.getElementById('base').value;
+        const user = document.getElementById('user').value;
+        const pass = document.getElementById('pass').value;
+        const nodes = document.getElementById('nodes').value;
+        const digHost = document.getElementById('dig_host').value;
+        const digUser = document.getElementById('dig_user').value;
+        const digPass = document.getElementById('dig_pass').value;
+        google.script.run.saveSecrets(base, user, pass, nodes);
+        if (digHost || digUser || digPass) google.script.run.saveDigiumSecrets(digHost, digUser, digPass);
+        google.script.host.close();
+      }
+    </script>
+  `).setWidth(400).setHeight(350);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Configure Secrets');
+}
+
+function saveSecrets(base, user, pass, nodes) {
+  const props = getProps_();
+  if (base) setProp_(PROP_KEYS.RESCUE_BASE, base);
+  if (user) setProp_(PROP_KEYS.RESCUE_USER, user);
+  if (pass) setProp_(PROP_KEYS.RESCUE_PASS, pass);
+  if (nodes) {
+    try { JSON.parse(nodes); setProp_(PROP_KEYS.NODE_JSON, nodes); } catch(e) {}
+  }
+  SpreadsheetApp.getActive().toast('Secrets saved');
+}
+
+function saveDigiumSecrets(host, user, pass) {
+  try {
+    if (host) setProp_('DIGIUM_HOST', host);
+    if (user) setProp_('DIGIUM_USER', user);
+    if (pass) setProp_('DIGIUM_PASS', pass);
+    SpreadsheetApp.getActive().toast('Digium secrets saved');
+  } catch (e) { Logger.log('saveDigiumSecrets error: ' + e.toString()); }
+}
+
+/* ===== HTTP Helpers ===== */
+function apiGet_(base, endpoint, params, cookie, tries, mute) {
+  const qs = Object.keys(params || {}).map(k => `${k}=${encodeURIComponent(params[k])}`).join('&');
+  const url = `${base}/${endpoint}${qs ? '?' + qs : ''}`;
+  const opts = {
+    method: 'get',
+    headers: Object.assign(
+      {'User-Agent': 'Mozilla/5.0'},
+      cookie ? {'Cookie': cookie} : {}
+    ),
+    muteHttpExceptions: !!mute
+  };
+  return UrlFetchApp.fetch(url, opts);
+}
+
+function extractCookie_(response) {
+  const headers = response.getHeaders();
+  const setCookie = headers['Set-Cookie'] || headers['set-cookie'];
+  if (!setCookie) return null;
+  const cookies = Array.isArray(setCookie) ? setCookie : [setCookie];
+  return cookies.map(c => c.split(';')[0]).join('; ');
+}
+
+/* ===== Digium / Switchvox XML-RPC helpers ===== */
+// Helper: escape text for XML content
+function xmlEscape_(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+// Generic XML-RPC caller. Uses HTTP Basic Auth against the provided host.
+function xmlRpcCall_(host, methodName, params, user, pass) {
+  // Build a minimal XML-RPC request (params should be an array of simple values or objects already serialized)
+  let body = '<?xml version="1.0"?>\n<methodCall><methodName>' + methodName + '</methodName><params>';
+  (params || []).forEach(p => {
+    body += '<param><value>';
+    if (typeof p === 'number') body += '<int>' + String(p) + '</int>';
+    else if (typeof p === 'boolean') body += '<boolean>' + (p ? '1' : '0') + '</boolean>';
+  else body += '<string>' + xmlEscape_(String(p)) + '</string>';
+    body += '</value></param>';
+  });
+  body += '</params></methodCall>';
+
+  // Use application/xml per Digium error response which explicitly requires application/xml or application/json
+  const headers = { 'Content-Type': 'application/xml; charset=UTF-8', 'Accept': 'application/xml' };
+  if (user && pass) headers['Authorization'] = 'Basic ' + Utilities.base64Encode(user + ':' + pass);
+  const opts = { method: 'post', contentType: 'application/xml; charset=UTF-8', payload: body, headers: headers, muteHttpExceptions: true };
+  try {
+    const resp = UrlFetchApp.fetch(host, opts);
+    const code = resp.getResponseCode();
+    const txt = resp.getContentText();
+    if (code >= 200 && code < 300) {
+      try {
+        const xml = XmlService.parse(txt);
+        return { ok: true, xml: xml, raw: txt };
+      } catch (e) {
+        return { ok: false, error: 'XML parse error: ' + e.toString(), raw: txt };
+      }
+    }
+    return { ok: false, error: 'HTTP ' + code, raw: txt };
+  } catch (e) {
+    return { ok: false, error: e.toString() };
+  }
+}
+
+// Fetch Digium call summary for a date range. This is a small wrapper and uses placeholder method names.
+// The Switchvox API uses XML-RPC; exact method names and params must be taken from the Digium docs.
+function fetchDigiumCallSummary_(startDate, endDate) {
+  const cfg = getCfg_();
+  const host = cfg.digiumHost;
+  const user = cfg.digiumUser;
+  const pass = cfg.digiumPass;
+  if (!host || !user || !pass) {
+    Logger.log('fetchDigiumCallSummary_: Digium credentials not configured');
+    return { ok: false, reason: 'missing_credentials' };
+  }
+
+  // NOTE: The method name and param structure below are placeholders. Refer to the Switchvox API docs
+  // (http://developers.digium.com/switchvox) for the correct method to request call logs or CDRs.
+  const method = 'switchvox.calls.getList'; // placeholder — replace with real method
+  const params = [ { start: startDate.toISOString(), end: endDate.toISOString() } ];
+  const r = xmlRpcCall_(host, method, params, user, pass);
+  if (!r.ok) {
+    Logger.log('fetchDigiumCallSummary_ failed: ' + (r.error || r.raw));
+    return { ok: false, error: r.error || r.raw };
+  }
+
+  // TODO: parse r.xml to extract totals per day and raw call rows
+  // For now, return the raw XML so we can iterate on parsing once we confirm method/response shape.
+  return { ok: true, xml: r.xml, raw: r.raw };
+}
 
 // Send a Digium-style <request method="..."> XML envelope. Returns {ok, raw, xml (XmlService.Document)}
 function digiumApiCall_(methodName, parametersXmlString, user, pass, host) {
@@ -26,7 +308,285 @@ function digiumApiCall_(methodName, parametersXmlString, user, pass, host) {
         return { ok: true, raw: txt, xml: xml };
       } catch (e) {
         return { ok: false, error: 'XML parse error: ' + e.toString(), raw: txt };
-      // Removed helper utilities per request (Rescue_LISTALL raw dump, header fixers, strip formatting, re-ingest)
+      }
+    }
+    return { ok: false, error: 'HTTP ' + code, raw: txt };
+  } catch (e) {
+    return { ok: false, error: e.toString() };
+  }
+}
+
+// Fetch callReports.search for a date range and return parsed wide-format data when possible.
+function fetchDigiumCallReports_(startDate, endDate, options) {
+  const cfg = getCfg_();
+  const host = cfg.digiumHost;
+  const user = cfg.digiumUser;
+  const pass = cfg.digiumPass;
+  if (!host || !user || !pass) return { ok: false, reason: 'missing_credentials' };
+
+  const fmt = (d) => {
+    const dt = (d instanceof Date) ? d : new Date(d);
+    const Y = dt.getFullYear();
+    const M = String(dt.getMonth()+1).padStart(2,'0');
+    const D = String(dt.getDate()).padStart(2,'0');
+    return `${Y}-${M}-${D} 00:00:00`;
+  };
+
+  const startStr = fmt(startDate);
+  const endStr = (() => { const dt = (endDate instanceof Date) ? endDate : new Date(endDate); return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')} 23:59:59`; })();
+
+  const fields = (options && options.report_fields) || [
+    'total_calls','total_incoming_calls','total_outgoing_calls','talking_duration','call_duration','avg_talking_duration','avg_call_duration'
+  ];
+
+  // Human-friendly labels for metrics (used in wide table rows)
+  const human = {
+    total_calls: 'Total Calls', total_incoming_calls: 'Total Incoming Calls', total_outgoing_calls: 'Total Outgoing Calls',
+    talking_duration: 'Talking Duration (s)', call_duration: 'Call Duration (s)', avg_talking_duration: 'Avg Talking Duration (s)', avg_call_duration: 'Avg Call Duration (s)'
+  };
+
+  // prefer per-day breakdown for wide output; use Switchvox token 'by_day' per API docs
+  const breakdown = (options && options.breakdown) || 'by_day';
+
+  // Build report_fields XML
+  let reportFieldsXml = '<report_fields>'; 
+  fields.forEach(f => { reportFieldsXml += '<report_field>' + xmlEscape_(f) + '</report_field>'; });
+  reportFieldsXml += '</report_fields>';
+
+  // ignore_weekends: 0 => do not ignore weekends (user requested we do NOT ignore weekends)
+  // Optionally include account_ids (extensions) to filter results per account
+  let accountIdsXml = '';
+  if (options && options.account_ids) {
+    // accept comma-separated string or array
+    const ids = Array.isArray(options.account_ids) ? options.account_ids : String(options.account_ids).split(',').map(s=>s.trim()).filter(Boolean);
+    if (ids && ids.length) {
+      accountIdsXml = '\n    <account_ids>' + ids.map(id => '<account_id>' + xmlEscape_(id) + '</account_id>').join('') + '</account_ids>';
+    }
+  }
+
+  const paramsXml = `\n    <start_date>${xmlEscape_(startStr)}</start_date>\n    <end_date>${xmlEscape_(endStr)}</end_date>\n    <ignore_weekends>0</ignore_weekends>\n    <breakdown>${xmlEscape_(breakdown)}</breakdown>${accountIdsXml}\n    ${reportFieldsXml}\n    <format>xml</format>\n  `;
+
+  const r = digiumApiCall_('switchvox.callReports.search', paramsXml, user, pass, host);
+  // Save raw response for inspection — append rather than clear so history is preserved (batched)
+  try { appendDigiumRaw_(paramsXml, 'Raw XML Response', r.raw || (r.error || '')); } catch (e) { Logger.log('Failed to append Digium_Raw: ' + e.toString()); }
+
+  // If Digium returned an error (for example "Invalid breakdown"), try a fallback without the breakdown
+  try {
+    if (r.ok && r.xml) {
+      const rootChk = r.xml.getRootElement ? r.xml.getRootElement() : null;
+      const errorsEl = rootChk ? rootChk.getChild('errors') : null;
+      if (errorsEl) {
+        const errEl = errorsEl.getChild('error');
+        const msg = errEl && errEl.getAttribute ? (errEl.getAttribute('message') ? errEl.getAttribute('message').getValue() : '') : '';
+        Logger.log('Digium returned errors: ' + msg);
+        // If breakdown is invalid, retry without breakdown param (aggregate totals)
+        if (/invalid breakdown/i.test(String(msg || ''))) {
+          try {
+            // Remove the <breakdown>...</breakdown> element from the paramsXml
+            const paramsNoBreakdown = paramsXml.replace(/\s*<breakdown>.*?<\/breakdown>\s*/i, ' ');
+            try { appendDigiumRaw_('Server reported invalid breakdown, retrying without <breakdown>\n' + paramsNoBreakdown, 'Retry Raw XML Response', ''); } catch (e) {}
+            const r2 = digiumApiCall_('switchvox.callReports.search', paramsNoBreakdown, user, pass, host);
+            try { appendDigiumRaw_(paramsNoBreakdown, 'Retry Raw XML Response', r2.raw || (r2.error || '')); } catch (e) {}
+            if (!r2.ok) return { ok: false, error: r2.error || r2.raw, raw: r.raw };
+            // Replace r with successful fallback response
+            r = r2;
+          } catch (e) {
+            Logger.log('Retry without breakdown failed: ' + e.toString());
+            return { ok: false, error: e.toString(), raw: r.raw };
+          }
+        } else {
+          return { ok: false, error: msg || (r.error || r.raw), raw: r.raw };
+        }
+      }
+    }
+  } catch (e) {
+    Logger.log('Error checking Digium errors element: ' + e.toString());
+  }
+
+  if (!r.ok) return { ok: false, error: r.error || r.raw };
+
+  // Helper: parse Digium numeric fields. Accept plain numbers or HH:MM:SS; return seconds (raw).
+  const parseDigiumNum = (txt) => {
+    if (txt == null) return 0;
+    const s = String(txt).trim();
+    if (!s) return 0;
+    // HH:MM:SS
+    if (/^\d{1,2}:\d{2}:\d{2}$/.test(s)) return parseDurationSeconds_(s);
+    const n = Number(s);
+    return isNaN(n) ? 0 : n;
+  };
+
+  // Try to parse per-day results. Best-effort: look for <day date="YYYY-MM-DD">...</day>
+  try {
+    const doc = r.xml;
+    const root = doc.getRootElement();
+
+    // Build dates array from start to end
+    const dates = [];
+    const d = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
+    const ed = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate());
+    while (d <= ed) {
+      dates.push(d.toISOString().split('T')[0]);
+      d.setDate(d.getDate() + 1);
+    }
+
+    const fieldMap = {};
+    // Initialize map for each date
+    dates.forEach(dt => { fieldMap[dt] = {}; fields.forEach(f => fieldMap[dt][f] = 0); });
+
+    // Helper: find all <day> elements anywhere
+    const findDays = (el) => {
+      const out = [];
+      const children = el.getChildren();
+      children.forEach(c => {
+        if (String(c.getName()).toLowerCase() === 'day' && c.getAttribute('date')) out.push(c);
+        out.push(...findDays(c));
+      });
+      return out;
+    };
+
+    const days = findDays(root);
+    if (days && days.length) {
+      days.forEach(dayEl => {
+        const dateAttr = dayEl.getAttribute('date') ? dayEl.getAttribute('date').getValue() : null;
+        const dateKey = dateAttr ? dateAttr.split(' ')[0] : null;
+        if (!dateKey) return;
+        fields.forEach(f => {
+          const child = dayEl.getChild(f);
+          if (child) {
+            const txt = (child.getText() || '').trim();
+            const num = parseDigiumNum(txt);
+            fieldMap[dateKey][f] = num;
+          }
+        });
+      });
+    } else {
+      // Try <rows><row .../></rows> where each row has date and metric attributes
+      const resultEl = root.getChild('result') || root;
+      const rowsEl = resultEl.getChild('rows');
+      const rowChildren = rowsEl ? rowsEl.getChildren('row') : null;
+      if (rowChildren && rowChildren.length) {
+        rowChildren.forEach(rowEl => {
+          let dateAttr = rowEl.getAttribute('date') ? rowEl.getAttribute('date').getValue() : null;
+          let dateKey = null;
+          if (dateAttr) {
+            // Convert MM/DD/YYYY to YYYY-MM-DD
+            const m = String(dateAttr).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+            if (m) dateKey = `${m[3]}-${('0'+m[1]).slice(-2)}-${('0'+m[2]).slice(-2)}`; else dateKey = dateAttr;
+          }
+          if (!dateKey) return;
+          if (!fieldMap[dateKey]) { fieldMap[dateKey] = {}; fields.forEach(f => fieldMap[dateKey][f] = 0); }
+          fields.forEach(f => {
+            const a = rowEl.getAttribute(f);
+            if (a) {
+              const num = parseDigiumNum(a.getValue());
+              fieldMap[dateKey][f] = num;
+            }
+          });
+        });
+      } else {
+        // Fallback: Digium returned aggregated attributes on a <rows ... /> element (no per-day breakdown)
+        // Example: <rows total_calls="69" total_incoming_calls="43" ... />
+        if (rowsEl && rowsEl.getAttributes && rowsEl.getAttributes().length > 0) {
+          // Build a single-date column representing the requested range
+          const rangeLabel = `${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]}`;
+          const single = {};
+          fields.forEach(f => { single[f] = 0; });
+          rowsEl.getAttributes().forEach(attr => {
+            const name = attr.getName();
+            const val = parseDigiumNum(attr.getValue());
+            if (fields.indexOf(name) >= 0) single[name] = val;
+          });
+          // Return single-column wide data labeled with the range
+          const wideRows = fields.map(f => [ (human && human[f]) || f, single[f] ]);
+          const singleDates = [rangeLabel];
+          return { ok: true, dates: singleDates, rows: wideRows, raw: r.raw };
+        }
+      }
+    }
+
+    // Build wide rows
+    const wideRows = [];
+    fields.forEach(f => {
+      const row = [ human[f] || f ];
+      dates.forEach(dKey => row.push(fieldMap[dKey] ? fieldMap[dKey][f] || 0 : 0));
+      wideRows.push(row);
+    });
+
+    return { ok: true, dates: dates, rows: wideRows, raw: r.raw };
+  } catch (e) {
+    return { ok: false, error: 'parse_failed: ' + e.toString(), raw: r.raw };
+  }
+}
+
+// Create a wide-format Digium calls sheet and write provided data (dates + metrics)
+function createDigiumCallsSheet_(wideData) {
+  // wideData: { dates: ['2025-11-01', ...], rows: [ ['Total Calls', 5, 3, ...], ['Total Duration', 3600, ...] ] }
+  const ss = SpreadsheetApp.getActive();
+  const name = 'Digium_Calls';
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  sh.clear();
+  const header = ['Metric'].concat(wideData.dates || []);
+  sh.getRange(1,1,1,header.length).setValues([header]);
+  for (let i=0;i<(wideData.rows||[]).length;i++) {
+    sh.getRange(2+i,1,1,wideData.rows[i].length).setValues([wideData.rows[i]]);
+  }
+  // Basic styling
+  try { sh.getRange(1,1,1,header.length).setFontWeight('bold').setBackground('#1976D2').setFontColor('#FFFFFF'); } catch(e){}
+  return sh;
+}
+
+// Append Digium request/response in one batched write to reduce calls
+function appendDigiumRaw_(requestXml, label, raw) {
+  try {
+    const ss = SpreadsheetApp.getActive();
+    let sh = ss.getSheetByName('Digium_Raw');
+    if (!sh) sh = ss.insertSheet('Digium_Raw');
+    const startRow = Math.max(1, sh.getLastRow()) + 2;
+    const rows = [
+      ['Request (XML)'],
+      [requestXml || ''],
+      [''],
+      [label || 'Raw XML Response'],
+      [raw || '']
+    ];
+    sh.getRange(startRow, 1, rows.length, 1).setValues(rows);
+    return true;
+  } catch (e) {
+    Logger.log('appendDigiumRaw_ failed: ' + e.toString());
+    return false;
+  }
+}
+
+// Convert numeric seconds in a wide table (with a Metric label column) to spreadsheet day-fractions
+// and apply hh:mm:ss formatting to the value cells. Looks for a header cell with text 'Metric'.
+function convertSecondsToDayFractionForTableAt_(sheet, headerRow, headerCol) {
+  try {
+    if (!sheet) return { ok: false, reason: 'no_sheet' };
+    const hdr = String(sheet.getRange(headerRow, headerCol).getValue() || '').toLowerCase();
+    if (!hdr.includes('metric')) return { ok: false, reason: 'no_metric_header' };
+
+    // Detect width
+    const maxScan = Math.max(10, Math.min(100, sheet.getLastColumn() - headerCol + 1));
+    const headerVals = sheet.getRange(headerRow, headerCol, 1, maxScan).getValues()[0];
+    let width = 1;
+    for (let i = 1; i < maxScan; i++) {
+      if (headerVals[i] === '' || headerVals[i] == null) break;
+      width = i + 1;
+    }
+    if (width <= 1) return { ok: false, reason: 'no_value_columns' };
+
+    // Detect height
+    let height = 0;
+    for (let r = headerRow + 1; r <= sheet.getMaxRows(); r++) {
+      const v = sheet.getRange(r, headerCol).getValue();
+      if (v === '' || v == null) break;
+      height++;
+      if (height > 2000) break;
+    }
+    if (height <= 0) return { ok: true, converted: 0 };
+
     // Bulk read/write
     const blockRange = sheet.getRange(headerRow + 1, headerCol, height, width);
     const data = blockRange.getValues();
@@ -620,44 +1180,68 @@ function parseDurationSeconds_(val) {
 /* ===== Sheets Storage ===== */
 function getOrCreateSessionsSheet_(ss) {
   let sh = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
-  const isNew = !sh;
   if (!sh) {
     sh = ss.insertSheet(SHEETS_SESSIONS_TABLE);
   }
-
-  // Only set headers/styling when creating a brand new sheet.
-  if (isNew) {
-    const headers = [
-      'Start Time','End Time','Last Action Time',
-      'Technician Name','Technician ID','Technician Email','Technician Group',
-      'Session ID','Session Type','Status',
-      'Your Name:','Your Phone #:','Company name:','Location Name:',
-      'Custom field 4','Custom field 5','Tracking ID','Customer IP','Device ID','Incident Tools Used',
-      'Resolved Unresolved','Channel ID','Channel Name','Calling Card',
-      'Connecting Time','Waiting Time','Total Time','Active Time','Work Time','Hold Time','Time in Transfer','Rebooting Time','Reconnecting Time',
-      'Platform','Browser Type','Host Name',
-      'ingested_at'
-    ];
-    const headerRange = sh.getRange(1, 1, 1, headers.length);
+  
+  // Use the exact column titles from LogMeIn Rescue API (Report Area: Session, Type: LISTALL)
+  // This ensures we store raw data exactly as returned to avoid mixed-column issues.
+  const headers = [
+    'Start Time','End Time','Last Action Time',
+    'Technician Name','Technician ID','Technician Email','Technician Group',
+    'Session ID','Session Type','Status',
+    'Your Name:','Your Phone #:','Company name:','Location Name:',
+    'Custom field 4','Custom field 5','Tracking ID','Customer IP','Device ID','Incident Tools Used',
+    'Resolved Unresolved','Channel ID','Channel Name','Calling Card',
+    'Connecting Time','Waiting Time','Total Time','Active Time','Work Time','Hold Time','Time in Transfer','Rebooting Time','Reconnecting Time',
+    'Platform','Browser Type','Host Name',
+    // Additional internal field for ingestion timestamp
+    'ingested_at'
+  ];
+  
+  // Check if header row exists and is correct
+  const headerRange = sh.getRange(1, 1, 1, headers.length);
+  const existingHeaders = headerRange.getValues()[0];
+  const needsHeaderUpdate = !existingHeaders || existingHeaders.length !== headers.length || 
+                           !existingHeaders[0] || existingHeaders[0] !== 'Start Time';
+  
+  if (needsHeaderUpdate) {
+    // Clear and set headers with improved styling
+    headerRange.clear();
     headerRange.setValues([headers]);
-    try {
-      headerRange.setFontWeight('bold')
-        .setBackground('#07123B')
-        .setFontColor('#FFFFFF')
-        .setHorizontalAlignment('left')
-        .setVerticalAlignment('middle');
-      sh.setFrozenRows(1);
-    } catch (e) { /* styling optional */ }
+    headerRange.setFontWeight('bold')
+      .setBackground('#07123B')
+      .setFontColor('#FFFFFF')
+      .setHorizontalAlignment('left')
+      .setVerticalAlignment('middle');
+    sh.setFrozenRows(1);
+    Logger.log('Updated Sessions sheet headers');
   }
+  
+  // Set column widths for better readability
+  // Set key column widths for readability
+  sh.setColumnWidth(1, 160);  // Start Time
+  sh.setColumnWidth(2, 160);  // End Time
+  sh.setColumnWidth(3, 160);  // Last Action Time
+  sh.setColumnWidth(4, 180);  // Technician Name
+  sh.setColumnWidth(6, 200);  // Technician Email
+  sh.setColumnWidth(9, 160);  // Session Type
+  sh.setColumnWidth(11, 160); // Your Phone #:
+  sh.setColumnWidth(13, 180); // Company name:
+  sh.setColumnWidth(23, 160); // Channel Name
+  sh.setColumnWidth(headers.length, 180); // ingested_at
+  
+  // Apply consistent styling
+  try { applyProfessionalTableStyling_(sh, headers.length); } catch (e) { Logger.log('Styling sessions sheet failed: ' + e.toString()); }
 
-  // Do NOT alter existing formatting or column order when sheet already exists
+  // No duplicate columns in the official header set
+
   return sh;
 }
 
 // Migrate existing Sessions sheet to official LISTALL headers with correct column mapping.
 // Keeps raw values; attempts to map from prior normalized headers and synonyms.
-/* Deprecated: migration utilities removed as positions are now locked by design */
-/* function migrateSessionsSheetToOfficial_() {
+function migrateSessionsSheetToOfficial_() {
   const ss = SpreadsheetApp.getActive();
   const sh = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
   if (!sh) { SpreadsheetApp.getActive().toast('Sessions sheet not found'); return false; }
@@ -751,12 +1335,12 @@ function getOrCreateSessionsSheet_(ss) {
   try { applyProfessionalTableStyling_(sh, newHeaders.length); } catch (e) {}
   SpreadsheetApp.getActive().toast(`Sessions migrated to official headers (${newHeaders.length} columns)`);
   return true;
-} */
+}
 
 // Public wrapper for menu/run list
-/* function migrateSessionsHeaders() {
+function migrateSessionsHeaders() {
   try { migrateSessionsSheetToOfficial_(); } catch (e) { SpreadsheetApp.getActive().toast('Migration failed: ' + e.toString()); }
-} */
+}
 
 // Apply consistent, professional styling to a sheet's table area.
 // headerCols: number of header columns (optional). If omitted, uses sheet.getLastColumn().
@@ -1803,6 +2387,7 @@ function dumpRescueListAllRawMenu() {
   }
 }
 
+function dumpRescueListAllRaw_(startDate, endDate) {
   try {
     const cfg = getCfg_();
     const base = cfg.rescueBase;
@@ -1868,7 +2453,6 @@ function dumpRescueListAllRawMenu() {
     Logger.log('dumpRescueListAllRaw_ error: ' + e.toString());
   }
 }
-// dumpRescueListAllRaw removed per request (positions locked)
 
 /* ===== One-time header fix for Rescue_Map ===== */
 function fixRescueMapHeadersMenu() {
@@ -1914,6 +2498,7 @@ function fixRescueMapHeaders_(anchorHeader) {
   if (anchorIdx < 0) return false;
 
   // Step 1: shift all titles one column to the right starting AFTER Technician Name.
+  const srcStart = anchorIdx + 2; // 1-based column after anchor header
   const srcCount = lastCol - (anchorIdx + 1);
   if (srcCount > 0) {
     // Ensure there is space to shift right by inserting a temporary column at the end
@@ -1923,6 +2508,7 @@ function fixRescueMapHeaders_(anchorHeader) {
     sh.getRange(1, srcStart + 1, 1, srcCount).setValues(srcVals);
     // Clear the original header cells we copied from
     srcRange.clearContent();
+  }
 
   // Step 2: delete the column immediately after Technician Name (contains 'Nova Point of Sale')
   sh.deleteColumn(anchorIdx + 2); // +2 because getRange is 1-based
@@ -1932,6 +2518,7 @@ function fixRescueMapHeaders_(anchorHeader) {
 
 /* ===== Strip formatting from Sessions sheet only ===== */
 function stripSessionsFormattingMenu() {
+  try {
     const ok = stripSessionsFormatting_();
     SpreadsheetApp.getActive().toast(ok ? 'Sessions formatting cleared' : 'Sessions sheet not found');
   } catch (e) {
@@ -1960,7 +2547,6 @@ function stripSessionsFormatting_() {
         const touchesSessions = ranges && ranges.some(rg => rg.getSheet && rg.getSheet().getName && rg.getSheet().getName() === SHEETS_SESSIONS_TABLE);
         if (!touchesSessions) kept.push(r);
       }
-// fixRescueMapHeaders functions removed per request
       if (kept.length !== rules.length) ss.setConditionalFormatRules(kept);
     } catch (e) {}
 
@@ -2035,6 +2621,7 @@ function reingestSessionsRescueMap_(startDate, endDate) {
         const node = nodes[j];
         const t = getReportTry_(base, cookie, node, nr);
         if (!t || !/^OK/i.test(t)) continue;
+        const parsed = parsePipe_(t, '|');
         if (parsed && parsed.headers && parsed.headers.length) addUnion(parsed.headers);
         (parsed.rows || []).forEach(r => allRowObjs.push(r));
         Utilities.sleep(120);
@@ -2078,7 +2665,6 @@ function shiftRescueMapDataAlignMenu() {
     Logger.log('shiftRescueMapDataAlignMenu error: ' + e.toString());
   }
 }
-  // stripSessionsFormatting removed per request
 
 function shiftRescueMapDataAlign_() {
   const ss = SpreadsheetApp.getActive();
@@ -2298,6 +2884,7 @@ function fetchLoggedInTechnicians_(cfg) {
       }
     }
     
+    // Format as [Technician Name, Status]
     const result = Array.from(loggedInTechs).sort().map(name => [name, 'Logged In']);
     Logger.log(`fetchLoggedInTechnicians_: Found ${result.length} logged in technicians`);
     return result;
@@ -2364,7 +2951,6 @@ function createDailySummarySheet_(ss, startDate, endDate) {
       if (row[techIdx]) dailyData[dateStr].techs.add(row[techIdx]);
       if (row[workIdx]) dailyData[dateStr].totalWorkSeconds += parseDurationSeconds_(row[workIdx]);
     });
-                // reingestSessionsRescueMap removed per request
     
     // Get all dates in range
     const dates = [];
