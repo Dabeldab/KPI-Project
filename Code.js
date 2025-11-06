@@ -27,7 +27,9 @@ function getPerfSummaryCached_(cfg, startDate, endDate) {
 const NODE_CANDIDATES_DEFAULT = [5648341, 300589800, 1367438801, 863388310, -2];
 
 /* ===== Runtime settings ===== */
-const FORCE_TEXT_OUTPUT = true;
+// When false, we request XML from Rescue where supported and parse it to avoid column misalignment.
+// We still fall back to TEXT automatically if XML is not available.
+const FORCE_TEXT_OUTPUT = false;
 const SHEETS_SESSIONS_TABLE = 'Sessions'; // Main data storage sheet
 // If true, write raw API values into the Sessions sheet (preserve empty strings
 // and original formatting) instead of converting timestamps/durations to Dates/numbers.
@@ -54,10 +56,6 @@ function onOpen() {
   .addItem('🧾 Dump Performance Raw', 'dumpPerformanceRawMenu')
   .addItem('🗺️ Dump Digium Map (raw)', 'dumpDigiumMapMenu')
   .addItem('🗺️ Dump Rescue LISTALL (raw)', 'dumpRescueListAllRawMenu')
-  .addItem('🧩 Fix Rescue_Map headers', 'fixRescueMapHeadersMenu')
-  .addItem('🧩 Fix Rescue_Map from Technician ID', 'fixRescueMapFromTechIdMenu')
-  .addItem('🧹 Strip Sessions formatting', 'stripSessionsFormattingMenu')
-  .addItem('↻ Re-ingest Sessions (Rescue_Map order, skip col 5)', 'reingestSessionsRescueMapMenu')
   .addItem('⬅️ Shift Rescue_Map data (Session ID → Technician ID)', 'shiftRescueMapDataAlignMenu')
     .addSeparator()
     .addSubMenu(
@@ -938,6 +936,8 @@ function setDelimiter_(base, cookie, delimiter) {
   if (!/^OK/i.test(t)) throw new Error(`setDelimiter: ${t}`);
 }
 
+// Per Rescue API docs (see API.asmx?op=setOutput), the allowed HTTP GET endpoint is /API/setOutput.aspx
+// with parameter 'output=XML' or 'output=TEXT'. We use GET with the authenticated session cookie.
 function setOutputXMLOrFallback_(base, cookie) {
   if (FORCE_TEXT_OUTPUT) {
     const rt = apiGet_(base, 'setOutput.aspx', { output: 'TEXT' }, cookie, 2, true);
@@ -962,7 +962,9 @@ function getReportTry_(base, cookie, nodeId, noderef) {
   try {
     const r = apiGet_(base, 'getReport.aspx', { node: String(nodeId), noderef: noderef }, cookie, 4, true);
     const t = (r.getContentText()||'').trim();
+    // Accept both TEXT (starts with OK) and XML (starts with '<') responses
     if (/^OK/i.test(t)) return t;
+    if (t && t[0] === '<') return t;
     return null;
   } catch (e) {
     Logger.log(`getReportTry_ failed for node ${nodeId} (${noderef}): ${e.toString()}`);
@@ -973,8 +975,12 @@ function getReportTry_(base, cookie, nodeId, noderef) {
 /* ===== Parsing ===== */
 function parsePipe_(okBody, delimiter) {
   if (!okBody || typeof okBody !== 'string') return { headers: [], rows: [] };
-  const body = String(okBody).replace(/^OK\s*/i, '').trim();
+  const raw = String(okBody).trim();
+  // If the response is XML (due to setOutput XML), parse XML instead
+  if (raw && raw[0] === '<') return parseRescueXmlBody_(raw);
+  const body = raw.replace(/^OK\s*/i, '').trim();
   if (!body) return { headers: [], rows: [] };
+  if (body[0] === '<') return parseRescueXmlBody_(body);
   const lines = body.split(/\r?\n/).filter(Boolean);
   if (!lines.length) return { headers: [], rows: [] };
   const delim = String(delimiter || '|');
@@ -991,6 +997,96 @@ function parsePipe_(okBody, delimiter) {
     out.push(obj);
   }
   return { headers: header, rows: out };
+}
+
+// Parse Rescue XML report content into { headers, rows }
+function parseRescueXmlBody_(xmlText) {
+  try {
+    const doc = XmlService.parse(String(xmlText));
+    const root = doc.getRootElement();
+    // Collect all elements
+    const all = [];
+    (function walk(el){
+      all.push(el);
+      const kids = el.getChildren();
+      for (let i=0;i<kids.length;i++) walk(kids[i]);
+    })(root);
+
+    // Choose the most frequent element name as row tag, prefer common names
+    const counts = {};
+    const prefer = ['row','record','item','entry'];
+    all.forEach(el => {
+      const n = String(el.getName()||'').toLowerCase();
+      counts[n] = (counts[n]||0) + 1;
+    });
+    let rowName = null;
+    for (const p of prefer) { if (counts[p] && (!rowName || counts[p] > counts[rowName])) rowName = p; }
+    if (!rowName) {
+      // fallback to the most frequent non-root element
+      rowName = Object.keys(counts).sort((a,b)=>counts[b]-counts[a])[0];
+    }
+    let rows = all.filter(el => String(el.getName()||'').toLowerCase() === String(rowName||'').toLowerCase());
+    if (!rows.length) {
+      // fallback: any element that has attributes (likely row-like)
+      rows = all.filter(el => (el.getAttributes()||[]).length);
+    }
+    if (!rows.length) return { headers: [], rows: [] };
+
+    // Build header union from attributes and immediate child elements
+    const headerSet = new Set();
+    rows.forEach(el => {
+      (el.getAttributes()||[]).forEach(a => headerSet.add(a.getName()));
+      (el.getChildren()||[]).forEach(c => headerSet.add(c.getName()));
+    });
+    const headers = Array.from(headerSet);
+    if (!headers.length) return { headers: [], rows: [] };
+
+    const out = rows.map(el => {
+      const obj = {};
+      (el.getAttributes()||[]).forEach(a => { obj[a.getName()] = a.getValue(); });
+      (el.getChildren()||[]).forEach(c => { obj[c.getName()] = c.getText ? c.getText().trim() : ''; });
+      return obj;
+    });
+    return { headers: headers, rows: out };
+  } catch (e) {
+    Logger.log('parseRescueXmlBody_ error: ' + e.toString());
+    return { headers: [], rows: [] };
+  }
+}
+
+// Get current output format from Rescue ('XML' or 'TEXT')
+function getOutput_(base, cookie) {
+  try {
+    // Per Rescue API docs, allowed HTTP GET endpoint is /API/getOutput.aspx
+    const r = apiGet_(base, 'getOutput.aspx', {}, cookie, 2, true);
+    const t = (r.getContentText()||'').trim();
+    // Accept common plain text formats
+    let m = t.match(/OUTPUT\s*:\s*(XML|TEXT)/i) || t.match(/OK\s+(XML|TEXT)/i);
+    if (m) return m[1].toUpperCase();
+    // Some environments may return minimal XML; try to parse
+    if (t && t[0] === '<') {
+      try {
+        const doc = XmlService.parse(t);
+        const root = doc.getRootElement();
+        // Search for any element named 'output' (case-insensitive) and read its text/value
+        const stack = [root];
+        while (stack.length) {
+          const el = stack.pop();
+          if (String(el.getName()||'').toLowerCase() === 'output') {
+            const val = (el.getText ? el.getText() : '') || (el.getAttribute && el.getAttribute('value') ? el.getAttribute('value').getValue() : '');
+            if (/^xml$/i.test(val)) return 'XML';
+            if (/^text$/i.test(val)) return 'TEXT';
+          }
+          const kids = el.getChildren();
+          for (let i=0;i<kids.length;i++) stack.push(kids[i]);
+        }
+      } catch (e) { /* ignore XML parse failure */ }
+    }
+    return null;
+  } catch (e) {
+    Logger.log('getOutput_ error: ' + e.toString());
+    return null;
+  }
 }
 
 // Log unmapped header names (helpful when API changes header labels)
@@ -1033,9 +1129,27 @@ function logUnmappedHeader_(header, sample) {
 /* ===== Mapping to Schema ===== */
 function mapRow_(rec) {
   if (!rec || typeof rec !== 'object') return null;
+  // Normalize incoming keys from XML or TEXT: lowercase and strip non-alphanumerics
+  const nk = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const normMap = (() => {
+    const m = new Map();
+    try {
+      Object.keys(rec || {}).forEach(k => {
+        const n = nk(k);
+        if (n && !m.has(n)) m.set(n, k);
+      });
+    } catch (e) {}
+    return m;
+  })();
   const g = (o, keys, d='') => { 
     for (const k of keys) {
+      // Exact key match
       if (o[k] != null && String(o[k]).length) return String(o[k]).trim();
+      // Normalized key match (handles SessionID, session_id, Session Id, etc.)
+      try {
+        const actual = normMap.get(nk(k));
+        if (actual != null && o[actual] != null && String(o[actual]).length) return String(o[actual]).trim();
+      } catch (e) {}
     }
     return d; 
   };
@@ -1086,50 +1200,50 @@ function mapRow_(rec) {
     });
   } catch (e) {}
   return {
-    session_id: g(rec, ['Session ID'], ''),
-    session_type: g(rec, ['Session Type'], ''),
-    session_status: g(rec, ['Status'], ''),
-    technician_id: g(rec, ['Technician ID'], ''),
-    technician_name: g(rec, ['Technician Name'], ''),
-    technician_email: g(rec, ['Technician Email'], ''),
-    technician_group: g(rec, ['Technician Group'], ''),
+    session_id: g(rec, ['Session ID','SessionID','session_id','sessionid'], ''),
+    session_type: g(rec, ['Session Type','SessionType','session_type','sessiontype'], ''),
+    session_status: g(rec, ['Status','Session Status','session_status','sessionstatus'], ''),
+    technician_id: g(rec, ['Technician ID','TechnicianID','technician_id','technicianid'], ''),
+    technician_name: g(rec, ['Technician Name','Technician','TechnicianName','technician_name','technician'], ''),
+    technician_email: g(rec, ['Technician Email','TechnicianEmail','technician_email','email'], ''),
+    technician_group: g(rec, ['Technician Group','Group','Group Name','technician_group','group_name'], ''),
   customer_name: g(rec, ['Your Name:', 'Your Name', 'Customer Name', 'Customer', 'Caller Name', 'caller_name', 'customer_name', 'CustomerName', 'Contact Name', 'Client Name', 'YourName'], ''),
   customer_email: g(rec, ['Your Email:', 'Customer Email', 'customer_email', 'email', 'Email'], ''),
-    tracking_id: g(rec, ['Tracking ID'], ''),
-    ip_address: g(rec, ['Customer IP'], ''),
-    device_id: g(rec, ['Device ID'], ''),
-  platform: g(rec, ['Platform'], ''),
-    browser: g(rec, ['Browser Type'], ''),
-    host: g(rec, ['Host Name'], ''),
+    tracking_id: g(rec, ['Tracking ID','TrackingID','tracking_id'], ''),
+    ip_address: g(rec, ['Customer IP','IP Address','IPAddress','ip_address'], ''),
+    device_id: g(rec, ['Device ID','DeviceID','device_id'], ''),
+  platform: g(rec, ['Platform','platform'], ''),
+    browser: g(rec, ['Browser Type','Browser','browser_type','browser'], ''),
+    host: g(rec, ['Host Name','Host','host','host_name'], ''),
   // Additional fields present in LISTALL headers
-  location_name: g(rec, ['Location Name:','Location Name'], ''),
-  custom_field_4: g(rec, ['Custom field 4','Custom Field 4'], ''),
-  custom_field_5: g(rec, ['Custom field 5','Custom Field 5'], ''),
-  incident_tools_used: g(rec, ['Incident Tools Used'], ''),
-    start_time: toTs(g(rec, ['Start Time'], '')),
-    end_time: toTs(g(rec, ['End Time'], '')),
-    last_action_time: toTs(g(rec, ['Last Action Time'], '')),
-    duration_active_seconds: toSec(g(rec, ['Active Time'], '')),
-    duration_work_seconds: toSec(g(rec, ['Work Time'], '')),
-    duration_total_seconds: toSec(g(rec, ['Total Time'], '')),
-    pickup_seconds: toSec(g(rec, ['Waiting Time'], '')),
-    channel_id: g(rec, ['Channel ID'], ''),
-    channel_name: g(rec, ['Channel Name'], ''),
+  location_name: g(rec, ['Location Name:','Location Name','location_name'], ''),
+  custom_field_4: g(rec, ['Custom field 4','Custom Field 4','custom_field_4'], ''),
+  custom_field_5: g(rec, ['Custom field 5','Custom Field 5','custom_field_5'], ''),
+  incident_tools_used: g(rec, ['Incident Tools Used','incident_tools_used'], ''),
+    start_time: toTs(g(rec, ['Start Time','StartTime','start_time','starttime'], '')),
+    end_time: toTs(g(rec, ['End Time','EndTime','end_time','endtime'], '')),
+    last_action_time: toTs(g(rec, ['Last Action Time','LastActionTime','last_action_time','lastactiontime'], '')),
+    duration_active_seconds: toSec(g(rec, ['Active Time','ActiveTime','active_time','activetime'], '')),
+    duration_work_seconds: toSec(g(rec, ['Work Time','WorkTime','work_time','worktime'], '')),
+    duration_total_seconds: toSec(g(rec, ['Total Time','TotalTime','total_time','totaltime'], '')),
+    pickup_seconds: toSec(g(rec, ['Waiting Time','WaitingTime','waiting_time','pick_up','pickup','pickup_seconds'], '')),
+    channel_id: g(rec, ['Channel ID','ChannelID','channel_id'], ''),
+    channel_name: g(rec, ['Channel Name','Channel','ChannelName','channel_name'], ''),
   company_name: g(rec, ['Company name:', 'Company Name', 'Company', 'company_name', 'CompanyName'], ''),
   caller_name: g(rec, ['Caller Name', 'Caller', 'caller_name', 'Your Name:', 'Your Name', 'Contact Name'], ''),
   caller_phone: g(rec, ['Your Phone #:', 'Caller Phone', 'Phone', 'Phone Number', 'caller_phone', 'customer_phone', 'Telephone', 'Tel', 'Mobile', 'Mobile Phone'], ''),
-    resolved_unresolved: g(rec, ['Resolved Unresolved'], ''),
-    calling_card: g(rec, ['Calling Card'], ''),
-    browser_type: g(rec, ['Browser Type'], ''),
-    connecting_time: toSec(g(rec, ['Connecting Time'], '')),
-    waiting_time: toSec(g(rec, ['Waiting Time'], '')),
-    total_time: toSec(g(rec, ['Total Time'], '')),
-    active_time: toSec(g(rec, ['Active Time'], '')),
-    work_time: toSec(g(rec, ['Work Time'], '')),
-    hold_time: toSec(g(rec, ['Hold Time'], '')),
-    time_in_transfer: toSec(g(rec, ['Time in Transfer'], '')),
-    reconnecting_time: toSec(g(rec, ['Reconnecting Time'], '')),
-    rebooting_time: toSec(g(rec, ['Rebooting Time'], '')),
+    resolved_unresolved: g(rec, ['Resolved Unresolved','resolved_unresolved'], ''),
+    calling_card: g(rec, ['Calling Card','calling_card'], ''),
+    browser_type: g(rec, ['Browser Type','Browser','browser_type'], ''),
+    connecting_time: toSec(g(rec, ['Connecting Time','ConnectingTime','connecting_time'], '')),
+    waiting_time: toSec(g(rec, ['Waiting Time','WaitingTime','waiting_time'], '')),
+    total_time: toSec(g(rec, ['Total Time','TotalTime','total_time'], '')),
+    active_time: toSec(g(rec, ['Active Time','ActiveTime','active_time'], '')),
+    work_time: toSec(g(rec, ['Work Time','WorkTime','work_time'], '')),
+    hold_time: toSec(g(rec, ['Hold Time','HoldTime','hold_time'], '')),
+    time_in_transfer: toSec(g(rec, ['Time in Transfer','TimeInTransfer','time_in_transfer'], '')),
+    reconnecting_time: toSec(g(rec, ['Reconnecting Time','ReconnectingTime','reconnecting_time'], '')),
+    rebooting_time: toSec(g(rec, ['Rebooting Time','RebootingTime','rebooting_time'], '')),
     ingested_at: new Date().toISOString()
   };
 }
@@ -1411,9 +1525,13 @@ function writeRowsToSheets_(ss, rows, clearExisting = false) {
   const existingIds = new Set();
   const dataRange = sh.getDataRange();
   if (dataRange.getNumRows() > 1) {
-    // Column 1 is session_id - dedupe by session_id
-    const existing = sh.getRange(2, 1, dataRange.getNumRows() - 1, 1).getValues();
-    existing.forEach(r => { if (r[0]) existingIds.add(String(r[0])); });
+    // Find the 'Session ID' column in the Sessions table header for proper de-duplication
+    const headerVals = sh.getRange(1, 1, 1, dataRange.getNumColumns()).getValues()[0];
+    let idColIdx = headerVals.findIndex(h => String(h || '').toLowerCase().trim() === 'session id');
+    if (idColIdx < 0) idColIdx = headerVals.findIndex(h => /session\s*id/i.test(String(h || '')));
+    if (idColIdx < 0) idColIdx = 7; // Fallback to 0-based index 7 (8th col) per official header order
+    const existing = sh.getRange(2, idColIdx + 1, dataRange.getNumRows() - 1, 1).getValues();
+    existing.forEach(r => { const v = r[0]; if (v != null && String(v).trim() !== '') existingIds.add(String(v)); });
   }
   // Filter by session_id
   const toInsert = rows.filter(r => r && r.session_id && !existingIds.has(String(r.session_id)));
@@ -1740,7 +1858,7 @@ function ingestTimeRangeToSheets_(startTimestamp, endTimestamp, cfg, clearExisti
       for (const node of nodes) {
         try {
           const t = getReportTry_(cfg.rescueBase, cookie, node, nr);
-          if (!t || !/^OK/i.test(t)) continue;
+          if (!t) continue;
           const parseResult = parsePipe_(t, '|');
           const parsed = parseResult.rows || [];
           if (!parsed || !parsed.length) continue;
@@ -1831,7 +1949,8 @@ function fetchLiveActiveSessions_(cfg) {
       for (const node of nodes) {
         try {
           const t = getReportTry_(cfg.rescueBase, cookie, node, nr);
-          if (!t || !/^OK/i.test(t)) continue;
+          // Accept XML or TEXT; getReportTry_ already validated acceptable shapes
+          if (!t) continue;
           const parseResult = parsePipe_(t, '|');
           const parsed = parseResult.rows || [];
           if (!parsed || !parsed.length) continue;
@@ -2139,7 +2258,8 @@ function fetchPerformanceSummaryData_(cfg, startDate, endDate) {
       for (const node of nodes) {
         try {
           const t = getReportTry_(cfg.rescueBase, cookie, node, nr);
-          if (!t || !/^OK/i.test(t)) continue;
+          // Accept XML or TEXT; getReportTry_ already validated acceptable shapes
+          if (!t) continue;
           
           const parseResult = parsePipe_(t, '|');
           const parsed = parseResult.rows || [];
@@ -2415,7 +2535,8 @@ function dumpRescueListAllRaw_(startDate, endDate) {
         const node = nodes[j];
         try {
           const t = getReportTry_(base, cookie, node, nr);
-          if (!t || !/^OK/i.test(t)) continue;
+          // Accept XML or TEXT; getReportTry_ already validated acceptable shapes
+          if (!t) continue;
           const parsed = parsePipe_(t, '|');
           if (!parsed || !parsed.headers || !parsed.rows) continue;
           if (parsed.headers && parsed.headers.length) addHeaderUnion(parsed.headers);
@@ -2455,205 +2576,7 @@ function dumpRescueListAllRaw_(startDate, endDate) {
 }
 
 /* ===== One-time header fix for Rescue_Map ===== */
-function fixRescueMapHeadersMenu() {
-  try {
-    const ok = fixRescueMapHeaders_('Technician Name');
-    SpreadsheetApp.getActive().toast(ok ? 'Rescue_Map headers adjusted' : 'Rescue_Map not found or no change');
-  } catch (e) {
-    SpreadsheetApp.getActive().toast('Header fix error: ' + e.toString().substring(0, 60));
-    Logger.log('fixRescueMapHeadersMenu error: ' + e.toString());
-  }
-}
-
-function fixRescueMapHeadersFromTechIdMenu() {
-  try {
-    const ok = fixRescueMapHeaders_('Technician ID');
-    SpreadsheetApp.getActive().toast(ok ? 'Rescue_Map headers adjusted (from Technician ID)' : 'Rescue_Map not found or no change');
-  } catch (e) {
-    SpreadsheetApp.getActive().toast('Header fix error: ' + e.toString().substring(0, 60));
-    Logger.log('fixRescueMapHeadersFromTechIdMenu error: ' + e.toString());
-  }
-}
-
-// Backward-compatible name expected by the menu (wrapper)
-function fixRescueMapFromTechIdMenu() {
-  try {
-    const ok = fixRescueMapHeaders_('Technician ID');
-    SpreadsheetApp.getActive().toast(ok ? 'Rescue_Map headers adjusted (from Technician ID)' : 'Rescue_Map not found or no change');
-  } catch (e) {
-    SpreadsheetApp.getActive().toast('Header fix error: ' + e.toString().substring(0, 60));
-    Logger.log('fixRescueMapFromTechIdMenu error: ' + e.toString());
-  }
-}
-
-function fixRescueMapHeaders_(anchorHeader) {
-  const ss = SpreadsheetApp.getActive();
-  const sh = ss.getSheetByName('sessions');
-  if (!sh) return false;
-  const lastCol = sh.getLastColumn();
-  if (lastCol < 2) return false;
-  const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0];
-  const findIdx = (vals, target) => vals.findIndex(h => String(h || '').trim().toLowerCase() === String(target).trim().toLowerCase());
-  const anchorIdx = findIdx(headers, anchorHeader || 'Technician Name');
-  if (anchorIdx < 0) return false;
-
-  // Step 1: shift all titles one column to the right starting AFTER Technician Name.
-  const srcStart = anchorIdx + 2; // 1-based column after anchor header
-  const srcCount = lastCol - (anchorIdx + 1);
-  if (srcCount > 0) {
-    // Ensure there is space to shift right by inserting a temporary column at the end
-    sh.insertColumnAfter(lastCol);
-    const srcRange = sh.getRange(1, srcStart, 1, srcCount);
-    const srcVals = srcRange.getValues();
-    sh.getRange(1, srcStart + 1, 1, srcCount).setValues(srcVals);
-    // Clear the original header cells we copied from
-    srcRange.clearContent();
-  }
-
-  // Step 2: delete the column immediately after Technician Name (contains 'Nova Point of Sale')
-  sh.deleteColumn(anchorIdx + 2); // +2 because getRange is 1-based
-
-  return true;
-}
-
-/* ===== Strip formatting from Sessions sheet only ===== */
-function stripSessionsFormattingMenu() {
-  try {
-    const ok = stripSessionsFormatting_();
-    SpreadsheetApp.getActive().toast(ok ? 'Sessions formatting cleared' : 'Sessions sheet not found');
-  } catch (e) {
-    SpreadsheetApp.getActive().toast('Strip formatting error: ' + e.toString().substring(0,60));
-    Logger.log('stripSessionsFormattingMenu error: ' + e.toString());
-  }
-}
-
-function stripSessionsFormatting_() {
-  const ss = SpreadsheetApp.getActive();
-  const sh = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
-  if (!sh) return false;
-  try {
-    // Clear cell-level formatting
-    sh.getDataRange().clearFormat();
-
-    // Remove alternating colors/banding limited to this sheet
-    try { (sh.getBandings() || []).forEach(b => b.remove()); } catch (e) {}
-
-    // Remove conditional formatting rules that target this sheet
-    try {
-      const rules = ss.getConditionalFormatRules();
-      const kept = [];
-      for (const r of rules) {
-        const ranges = r.getRanges ? r.getRanges() : [];
-        const touchesSessions = ranges && ranges.some(rg => rg.getSheet && rg.getSheet().getName && rg.getSheet().getName() === SHEETS_SESSIONS_TABLE);
-        if (!touchesSessions) kept.push(r);
-      }
-      if (kept.length !== rules.length) ss.setConditionalFormatRules(kept);
-    } catch (e) {}
-
-    // Remove sheet filter if present
-    try { const f = sh.getFilter(); if (f) f.remove(); } catch (e) {}
-
-    // Break any merged cells in the used grid
-    try { sh.getRange(1,1,sh.getMaxRows(), sh.getMaxColumns()).breakApart(); } catch (e) {}
-
-    // Remove row/column grouping within Sessions only
-    try {
-      sh.getRange(1, 1, Math.max(1, sh.getMaxRows()), 1).shiftRowGroupDepth(-8);
-      sh.getRange(1, 1, 1, Math.max(1, sh.getMaxColumns())).shiftColumnGroupDepth(-8);
-    } catch (e) {}
-
-    // Unfreeze any frozen rows/columns
-    try { sh.setFrozenRows(0); sh.setFrozenColumns(0); } catch (e) {}
-
-    return true;
-  } catch (e) {
-    Logger.log('stripSessionsFormatting_ error: ' + e.toString());
-    return false;
-  }
-}
-
-/* ===== Re-ingest Sessions using Rescue_Map header order (skip 5th column values) ===== */
-function reingestSessionsRescueMapMenu() {
-  try {
-    const ss = SpreadsheetApp.getActive();
-    const configSheet = ss.getSheetByName('Dashboard_Config');
-    const timeFrame = configSheet ? (configSheet.getRange('B3').getValue() || 'Today') : 'Today';
-    const range = getTimeFrameRange_(timeFrame);
-    const res = reingestSessionsRescueMap_(range.startDate, range.endDate);
-    SpreadsheetApp.getActive().toast(res && res.ok ? `Sessions re-ingested (${res.rows} rows)` : ('Error: ' + (res && res.error ? res.error : 'unknown')));
-  } catch (e) {
-    SpreadsheetApp.getActive().toast('Re-ingest error: ' + e.toString().substring(0, 60));
-    Logger.log('reingestSessionsRescueMapMenu error: ' + e.toString());
-  }
-}
-
-function reingestSessionsRescueMap_(startDate, endDate) {
-  try {
-    const ss = SpreadsheetApp.getActive();
-    const cfg = getCfg_();
-    const base = cfg.rescueBase;
-    const cookie = login_(base, cfg.user, cfg.pass);
-    setReportAreaSession_(base, cookie);
-    setReportTypeListAll_(base, cookie);
-    setOutputXMLOrFallback_(base, cookie); // TEXT pipe
-    setDelimiter_(base, cookie, '|');
-    setReportDate_(base, cookie, isoDate_(startDate), isoDate_(endDate));
-    setReportTimeAllDay_(base, cookie);
-
-    // Read desired header order from Rescue_Map if present
-    let desiredHeaders = null;
-    try {
-      const mapSh = ss.getSheetByName('Rescue_Map');
-      if (mapSh && mapSh.getLastColumn() > 0) {
-        desiredHeaders = mapSh.getRange(1,1,1,mapSh.getLastColumn()).getValues()[0].map(h => String(h||''));
-      }
-    } catch (e) { desiredHeaders = null; }
-
-    const nodes = (cfg.nodes || []).map(n => Number(n)).filter(n => Number.isFinite(n));
-    const noderefs = ['NODE','CHANNEL'];
-    let unionHeaders = [];
-    let allRowObjs = [];
-    const addUnion = (hs) => { hs.forEach(h => { if (unionHeaders.indexOf(h) === -1) unionHeaders.push(h); }); };
-
-    for (let i=0;i<noderefs.length;i++) {
-      const nr = noderefs[i];
-      for (let j=0;j<nodes.length;j++) {
-        const node = nodes[j];
-        const t = getReportTry_(base, cookie, node, nr);
-        if (!t || !/^OK/i.test(t)) continue;
-        const parsed = parsePipe_(t, '|');
-        if (parsed && parsed.headers && parsed.headers.length) addUnion(parsed.headers);
-        (parsed.rows || []).forEach(r => allRowObjs.push(r));
-        Utilities.sleep(120);
-      }
-    }
-
-    if (!desiredHeaders || !desiredHeaders.length) desiredHeaders = unionHeaders;
-    if (!desiredHeaders || !desiredHeaders.length) return { ok: false, error: 'No headers from API' };
-
-    // Prepare values aligned to desired headers, skipping 5th column values (1-based index = 5)
-    const skipIndex = 5; // omit data but keep header
-    const values = allRowObjs.map(obj => desiredHeaders.map((h, idx) => (idx+1) === skipIndex ? '' : (obj && obj.hasOwnProperty(h) ? obj[h] : '')));
-
-    // Write to Sessions sheet: headers then values, no formatting
-    let sh = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
-    if (!sh) sh = ss.insertSheet(SHEETS_SESSIONS_TABLE);
-    sh.clear();
-    if (desiredHeaders && desiredHeaders.length) sh.getRange(1,1,1,desiredHeaders.length).setValues([desiredHeaders]);
-    if (values && values.length) {
-      // chunked writes
-      const chunk = 1000;
-      for (let i=0;i<values.length;i+=chunk) {
-        const part = values.slice(i, i+chunk);
-        sh.getRange(2+i, 1, part.length, desiredHeaders.length).setValues(part);
-      }
-    }
-    return { ok: true, rows: values.length };
-  } catch (e) {
-    Logger.log('reingestSessionsRescueMap_ error: ' + e.toString());
-    return { ok: false, error: e.toString() };
-  }
-}
+// removed: header-fix utilities, strip formatting, and re-ingest options per request
 
 /* ===== Shift Rescue_Map data left so that values from 'Session ID' align under 'Technician ID' (first 4 columns unchanged) ===== */
 function shiftRescueMapDataAlignMenu() {
@@ -2775,8 +2698,9 @@ function fetchChannelSummaryData_(cfg, startDate, endDate) {
           setReportTypeSummary_(cfg.rescueBase, cookie);
         }
         
-        const t = getReportTry_(cfg.rescueBase, cookie, node, 'CHANNEL');
-        if (!t || !/^OK/i.test(t)) continue;
+  const t = getReportTry_(cfg.rescueBase, cookie, node, 'CHANNEL');
+  // Accept XML or TEXT; getReportTry_ already validated acceptable shapes
+  if (!t) continue;
         
         const parseResult = parsePipe_(t, '|');
         const parsed = parseResult.rows || [];
@@ -4624,7 +4548,8 @@ function apiSmokeTest() {
         const node = nodes[j];
         try {
           const t = getReportTry_(cfg.rescueBase, cookie, node, nr);
-          if (!t || !/^OK/i.test(t)) {
+          // Accept XML or TEXT; getReportTry_ already validated acceptable shapes
+          if (!t) {
             nodeStats.push({ node, noderef: nr, parsed: 0, mapped: 0, status: 'No data' });
             continue;
           }
