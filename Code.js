@@ -24,7 +24,7 @@ function getPerfSummaryCached_(cfg, startDate, endDate) {
  ************************************************************/
 
 /* ===== Default nodes ===== */
-const NODE_CANDIDATES_DEFAULT = [5648341, 300589800, 1367438801, 863388310, -2];
+const NODE_CANDIDATES_DEFAULT = [5648341];
 
 /* ===== Runtime settings ===== */
 // When false, we request XML from Rescue where supported and parse it to avoid column misalignment.
@@ -1341,6 +1341,24 @@ function mdy_(iso) {
 // Accepts: numeric seconds, numeric time-fraction (days), or hh:mm:ss string.
 function parseDurationSeconds_(val) {
   if (val == null || val === '') return 0;
+  
+  // Handle Date objects (Google Sheets converts time fractions to Date objects)
+  if (val instanceof Date) {
+    // Date objects from Sheets time values - convert to seconds
+    // Date object represents days since 1899-12-30, so get the time value
+    const timeValue = val.getTime();
+    // If it's a date in 1899, it's likely a time fraction (0.00185 days = 2:41)
+    // Convert to seconds: (date.getTime() - baseDate.getTime()) / 1000
+    const baseDate = new Date(1899, 11, 30); // Dec 30, 1899
+    const diffMs = timeValue - baseDate.getTime();
+    // If the difference is less than 2 days in milliseconds, it's a time fraction
+    if (Math.abs(diffMs) < 2 * 24 * 60 * 60 * 1000) {
+      return Math.round(diffMs / 1000); // Convert milliseconds to seconds
+    }
+    // Otherwise it's a real date, return 0 (not a duration)
+    return 0;
+  }
+  
   // If already a number
   if (typeof val === 'number') {
     // If small (< 2) assume it's a time-fraction (days) and convert to seconds
@@ -1348,6 +1366,7 @@ function parseDurationSeconds_(val) {
     // Otherwise assume it's raw seconds
     return Math.round(val);
   }
+  
   // If string, try to parse numeric first
   const s = String(val).trim();
   if (!s) return 0;
@@ -1509,12 +1528,19 @@ function writeRowsToSheets_(ss, rawDataChunks, clearExisting = false) {
   
   // Identify which column header contains "Nova Point of Sale" values (company name)
   // We'll keep the header but replace "Nova Point of Sale" values with empty strings
+  // Exclude ID columns (Technician ID, Session ID, etc.) from company name detection
+  const idColumnPatterns = ['id', 'technician id', 'session id', 'tracking id', 'device id', 'channel id'];
   let headerWithCompanyName = null;
   for (const chunk of rawDataChunks) {
     if (chunk.rows && Array.isArray(chunk.rows) && chunk.rows.length > 0) {
       // Check first row to find which column has "Nova Point of Sale"
       const firstRow = chunk.rows[0];
       for (const header of allHeaders) {
+        // Skip ID columns
+        const headerLower = String(header || '').toLowerCase().trim();
+        const isIdColumn = idColumnPatterns.some(pattern => headerLower.includes(pattern));
+        if (isIdColumn) continue;
+        
         const value = String(firstRow[header] || '').trim();
         if (value && value.toLowerCase().includes('nova point of sale')) {
           headerWithCompanyName = header;
@@ -1543,7 +1569,7 @@ function writeRowsToSheets_(ss, rawDataChunks, clearExisting = false) {
   
   // Flatten all rows from all chunks - preserve original types (numbers, strings, nulls)
   // Replace "Nova Point of Sale" values with empty string in the identified column
-  // NO DEDUPLICATION - write all rows as-is from API
+  // NO DEDUPLICATION - write all rows as-is since we're only calling the correct channel once
   const allRows = [];
   
   rawDataChunks.forEach(chunk => {
@@ -1574,9 +1600,11 @@ function writeRowsToSheets_(ss, rawDataChunks, clearExisting = false) {
     return 0;
   }
   
-  const newRowStart = sh.getLastRow() + 1;
+  // If we cleared existing data, start writing at row 2 (after headers)
+  // Otherwise, append after the last row
+  const newRowStart = clearExisting ? 2 : (sh.getLastRow() + 1);
   sh.getRange(newRowStart, 1, allRows.length, allHeaders.length).setValues(allRows);
-  Logger.log(`Wrote ${allRows.length} rows to Sessions sheet with ${allHeaders.length} columns (no deduplication)`);
+  Logger.log(`Wrote ${allRows.length} rows to Sessions sheet starting at row ${newRowStart} with ${allHeaders.length} columns (no deduplication)`);
   
   return allRows.length;
 }
@@ -1732,9 +1760,13 @@ function ingestTimeRangeToSheets_(startTimestamp, endTimestamp, cfg, clearExisti
   showLoadingIndicator_(ss, true);
   
   try {
-    const nodes = cfg.nodes.map(n => Number(n)).filter(Number.isFinite);
-    if (!nodes.length) throw new Error('No valid nodes configured');
-    const noderefs = ['NODE','CHANNEL'];
+    // Only use node 5648341 - filter out failed nodes
+    const nodes = cfg.nodes.map(n => Number(n)).filter(n => Number.isFinite(n) && n === 5648341);
+    if (!nodes.length) {
+      Logger.log('No valid nodes configured - only using node 5648341');
+      throw new Error('No valid nodes configured');
+    }
+    const noderefs = ['CHANNEL']; // Only use CHANNEL to avoid duplicate calls
     let cookie = login_(cfg.rescueBase, cfg.user, cfg.pass);
     
     // Set timezone to EDT (Eastern Daylight Time) before setting dates/times
@@ -2214,7 +2246,8 @@ function fetchPerformanceSummaryData_(cfg, startDate, endDate) {
     setReportDate_(cfg.rescueBase, cookie, startStr, endStr);
     setReportTimeAllDay_(cfg.rescueBase, cookie);
     
-  const nodes = cfg.nodes.map(n => Number(n)).filter(Number.isFinite);
+  // Only use node 5648341 - filter out failed nodes
+  const nodes = cfg.nodes.map(n => Number(n)).filter(n => Number.isFinite(n) && n === 5648341);
   const noderefs = getSummaryNoderefs_();
     
     for (const nr of noderefs) {
@@ -3035,9 +3068,11 @@ function createDailySummarySheet_(ss, startDate, endDate) {
     summaryRows.push(Array(dates.length + 2).fill(''));
     summaryRows.push(Array(dates.length + 2).fill(''));
     
-    // Summary section (Technician totals)
-    summaryRows.push(['Summary', ...Array(dates.length + 1).fill('')]);
-    const summaryHeaders = ['Technician Name', 'Total Sessions', '% Of Total sessions', 'Sessions per HR', 'Avg Pick-up Speed', 'Avg Duration', 'Average Work Time', ...Array(dates.length - 6).fill('')];
+    // Summary section (Technician totals) - uses 7 fixed columns
+    const summaryHeaderCols = 7; // Fixed 7 columns for technician summary
+    summaryRows.push(['Summary', ...Array(summaryHeaderCols - 1).fill('')]);
+    // Summary headers: 7 fixed columns
+    const summaryHeaders = ['Technician Name', 'Total Sessions', '% Of Total sessions', 'Sessions per HR', 'Avg Pick-up Speed', 'Avg Duration', 'Average Work Time'];
     summaryRows.push(summaryHeaders);
     
     // Calculate per-technician stats
@@ -3068,26 +3103,42 @@ function createDailySummarySheet_(ss, startDate, endDate) {
       const avgDur = stats.durations.length > 0 ? (stats.durations.reduce((a, b) => a + b, 0) / stats.durations.length) : 0;
       const workTime = stats.workSeconds || 0;
       // store pickups/durations/workTime as numeric time fractions (seconds/86400)
-      const techRow = [tech, stats.sessions, pct, sessionsPerHr, avgPickup / 86400, avgDur / 86400, workTime / 86400, ...Array(dates.length - 6).fill('')];
+      // Tech row must match header structure with exactly headerCols columns
+      // Tech row must have exactly 7 columns to match summaryHeaders
+      const techRow = [tech, stats.sessions, pct, sessionsPerHr, avgPickup / 86400, avgDur / 86400, workTime / 86400];
+      // Ensure exactly 7 columns
+      while (techRow.length < summaryHeaderCols) {
+        techRow.push('');
+      }
+      techRow.length = summaryHeaderCols;
       summaryRows.push(techRow);
     });
     
-    // Write to sheet
-      if (summaryRows.length > 0) {
-      summarySheet.getRange(1, 1, summaryRows.length, summaryRows[0].length).setValues(summaryRows);
-      summarySheet.getRange(1, 1, 1, summaryRows[0].length).setFontWeight('bold').setBackground('#E5E7EB');
-      summarySheet.getRange(2, 1, 1, summaryRows[0].length).setFontWeight('bold');
-      summarySheet.getRange(summaryRows.length - Object.keys(techStats).length, 1, 1, summaryRows[0].length).setFontWeight('bold').setBackground('#E5E7EB');
+    // Write to sheet - ensure all rows have the same number of columns
+    if (summaryRows.length > 0) {
+      // Find maximum column count across all rows
+      const maxCols = Math.max(...summaryRows.map(row => row.length));
+      // Pad all rows to maxCols to ensure consistent column count
+      summaryRows.forEach(row => {
+        while (row.length < maxCols) {
+          row.push('');
+        }
+        row.length = maxCols; // Ensure exact length
+      });
+      summarySheet.getRange(1, 1, summaryRows.length, maxCols).setValues(summaryRows);
+      summarySheet.getRange(1, 1, 1, maxCols).setFontWeight('bold').setBackground('#E5E7EB');
+      summarySheet.getRange(2, 1, 1, maxCols).setFontWeight('bold');
+      summarySheet.getRange(summaryRows.length - Object.keys(techStats).length, 1, 1, maxCols).setFontWeight('bold').setBackground('#E5E7EB');
       summarySheet.setFrozenRows(1);
       summarySheet.setColumnWidth(1, 300);
-      for (let i = 2; i <= summaryRows[0].length; i++) {
+      for (let i = 2; i <= maxCols; i++) {
         summarySheet.setColumnWidth(i, 120);
       }
-      try { applyProfessionalTableStyling_(summarySheet, summaryRows[0].length); } catch (e) { Logger.log('Styling daily summary failed: ' + e.toString()); }
+      try { applyProfessionalTableStyling_(summarySheet, maxCols); } catch (e) { Logger.log('Styling daily summary failed: ' + e.toString()); }
 
       // Post-formatting: ensure duration/pickup cells are numeric time fractions and formatted as hh:mm:ss
       try {
-        const lastCol = summaryRows[0].length;
+        const lastCol = maxCols;
         // load column A to find metric rows
         const colA = summarySheet.getRange(1,1,summaryRows.length,1).getValues().map(r => String((r[0]||'')).trim().toLowerCase());
         const findRow = (label) => colA.findIndex(v => v === label.toLowerCase());
@@ -3167,17 +3218,21 @@ function createSupportDataSheet_(ss, startDate, endDate) {
       return -1;
     };
     
-    const startIdx = getHeaderIndex(['start_time','Start Time']);
-    const techIdx = getHeaderIndex(['technician_name','Technician Name']);
-    const statusIdx = getHeaderIndex(['session_status','Status']);
-    const durationIdx = getHeaderIndex(['duration_total_seconds','Total Time']);
-    const workIdx = getHeaderIndex(['duration_work_seconds','Work Time']);
-    const pickupIdx = getHeaderIndex(['pickup_seconds','Waiting Time']);
-    const customerIdx = getHeaderIndex(['customer_name','Your Name:','Customer Name']);
-    const sessionIdIdx = getHeaderIndex(['session_id','Session ID']);
-    const channelIdx = getHeaderIndex(['channel_name','Channel Name']);
-    const resolvedIdx = getHeaderIndex(['resolved_unresolved','Resolved Unresolved']);
-    const callingCardIdx = getHeaderIndex(['calling_card','Calling Card']);
+    // Use exact header names from API as provided by user
+    const startIdx = getHeaderIndex(['Start Time', 'start_time', 'start time']);
+    const techIdx = getHeaderIndex(['Technician Name', 'technician_name', 'technician name']);
+    const statusIdx = getHeaderIndex(['Status', 'session_status', 'status']);
+    const durationIdx = getHeaderIndex(['Total Time', 'total_time', 'duration_total_seconds']);
+    const workIdx = getHeaderIndex(['Work Time', 'work_time', 'duration_work_seconds']);
+    const pickupIdx = getHeaderIndex(['Waiting Time', 'waiting_time', 'pickup_seconds']);
+    const customerIdx = getHeaderIndex(['Your Name:', 'customer_name', 'Customer Name']);
+    const sessionIdIdx = getHeaderIndex(['Session ID', 'session_id', 'session id']);
+    const channelIdx = getHeaderIndex(['Channel Name', 'channel_name']);
+    const resolvedIdx = getHeaderIndex(['Resolved Unresolved', 'resolved_unresolved', 'Resolved, Unresolved']);
+    const callingCardIdx = getHeaderIndex(['Calling Card', 'calling_card', 'calling card']);
+    
+    // Log header indices for debugging
+    Logger.log(`Support Data header indices - Start: ${startIdx}, Tech: ${techIdx}, Duration: ${durationIdx}, Work: ${workIdx}, Pickup: ${pickupIdx}`);
     
     // Filter by date range
     const startStr = startDate.toISOString().split('T')[0];
@@ -3204,10 +3259,14 @@ function createSupportDataSheet_(ss, startDate, endDate) {
     // Summary KPIs
     const kpiRow = 4;
     const totalSessions = filtered.length;
-    const totalWorkSeconds = filtered.reduce((sum, row) => sum + parseDurationSeconds_(row[workIdx] || 0), 0);
+    // Add defensive checks for missing columns
+    const totalWorkSeconds = workIdx >= 0 ? filtered.reduce((sum, row) => sum + parseDurationSeconds_(row[workIdx] || 0), 0) : 0;
     const totalWorkHours = (totalWorkSeconds / 3600).toFixed(1);
-    const avgPickup = filtered.length > 0 ? 
+    const avgPickup = (filtered.length > 0 && pickupIdx >= 0) ? 
       Math.round(filtered.reduce((sum, row) => sum + parseDurationSeconds_(row[pickupIdx] || 0), 0) / filtered.length) : 0;
+    
+    if (workIdx < 0) Logger.log('WARNING: Work Time column not found in Support Data');
+    if (pickupIdx < 0) Logger.log('WARNING: Waiting Time column not found in Support Data');
   // resolved/unresolved columns exist in Sessions but Support_Data will not report resolution metrics
   const resolvedCount = filtered.filter(row => row[resolvedIdx] === 'Resolved').length;
     
@@ -3261,10 +3320,10 @@ function createSupportDataSheet_(ss, startDate, endDate) {
         };
       }
       techStats[tech].sessions++;
-      if (row[durationIdx]) techStats[tech].durations.push(parseDurationSeconds_(row[durationIdx]));
-      if (row[pickupIdx]) techStats[tech].pickups.push(parseDurationSeconds_(row[pickupIdx]));
-      if (row[workIdx]) techStats[tech].workSeconds += parseDurationSeconds_(row[workIdx]);
-      if (row[resolvedIdx] === 'Resolved') techStats[tech].resolved++;
+      if (durationIdx >= 0 && row[durationIdx]) techStats[tech].durations.push(parseDurationSeconds_(row[durationIdx]));
+      if (pickupIdx >= 0 && row[pickupIdx]) techStats[tech].pickups.push(parseDurationSeconds_(row[pickupIdx]));
+      if (workIdx >= 0 && row[workIdx]) techStats[tech].workSeconds += parseDurationSeconds_(row[workIdx]);
+      if (resolvedIdx >= 0 && row[resolvedIdx] === 'Resolved') techStats[tech].resolved++;
       // Count Nova Wave sessions
       if (callingCardIdx >= 0 && row[callingCardIdx]) {
         const callingCard = String(row[callingCardIdx]).toLowerCase();
@@ -3316,7 +3375,7 @@ function createSupportDataSheet_(ss, startDate, endDate) {
         if (!dailyData[d]) dailyData[d] = { sessions: [], totalWorkSeconds: 0 };
         dailyData[d].sessions.push(row);
         // Use robust parser for duration/work fields to avoid negative/invalid values
-        dailyData[d].totalWorkSeconds += parseDurationSeconds_(row[workIdx] || 0);
+        if (workIdx >= 0) dailyData[d].totalWorkSeconds += parseDurationSeconds_(row[workIdx] || 0);
       } catch (e) { /* ignore malformed rows */ }
     });
 
@@ -3354,7 +3413,7 @@ function createSupportDataSheet_(ss, startDate, endDate) {
     let daysWithData = 0;
     dates.forEach(d => {
       const data = dailyData[d];
-      if (data && data.sessions.length > 0) {
+      if (data && data.sessions.length > 0 && durationIdx >= 0) {
         // Parse session durations defensively (supports seconds, HH:MM:SS, or day-fractions)
         const durations = data.sessions.map(s => parseDurationSeconds_(s[durationIdx] || 0)).filter(Boolean);
           if (durations.length > 0) {
@@ -3382,7 +3441,7 @@ function createSupportDataSheet_(ss, startDate, endDate) {
     let totalPickupCount = 0;
     dates.forEach(d => {
       const data = dailyData[d];
-      if (data && data.sessions.length > 0) {
+      if (data && data.sessions.length > 0 && pickupIdx >= 0) {
         // Parse pickup times defensively
         const pickups = data.sessions.map(s => parseDurationSeconds_(s[pickupIdx] || 0)).filter(p => p > 0);
         if (pickups.length > 0) {
@@ -3720,7 +3779,8 @@ function createMainAnalyticsPage_(ss) {
   sh.setColumnWidth(6, 120);
   sh.setColumnWidth(7, 150);
   sh.setFrozenRows(1);
-  try { applyProfessionalTableStyling_(sh, sh.getLastColumn()); } catch (e) { Logger.log('Styling analytics dashboard failed: ' + e.toString()); }
+  // Don't apply professional table styling to Analytics Dashboard - it overwrites our custom header colors
+  // try { applyProfessionalTableStyling_(sh, sh.getLastColumn()); } catch (e) { Logger.log('Styling analytics dashboard failed: ' + e.toString()); }
 }
 
 function refreshDashboardFromAPI() {
@@ -4032,8 +4092,8 @@ function refreshAnalyticsDashboard_(startDate, endDate, perfMapOpt) {
           dashboardSheet.getRange(teamDataRow, 1, teamRows.length, teamHeaders.length).setFontColor('#0F172A');
         }
 
-        // Re-run the professional table styling helper to restore banding/borders where necessary
-        try { applyProfessionalTableStyling_(dashboardSheet, dashboardSheet.getLastColumn()); } catch (e) { /* non-fatal */ }
+                  // Don't apply professional table styling - it overwrites our custom header colors
+                  // try { applyProfessionalTableStyling_(dashboardSheet, dashboardSheet.getLastColumn()); } catch (e) { /* non-fatal */ }
       } catch (e) { Logger.log('Re-applying header styles failed: ' + e.toString()); }
 
       dashboardSheet.getRange(2, 5).setValue(new Date().toLocaleString());
@@ -4065,18 +4125,24 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
       }
       return -1;
     };
-    const startIdx = getHeaderIndex(['Start Time','start_time', 'start time', 'start_time_local']);
-    const techIdx = getHeaderIndex(['Technician Name','technician_name', 'technician name', 'technician', 'tech']);
-    const statusIdx = getHeaderIndex(['Status','session_status', 'status']);
-    const durationIdx = getHeaderIndex(['Total Time','total_time','duration_total_seconds', 'duration_seconds', 'duration_total']);
-    const pickupIdx = getHeaderIndex(['Waiting Time','waiting_time','pickup_seconds', 'pickup_seconds_total', 'pickup']);
-    const workIdx = getHeaderIndex(['Work Time','work_time','duration_work_seconds', 'work_seconds']);
-    const activeIdx = getHeaderIndex(['Active Time','active_time', 'duration_active_seconds', 'active seconds', 'active']);
-    const customerIdx = getHeaderIndex(['Your Name:','Customer Name','customer_name', 'customer', 'customer_name:']); // Column 8
-    const sessionIdIdx = getHeaderIndex(['Session ID','session_id', 'session id', 'id']); // Column 1
-    const phoneIdx = getHeaderIndex(['Your Phone #:','caller_phone', 'caller phone', 'phone']); // Column 26
-    const companyIdx = getHeaderIndex(['Company name:','Company Name','company_name', 'company']); // Column 24
-    const callingCardIdx = getHeaderIndex(['Calling Card','calling_card', 'calling card']); // Column 28
+    // Use exact header names from API as provided by user
+    const startIdx = getHeaderIndex(['Start Time', 'start_time', 'start time']);
+    const techIdx = getHeaderIndex(['Technician Name', 'technician_name', 'technician name']);
+    const techIdIdx = getHeaderIndex(['Technician ID', 'technician_id', 'technician id']);
+    const statusIdx = getHeaderIndex(['Status', 'session_status', 'status']);
+    const durationIdx = getHeaderIndex(['Total Time', 'total_time', 'duration_total_seconds', 'Total Time']);
+    const pickupIdx = getHeaderIndex(['Waiting Time', 'waiting_time', 'pickup_seconds', 'Waiting Time']);
+    const workIdx = getHeaderIndex(['Work Time', 'work_time', 'duration_work_seconds', 'Work Time']);
+    const activeIdx = getHeaderIndex(['Active Time', 'active_time', 'duration_active_seconds', 'Active Time']);
+    const customerIdx = getHeaderIndex(['Your Name:', 'Customer Name', 'customer_name', 'Your Name:']);
+    const sessionIdIdx = getHeaderIndex(['Session ID', 'session_id', 'session id', 'Session ID']);
+    const phoneIdx = getHeaderIndex(['Your Phone #:', 'caller_phone', 'phone', 'Your Phone #:']);
+    const companyIdx = getHeaderIndex(['Company name:', 'Company Name', 'company_name', 'Company name:']);
+    const callingCardIdx = getHeaderIndex(['Calling Card', 'calling_card', 'calling card', 'Calling Card']);
+    const channelNameIdx = getHeaderIndex(['Channel Name', 'channel_name', 'channel name', 'Channel Name']);
+    
+    // Log header indices for debugging
+    Logger.log(`Header indices - Start: ${startIdx}, Tech: ${techIdx}, Status: ${statusIdx}, Duration: ${durationIdx}, Pickup: ${pickupIdx}, Work: ${workIdx}, Active: ${activeIdx}, SessionID: ${sessionIdIdx}, Channel: ${channelNameIdx}`);
     const filtered = allData.filter(row => {
       if (!row || !row[startIdx] || !row[techIdx]) return false;
       try {
@@ -4086,29 +4152,40 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
         return false;
       }
     });
-  // Build tech list from roster (extension_map) plus any techs present in the filtered data
+  // Build tech list from roster (extension_map) - create ALL sheets upfront, then populate only if data exists
   const rosterNames = getRosterTechnicianNames_();
   const techSet = new Set((rosterNames || []).filter(Boolean));
   filtered.forEach(row => { const t = row[techIdx]; if (t) techSet.add(String(t)); });
   const techs = Array.from(techSet);
   
-  // Generate safe names for all techs first, then clean up any duplicate/old personal dashboard sheets
+  // Generate safe names for all techs
   const techSafeNames = new Set();
   techs.forEach(techName => {
     const safeName = techName.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30);
     techSafeNames.add(safeName);
   });
   
-  // Remove any personal dashboard sheets that don't match current tech safe names
+  // Create or get all personal dashboard sheets upfront (from roster)
   const allSheets = ss.getSheets();
   const reservedSheets = ['Sessions', 'Analytics_Dashboard', 'Dashboard_Config', 'Daily_Summary', 'Support_Data', 'Progress', 'Advanced_Analytics', 'Digium_Raw', 'Digium_Calls', 'API_Smoke_Test'];
+  
+  // First, create sheets for all roster techs if they don't exist
+  rosterNames.forEach(techName => {
+    const safeName = techName.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30);
+    if (!ss.getSheetByName(safeName)) {
+      const newSheet = ss.insertSheet(safeName);
+      Logger.log(`Created personal dashboard sheet: ${safeName}`);
+    }
+  });
+  
+  // Remove any personal dashboard sheets that don't match roster techs
   allSheets.forEach(sheet => {
     const sheetName = sheet.getName();
     if (reservedSheets.indexOf(sheetName) !== -1) return;
     try {
       const a1 = sheet.getRange(1, 1).getValue();
       const isPersonalDashboard = typeof a1 === 'string' && a1.indexOf('Personal Dashboard') !== -1;
-      // If it's a personal dashboard sheet but not in our current tech list, delete it
+      // If it's a personal dashboard sheet but not in our roster, delete it
       if (isPersonalDashboard && !techSafeNames.has(sheetName)) {
         ss.deleteSheet(sheet);
         Logger.log(`Deleted old personal dashboard sheet: ${sheetName}`);
@@ -4120,16 +4197,25 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
   
   // Pull performance summary once for the whole range; used for Avg Session (API)
   const perfByTech = perfMapOpt || getPerfSummaryCached_(cfg, startDate, endDate) || {};
-    for (const techName of techs) {
-      const safeName = techName.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30);
-      let techSheet = ss.getSheetByName(safeName);
-      if (!techSheet) {
-        techSheet = ss.insertSheet(safeName);
-      } else {
-        // Sheet exists - clear it completely to repopulate
-        techSheet.clear();
-      }
-  const techRows = filtered.filter(row => row[techIdx] === techName);
+  
+  // Process all techs (both roster and those with data)
+  for (const techName of techs) {
+    const safeName = techName.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30);
+    let techSheet = ss.getSheetByName(safeName);
+    if (!techSheet) {
+      techSheet = ss.insertSheet(safeName);
+    }
+    
+    // Always clear the sheet to repopulate
+    techSheet.clear();
+    
+    const techRows = filtered.filter(row => row[techIdx] === techName);
+    
+    // Only populate if there's data for this tech
+    if (techRows.length === 0) {
+      Logger.log(`No data for ${techName}, skipping dashboard population`);
+      continue;
+    }
       // Important: clearing values does not remove row/column groups; fully reset any prior groups
       try {
         const maxRows = techSheet.getMaxRows();
@@ -4146,10 +4232,23 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
       techSheet.getRange(2, 4).setValue('Last Updated:');
       techSheet.getRange(2, 5).setValue(new Date().toLocaleString());
   // Normalize durations/pickups/work seconds to seconds for robust calculations
-  const durations = techRows.map(r => parseDurationSeconds_(r[durationIdx] || 0)).filter(Boolean);
-  const pickups = techRows.map(r => parseDurationSeconds_(r[pickupIdx] || 0)).filter(Boolean);
-  const workSeconds = techRows.map(r => parseDurationSeconds_(r[workIdx] || 0)).filter(Boolean).reduce((a,b) => a + b, 0);
-  const activeSecondsArr = techRows.map(r => parseDurationSeconds_(r[activeIdx] || 0)).filter(Boolean);
+  // Add defensive checks for missing columns
+  const durations = durationIdx >= 0 ? techRows.map(r => parseDurationSeconds_(r[durationIdx] || 0)).filter(v => v > 0) : [];
+  const pickups = pickupIdx >= 0 ? techRows.map(r => parseDurationSeconds_(r[pickupIdx] || 0)).filter(v => v > 0) : [];
+  const workSeconds = workIdx >= 0 ? techRows.map(r => parseDurationSeconds_(r[workIdx] || 0)).filter(v => v > 0).reduce((a,b) => a + b, 0) : 0;
+  const activeSecondsArr = activeIdx >= 0 ? techRows.map(r => parseDurationSeconds_(r[activeIdx] || 0)).filter(v => v > 0) : [];
+  
+  // Log sample values to debug why values are 0
+  if (techRows.length > 0) {
+    const sampleRow = techRows[0];
+    Logger.log(`${techName} - Sample row values: Duration[${durationIdx}]=${sampleRow[durationIdx]}, Pickup[${pickupIdx}]=${sampleRow[pickupIdx]}, Work[${workIdx}]=${sampleRow[workIdx]}, Active[${activeIdx}]=${sampleRow[activeIdx]}`);
+    Logger.log(`${techName} - Parsed values: durations=${durations.length}, pickups=${pickups.length}, workSeconds=${workSeconds}, activeSeconds=${activeSecondsArr.length}`);
+  }
+  
+  if (durationIdx < 0) Logger.log(`WARNING: Duration column not found for ${techName}`);
+  if (pickupIdx < 0) Logger.log(`WARNING: Pickup column not found for ${techName}`);
+  if (workIdx < 0) Logger.log(`WARNING: Work Time column not found for ${techName}`);
+  if (activeIdx < 0) Logger.log(`WARNING: Active Time column not found for ${techName}`);
       const completed = techRows.filter(r => r[statusIdx] === 'Ended').length;
       const active = techRows.filter(r => r[statusIdx] === 'Active').length;
     const avgDur = durations.length > 0 ? (durations.reduce((a,b) => a+b, 0) / durations.length / 60).toFixed(1) : '0';
@@ -4162,28 +4261,40 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
   // Total Active Hours should reflect active time from sessions (not work time)
   const totalActiveSeconds = activeSecondsArr.reduce((a,b)=>a+b, 0);
   const activeHoursTotal = (totalActiveSeconds / 3600).toFixed(1);
-      // Count Nova Wave sessions for this technician
-      // callingCardIdx already defined above
-      const novaWaveCount = callingCardIdx >= 0 ? 
+      // Count Nova Wave sessions for this technician - use Channel Name instead of Calling Card
+      const novaWaveCount = channelNameIdx >= 0 ? 
         techRows.filter(row => {
-          const callingCard = String(row[callingCardIdx] || '').toLowerCase();
-          return callingCard.includes('nova wave chat');
+          const channelName = String(row[channelNameIdx] || '').toLowerCase();
+          return channelName.includes('nova wave chat');
         }).length : 0;
       
   const kpiRow = 4;
       // Build KPI values. Durations/pickups are stored here as spreadsheet time fractions (seconds/86400)
       const avgDurationSeconds = durations.length > 0 ? Math.round(durations.reduce((a,b)=>a+b,0) / durations.length) : 0;
       const avgPickupSeconds = pickups.length > 0 ? Math.round(pickups.reduce((a,b)=>a+b,0) / pickups.length) : 0;
+      // Calculate values with proper defensive checks
+      const avgActiveTimeSeconds = activeSecondsArr.length > 0 ? Math.round(activeSecondsArr.reduce((a,b)=>a+b,0) / activeSecondsArr.length) : 0;
+      const avgPickupTimeSeconds = avgPickupSeconds; // Already calculated above
+      const slaHitPercent = pickups.length > 0 ? (slaHits / pickups.length) : 0; // Numeric 0-1 for percentage format
+      const totalActiveHoursNum = totalActiveSeconds / 3600; // Numeric hours for decimal format
+      const totalLoginTimeSeconds = totalActiveSeconds; // Same as totalActiveSeconds
+      
+      // Log calculated values for debugging
+      Logger.log(`${techName} KPIs - Sessions: ${techRows.length}, Pickups: ${pickups.length}, Active Seconds: ${totalActiveSeconds}, Avg Pickup: ${avgPickupTimeSeconds}s`);
+      
       const kpis = [
         ['Total Sessions', techRows.length],
         ['Nova Wave Sessions', novaWaveCount],
-        // Replace Avg Duration with Active Time (average) stored as numeric time fraction for hh:mm:ss formatting
-        ['Active Time', (activeSecondsArr.length > 0 ? Math.round(activeSecondsArr.reduce((a,b)=>a+b,0) / activeSecondsArr.length) : 0) / 86400],
-        ['Avg Pickup Time', avgPickupSeconds / 86400],
-        ['SLA Hit %', slaPct + '%'],
-        ['Total Active Hours', activeHoursTotal + ' hrs'],
-        // Total Login Time is the sum of active seconds across all sessions, shown as time
-        ['Total Login Time', totalActiveSeconds / 86400],
+        // Active Time (average) stored as numeric time fraction for hh:mm:ss formatting
+        ['Active Time', avgActiveTimeSeconds / 86400],
+        // Avg Pickup Time stored as numeric time fraction
+        ['Avg Pickup Time', avgPickupTimeSeconds > 0 ? avgPickupTimeSeconds / 86400 : 0],
+        // SLA Hit % as numeric fraction (0-1) for percentage format
+        ['SLA Hit %', slaHitPercent],
+        // Total Active Hours as numeric hours for decimal format
+        ['Total Active Hours', totalActiveHoursNum],
+        // Total Login Time as numeric time fraction
+        ['Total Login Time', totalLoginTimeSeconds > 0 ? totalLoginTimeSeconds / 86400 : 0],
         ['Sessions/Hour', sessionsPerHour]
       ];
       for (let i = 0; i < kpis.length; i++) {
@@ -4193,13 +4304,19 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
         techSheet.getRange(row, col).setFontSize(11).setFontColor('#666666');
         techSheet.getRange(row, col + 1).setValue(kpis[i][1]);
         techSheet.getRange(row, col + 1).setFontSize(16).setFontWeight('bold').setFontColor('#9C27B0');
-        // If this KPI is a duration/pickup numeric fraction, format it as hh:mm:ss
+        // Apply appropriate number formats
         try {
           const label = String(kpis[i][0] || '');
-          if (/avg duration/i.test(label) || /avg pickup/i.test(label) || /active time/i.test(label) || /login time/i.test(label)) {
+          if (/avg pickup/i.test(label) || /active time/i.test(label) || /login time/i.test(label)) {
             techSheet.getRange(row, col + 1).setNumberFormat('hh:mm:ss');
+          } else if (/sla hit/i.test(label)) {
+            // SLA Hit % as percentage format (0.0%)
+            techSheet.getRange(row, col + 1).setNumberFormat('0.0%');
+          } else if (/total active hours/i.test(label)) {
+            // Total Active Hours as decimal hours (0.0 hrs)
+            techSheet.getRange(row, col + 1).setNumberFormat('0.0');
           } else if (/sessions\/hour/i.test(label)) {
-            // Ensure Sessions/Hour is displayed as a single-decimal number
+            // Sessions/Hour as single decimal
             techSheet.getRange(row, col + 1).setNumberFormat('0.0');
           }
         } catch (e) { /* ignore formatting errors */ }
@@ -4240,10 +4357,10 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
           const d = new Date(r[startIdx]).toISOString().split('T')[0];
           if (!dailyMap[d]) dailyMap[d] = { sessions: [], totalActiveSeconds: 0, totalWorkSeconds: 0 };
           dailyMap[d].sessions.push(r);
-          // Sum ACTIVE time for daily totals
-          dailyMap[d].totalActiveSeconds += parseDurationSeconds_(r[activeIdx] || 0);
+          // Sum ACTIVE time for daily totals (with defensive check)
+          if (activeIdx >= 0) dailyMap[d].totalActiveSeconds += parseDurationSeconds_(r[activeIdx] || 0);
           // Sum WORK time for daily totals (if present)
-          try { if (workIdx >= 0) dailyMap[d].totalWorkSeconds += parseDurationSeconds_(r[workIdx] || 0); } catch (e) {}
+          if (workIdx >= 0) dailyMap[d].totalWorkSeconds += parseDurationSeconds_(r[workIdx] || 0);
         } catch (e) { }
       });
       dates.forEach(d => {
@@ -4260,14 +4377,8 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
   // For Login Time, use the same source as Active (sum of active seconds for the day)
   totalLoginRow.push(activeSecs / 86400);
   totalLoginAll += activeSecs;
-        // For Avg Session, prefer API performance average for this technician
-        const perf = perfByTech[techName] || perfByTech[String(techName).trim()] || null;
-        if (perf && perf.avgDuration) {
-          const avg = Number(perf.avgDuration) || 0;
-          avgSessionRow.push(avg / 86400);
-          totalAvgSeconds += avg;
-          daysWithData++;
-        } else if (data && data.sessions.length > 0) {
+        // For Avg Session per day, calculate from sessions data for that day (not overall API average)
+        if (data && data.sessions.length > 0 && durationIdx >= 0) {
           const durations = data.sessions.map(s => parseDurationSeconds_(s[durationIdx] || 0)).filter(Boolean);
           if (durations.length > 0) {
             const avg = durations.reduce((a,b)=>a+b,0) / durations.length;
@@ -4281,7 +4392,8 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
           avgSessionRow.push(0);
         }
 
-        if (data && data.sessions.length > 0) {
+        // For Avg Pick-up Speed per day, calculate from sessions data for that day
+        if (data && data.sessions.length > 0 && pickupIdx >= 0) {
           const pickups = data.sessions.map(s => parseDurationSeconds_(s[pickupIdx] || 0)).filter(p=>p>0);
           if (pickups.length > 0) {
             const avgp = pickups.reduce((a,b)=>a+b,0) / pickups.length;
@@ -4369,8 +4481,8 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
         if ((!phoneNumber || !looksLikePhone(phoneNumber)) && callerNameIdx >= 0) phoneNumber = row[callerNameIdx] || phoneNumber || '';
 
         // Duration and pickup as true time values (fraction of day)
-        const durTime = row[durationIdx] ? secToTimeValue(row[durationIdx]) : 0;
-        const pickupTime = row[pickupIdx] ? secToTimeValue(row[pickupIdx]) : 0;
+        const durTime = (durationIdx >= 0 && row[durationIdx]) ? secToTimeValue(parseDurationSeconds_(row[durationIdx])) : 0;
+        const pickupTime = (pickupIdx >= 0 && row[pickupIdx]) ? secToTimeValue(parseDurationSeconds_(row[pickupIdx])) : 0;
         // session id fallback: if session id looks like a timestamp, try tracking_id or other headers
         let sessionId = row[sessionIdIdx] || '';
         const looksLikeDateTime = (s) => { if (!s) return false; const t=String(s); return /\d{1,2}\/\d{1,2}\/\d{2,4}/.test(t) || /\d{4}-\d{2}-\d{2}/.test(t) || /\d{1,2}:\d{2}:\d{2}/.test(t); };
@@ -5429,10 +5541,12 @@ function createCapacityIndicators_(sheet, startRow) {
     sheet.getRange(startRow, 1).setFontSize(16).setFontWeight('bold').setFontColor('#1A73E8');
     sheet.getRange(startRow, 1, 1, 3).merge();
     
-    // Get current sessions from API
-    const currentSessionData = fetchCurrentSessions_(cfg);
-    const activeCount = currentSessionData.active.length;
-    const waitingCount = currentSessionData.waiting.length;
+    // Get current sessions from API - DISABLED for now
+    // const currentSessionData = fetchCurrentSessions_(cfg);
+    // const activeCount = currentSessionData.active.length;
+    // const waitingCount = currentSessionData.waiting.length;
+    const activeCount = 0;
+    const waitingCount = 0;
     
     // Calculate average resolution time from recent data
     const sessionsSheet = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
