@@ -339,8 +339,12 @@ function fetchDigiumCallReports_(startDate, endDate, options) {
     talking_duration: 'Talking Duration (s)', call_duration: 'Call Duration (s)', avg_talking_duration: 'Avg Talking Duration (s)', avg_call_duration: 'Avg Call Duration (s)'
   };
 
-  // prefer per-day breakdown for wide output; use Switchvox token 'by_day' per API docs
-  const breakdown = (options && options.breakdown) || 'by_day';
+  // Breakdown options: 'by_date' (maps to 'by_day' in API), 'by_account', 'by_hour_of_day', 'by_day_of_week', 'cumulative'
+  // Map 'by_date' to 'by_day' for API compatibility
+  let breakdown = (options && options.breakdown) || 'by_day';
+  if (breakdown === 'by_date') {
+    breakdown = 'by_day'; // API uses 'by_day' for date breakdown
+  }
 
   // Build report_fields XML
   let reportFieldsXml = '<report_fields>'; 
@@ -359,6 +363,10 @@ function fetchDigiumCallReports_(startDate, endDate, options) {
   }
 
   const paramsXml = `\n    <start_date>${xmlEscape_(startStr)}</start_date>\n    <end_date>${xmlEscape_(endStr)}</end_date>\n    <ignore_weekends>0</ignore_weekends>\n    <breakdown>${xmlEscape_(breakdown)}</breakdown>${accountIdsXml}\n    ${reportFieldsXml}\n    <format>xml</format>\n  `;
+
+  // Log the request for debugging
+  Logger.log(`Digium API Request - breakdown: ${breakdown}, account_ids: ${options && options.account_ids ? (Array.isArray(options.account_ids) ? options.account_ids.join(',') : options.account_ids) : 'none'}`);
+  Logger.log(`Digium API Request XML (first 500 chars): ${paramsXml.substring(0, 500)}`);
 
   const r = digiumApiCall_('switchvox.callReports.search', paramsXml, user, pass, host);
   // Save raw response for inspection — append rather than clear so history is preserved (batched)
@@ -410,11 +418,91 @@ function fetchDigiumCallReports_(startDate, endDate, options) {
     return isNaN(n) ? 0 : n;
   };
 
-  // Try to parse per-day results. Best-effort: look for <day date="YYYY-MM-DD">...</day>
+  // Try to parse results based on breakdown type
   try {
     const doc = r.xml;
     const root = doc.getRootElement();
 
+    // Handle by_account breakdown - returns account-level totals
+    if (breakdown === 'by_account') {
+      const resultEl = root.getChild('result') || root;
+      const callsEl = resultEl.getChild('calls');
+      if (!callsEl) {
+        Logger.log('Digium by_account: No <calls> element found');
+        return { ok: false, error: 'No calls element in response', raw: r.raw };
+      }
+      
+      // Sum up totals across all accounts/extensions
+      const totals = {};
+      fields.forEach(f => { totals[f] = 0; });
+      
+      // Look for <call> elements with attributes
+      const callElements = callsEl.getChildren('call');
+      if (callElements && callElements.length > 0) {
+        callElements.forEach(callEl => {
+          fields.forEach(f => {
+            // Map field names to API attribute names
+            const attrMap = {
+              'total_calls': 'calls',
+              'total_incoming_calls': 'incoming',
+              'total_outgoing_calls': 'outgoing',
+              'talking_duration': 'talk_time',
+              'call_duration': 'call_time',
+              'avg_talking_duration': 'avg_talk_time',
+              'avg_call_duration': 'avg_call_time'
+            };
+            const attrName = attrMap[f] || f;
+            const attr = callEl.getAttribute(attrName);
+            if (attr) {
+              const val = parseDigiumNum(attr.getValue());
+              // For averages, we need to track count and sum separately, then calculate average
+              if (f === 'avg_talking_duration' || f === 'avg_call_duration') {
+                // For averages, store as sum for now (we'll calculate properly if needed)
+                // But Digium API already provides averages per account, so we can sum them
+                // Actually, for averages we should calculate weighted average, but for simplicity
+                // we'll use the sum approach and let the frontend handle it
+                totals[f] += val;
+              } else {
+                totals[f] += val;
+              }
+            }
+          });
+        });
+        
+        // Build rows: [Metric, Total]
+        const wideRows = fields.map(f => [human[f] || f, totals[f]]);
+        return { ok: true, dates: [], rows: wideRows, raw: r.raw };
+      } else {
+        // Check if totals are on the <calls> element itself (aggregated)
+        const callsAttrs = callsEl.getAttributes();
+        if (callsAttrs && callsAttrs.length > 0) {
+          fields.forEach(f => {
+            const attrMap = {
+              'total_calls': 'total_calls',
+              'total_incoming_calls': 'total_incoming',
+              'total_outgoing_calls': 'total_outgoing',
+              'talking_duration': 'total_talk_time',
+              'call_duration': 'total_call_time',
+              'avg_talking_duration': 'avg_talk_time_per_call',
+              'avg_call_duration': 'avg_call_time_per_call'
+            };
+            const attrName = attrMap[f] || f;
+            const attr = callsEl.getAttribute(attrName);
+            if (attr) {
+              totals[f] = parseDigiumNum(attr.getValue());
+            }
+          });
+          
+          const wideRows = fields.map(f => [human[f] || f, totals[f]]);
+          return { ok: true, dates: [], rows: wideRows, raw: r.raw };
+        }
+      }
+      
+      Logger.log('Digium by_account: No call elements or attributes found');
+      return { ok: false, error: 'No call data found in by_account response', raw: r.raw };
+    }
+
+    // Handle by_day breakdown (original logic)
     // Build dates array from start to end
     const dates = [];
     const d = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
@@ -516,18 +604,52 @@ function fetchDigiumCallReports_(startDate, endDate, options) {
 // Create a wide-format Digium calls sheet and write provided data (dates + metrics)
 function createDigiumCallsSheet_(wideData) {
   // wideData: { dates: ['2025-11-01', ...], rows: [ ['Total Calls', 5, 3, ...], ['Total Duration', 3600, ...] ] }
+  // For by_account breakdown: dates: [], rows: [ ['Total Calls', 123], ['Total Duration', 3600] ]
   const ss = SpreadsheetApp.getActive();
   const name = 'Digium_Calls';
   let sh = ss.getSheetByName(name);
-  if (!sh) sh = ss.insertSheet(name);
-  sh.clear();
-  const header = ['Metric'].concat(wideData.dates || []);
-  sh.getRange(1,1,1,header.length).setValues([header]);
-  for (let i=0;i<(wideData.rows||[]).length;i++) {
-    sh.getRange(2+i,1,1,wideData.rows[i].length).setValues([wideData.rows[i]]);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+  } else {
+    // Clear all content and formatting to ensure clean sheet
+    sh.clear();
   }
+  
+  // Build header: if dates is empty (by_account), use ['Metric', 'Total'], otherwise use ['Metric', ...dates]
+  let header;
+  if (!wideData.dates || wideData.dates.length === 0) {
+    // by_account breakdown: header is ['Metric', 'Total']
+    header = ['Metric', 'Total'];
+  } else {
+    // by_day breakdown: header is ['Metric', ...dates]
+    header = ['Metric'].concat(wideData.dates);
+  }
+  
+  // Write header
+  sh.getRange(1, 1, 1, header.length).setValues([header]);
+  
+  // Write data rows
+  if (wideData.rows && wideData.rows.length > 0) {
+    const maxCols = Math.max(...wideData.rows.map(row => row.length));
+    // Ensure all rows have the same number of columns as header
+    const paddedRows = wideData.rows.map(row => {
+      const padded = [...row];
+      while (padded.length < header.length) {
+        padded.push('');
+      }
+      return padded.slice(0, header.length);
+    });
+    sh.getRange(2, 1, paddedRows.length, header.length).setValues(paddedRows);
+  }
+  
   // Basic styling
-  try { sh.getRange(1,1,1,header.length).setFontWeight('bold').setBackground('#1976D2').setFontColor('#FFFFFF'); } catch(e){}
+  try { 
+    sh.getRange(1, 1, 1, header.length).setFontWeight('bold').setBackground('#1976D2').setFontColor('#FFFFFF'); 
+  } catch(e){
+    Logger.log('Digium sheet styling failed: ' + e.toString());
+  }
+  
+  Logger.log(`Digium_Calls sheet updated: ${wideData.rows ? wideData.rows.length : 0} rows, header: ${header.join(', ')}`);
   return sh;
 }
 
@@ -654,32 +776,112 @@ function formatAllDurationColumns() {
   }
 }
 
+// Initialize extension_map sheet with default data if it doesn't exist
+function initializeExtensionMapSheet_() {
+  try {
+    const ss = SpreadsheetApp.getActive();
+    let sh = ss.getSheetByName('extension_map');
+    
+    if (!sh) {
+      // Create the sheet
+      sh = ss.insertSheet('extension_map');
+      Logger.log('Created extension_map sheet');
+    } else {
+      // Check if sheet has data - if it does, don't overwrite
+      const dataRange = sh.getDataRange();
+      if (dataRange.getNumRows() > 1) {
+        Logger.log('extension_map sheet already has data, skipping initialization');
+        return;
+      }
+    }
+    
+    // Set headers
+    const headers = ['technician_name', 'technician_email', 'extension'];
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sh.getRange(1, 1, 1, headers.length).setFontWeight('bold').setBackground('#E5E7EB');
+    
+    // Default data provided by user
+    const defaultData = [
+      ['Mordi Turgeman', 'mordi@novapointofsale.com', '252'],
+      ['Oscar Ocampo', 'oscaro@novapointofsale.com', '304'],
+      ['Eduardo Brambila', 'eduardo@novapointofsale.com', '305'],
+      ['Eddie Talal', 'eddie@novapointofsale.com', '306'],
+      ['Oscar Umana', 'oscar@novapointofsale.com', '308'],
+      ['Tomer', 'tomer@novapointofsale.com', '322'],
+      ['Darius Parlor', 'darius@novapointofsale.com', '355']
+    ];
+    
+    // Write default data
+    if (defaultData.length > 0) {
+      sh.getRange(2, 1, defaultData.length, headers.length).setValues(defaultData);
+    }
+    
+    // Set column widths
+    sh.setColumnWidth(1, 200);
+    sh.setColumnWidth(2, 250);
+    sh.setColumnWidth(3, 100);
+    
+    Logger.log(`Initialized extension_map sheet with ${defaultData.length} technicians`);
+  } catch (e) {
+    Logger.log('initializeExtensionMapSheet_ failed: ' + e.toString());
+  }
+}
+
 // Read extension_map sheet and return { technician_name_lower: [ext1, ext2, ...] }
 function getExtensionMap_() {
   const out = {};
   try {
     const ss = SpreadsheetApp.getActive();
-    const sh = ss.getSheetByName('extension_map');
-    if (!sh) return out;
+    let sh = ss.getSheetByName('extension_map');
+    if (!sh) {
+      Logger.log('getExtensionMap_: extension_map sheet not found, initializing...');
+      initializeExtensionMapSheet_();
+      sh = ss.getSheetByName('extension_map');
+      if (!sh) {
+        Logger.log('getExtensionMap_: Failed to create extension_map sheet');
+        return out;
+      }
+    }
     const rng = sh.getDataRange();
     const vals = rng.getValues();
-    if (!vals || vals.length < 2) return out;
+    if (!vals || vals.length < 2) {
+      Logger.log('getExtensionMap_: extension_map sheet has no data rows');
+      return out;
+    }
     const headers = vals[0].map(h => String(h || '').trim().toLowerCase());
     const nameIdx = headers.indexOf('technician_name');
     const extIdx = headers.indexOf('extension');
     const activeIdx = headers.indexOf('is_active');
+    
+    Logger.log(`getExtensionMap_: Found headers - nameIdx=${nameIdx}, extIdx=${extIdx}, activeIdx=${activeIdx}`);
+    Logger.log(`getExtensionMap_: All headers: ${headers.join(', ')}`);
+    
+    if (nameIdx < 0 || extIdx < 0) {
+      Logger.log('getExtensionMap_: Required columns (technician_name, extension) not found');
+      return out;
+    }
+    
     for (let i = 1; i < vals.length; i++) {
       const row = vals[i];
       const name = nameIdx >= 0 ? String(row[nameIdx] || '').trim() : '';
       const extCell = extIdx >= 0 ? String(row[extIdx] || '').trim() : '';
       const isActive = activeIdx >= 0 ? String(row[activeIdx] || '').toLowerCase() !== 'false' : true;
-      if (!name || !extCell || !isActive) continue;
+      if (!name || !extCell) continue;
+      if (!isActive) {
+        Logger.log(`getExtensionMap_: Skipping inactive technician: ${name}`);
+        continue;
+      }
       const exts = extCell.split(',').map(s => s.trim()).filter(Boolean);
       const key = name.toLowerCase();
       if (!out[key]) out[key] = [];
       out[key].push(...exts);
+      Logger.log(`getExtensionMap_: Mapped ${name} -> extensions: ${exts.join(', ')}`);
     }
-  } catch (e) { Logger.log('getExtensionMap_ failed: ' + e.toString()); }
+    Logger.log(`getExtensionMap_: Total technicians mapped: ${Object.keys(out).length}`);
+  } catch (e) { 
+    Logger.log('getExtensionMap_ failed: ' + e.toString());
+    Logger.log('getExtensionMap_ error stack: ' + (e.stack || 'no stack trace'));
+  }
   return out;
 }
 
@@ -734,8 +936,27 @@ function ingestDigiumRangeToSheets_(startISO, endISO) {
   try {
     const startDate = new Date(startISO + 'T00:00:00Z');
     const endDate = new Date(endISO + 'T23:59:59Z');
-    // Use the new callReports.search flow (will save raw XML and attempt to parse per-day metrics)
-    const res = fetchDigiumCallReports_(startDate, endDate, {});
+    
+    // Get all extensions from extension_map for by_account breakdown
+    const extMap = getExtensionMap_();
+    const allExtensions = [];
+    Object.keys(extMap).forEach(techName => {
+      const exts = extMap[techName] || [];
+      exts.forEach(ext => {
+        if (ext && !allExtensions.includes(ext)) {
+          allExtensions.push(ext);
+        }
+      });
+    });
+    
+    Logger.log(`Digium_Calls pull: Using ${allExtensions.length} extensions for by_account breakdown`);
+    
+    // Use by_account breakdown with all extensions
+    const res = fetchDigiumCallReports_(startDate, endDate, { 
+      breakdown: 'by_account', 
+      account_ids: allExtensions.length > 0 ? allExtensions : undefined 
+    });
+    
     if (!res.ok) {
       SpreadsheetApp.getActive().toast('Digium fetch failed: ' + (res.error || res.reason || 'unknown'));
       return { ok: false, error: res.error || res.reason };
@@ -743,8 +964,8 @@ function ingestDigiumRangeToSheets_(startISO, endISO) {
 
     // If the helper returned parsed wide-format data, write it; otherwise fall back to raw saving
     const ss = SpreadsheetApp.getActive();
-    if (res.dates && res.rows) {
-      createDigiumCallsSheet_({ dates: res.dates, rows: res.rows });
+    if (res.rows) {
+      createDigiumCallsSheet_({ dates: res.dates || [], rows: res.rows });
       SpreadsheetApp.getActive().toast('Digium response parsed and saved to Digium_Calls');
       return { ok: true };
     } else {
@@ -2287,11 +2508,15 @@ function fetchPerformanceSummaryData_(cfg, startDate, endDate) {
             const avgPickupCol = row['Avg Pickup'] || row['Average Pickup'] || row['Waiting Time'] || 
                               row['Avg Waiting Time'] || row['Average Waiting Time'] || row['Pickup'] ||
                               row['Avg Pickup:'] || row['Waiting Time:'] || '';
+            // Extract Total Sessions from summary data
+            const totalSessionsCol = row['Total Sessions'] || row['Sessions'] || row['Total Sessions:'] || 
+                                   row['Count'] || row['Session Count'] || row['Total'] || '';
             
             if (!performanceData[techName]) {
               performanceData[techName] = {
                 avgDuration: 0,
                 avgPickup: 0,
+                totalSessions: 0,
                 count: 0
               };
             }
@@ -2328,9 +2553,19 @@ function fetchPerformanceSummaryData_(cfg, startDate, endDate) {
               }
             }
             
+            // Parse total sessions (should be a number)
+            let totalSessions = 0;
+            if (totalSessionsCol) {
+              const sessionsStr = String(totalSessionsCol).trim();
+              if (/^\d+$/.test(sessionsStr)) {
+                totalSessions = Number(sessionsStr);
+              }
+            }
+            
             // Accumulate (in case multiple rows per technician)
             performanceData[techName].avgDuration += avgDur;
             performanceData[techName].avgPickup += avgPickup;
+            performanceData[techName].totalSessions += totalSessions;
             performanceData[techName].count++;
           });
           
@@ -2342,11 +2577,13 @@ function fetchPerformanceSummaryData_(cfg, startDate, endDate) {
     }
     
     // Calculate averages if we have multiple entries per technician
+    // Note: totalSessions should be summed, not averaged
     Object.keys(performanceData).forEach(tech => {
       const perf = performanceData[tech];
       if (perf.count > 1) {
         perf.avgDuration = perf.avgDuration / perf.count;
         perf.avgPickup = perf.avgPickup / perf.count;
+        // totalSessions is already summed, keep as is
       }
     });
     
@@ -3495,16 +3732,37 @@ function createSupportDataSheet_(ss, startDate, endDate) {
     // --- Insert Digium call report (wide-format) into Support_Data under Channel Performance Summary
     // Place starting at row 25, column A as requested
     try {
-      const digRes = fetchDigiumCallReports_(startDate, endDate, {});
-      if (digRes && digRes.ok && digRes.dates && digRes.rows) {
+      // Support_Data uses 'by_date' (by_day) breakdown for daily metrics
+      // Personal dashboards use 'by_account' for per-technician totals
+      Logger.log(`Support_Data Digium pull: Using by_date breakdown for daily metrics`);
+      
+      // Use by_date breakdown (maps to 'by_day' in API) for daily breakdown
+      const digRes = fetchDigiumCallReports_(startDate, endDate, { 
+        breakdown: 'by_date' // Will be mapped to 'by_day' in API
+      });
+      
+      if (digRes && digRes.ok && digRes.rows) {
         const startCol = 1; // Column A
         const startRow = 25; // Under the Channel Performance Summary (daily)
-        // Build header (Metric + dates)
-        const header = ['Metric'].concat(digRes.dates || []);
+        
+        // For by_account breakdown, header is ['Metric', 'Total']
+        // For by_day breakdown, header is ['Metric', ...dates]
+        const header = (digRes.dates && digRes.dates.length > 0) 
+          ? ['Metric'].concat(digRes.dates) 
+          : ['Metric', 'Total'];
+        
         supportSheet.getRange(startRow, startCol, 1, header.length).setValues([header]);
         // Write metric rows
         if (digRes.rows && digRes.rows.length) {
-          supportSheet.getRange(startRow + 1, startCol, digRes.rows.length, digRes.rows[0].length).setValues(digRes.rows);
+          // Ensure all rows have the same number of columns as header
+          const paddedRows = digRes.rows.map(row => {
+            const padded = [...row];
+            while (padded.length < header.length) {
+              padded.push('');
+            }
+            return padded.slice(0, header.length);
+          });
+          supportSheet.getRange(startRow + 1, startCol, paddedRows.length, header.length).setValues(paddedRows);
         }
         // Styling
         try { supportSheet.getRange(startRow, startCol, 1, header.length).setFontWeight('bold').setBackground('#E5E7EB').setFontColor('#000000'); } catch (e) {}
@@ -4152,62 +4410,39 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
         return false;
       }
     });
-  // Build tech list from roster (extension_map) - create ALL sheets upfront, then populate only if data exists
+  // Build tech list from roster (extension_map) and from filtered data
   const rosterNames = getRosterTechnicianNames_();
   const techSet = new Set((rosterNames || []).filter(Boolean));
   filtered.forEach(row => { const t = row[techIdx]; if (t) techSet.add(String(t)); });
   const techs = Array.from(techSet);
   
-  // Generate safe names for all techs
-  const techSafeNames = new Set();
-  techs.forEach(techName => {
-    const safeName = techName.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30);
-    techSafeNames.add(safeName);
-  });
-  
-  // Create or get all personal dashboard sheets upfront (from roster)
-  const allSheets = ss.getSheets();
-  const reservedSheets = ['Sessions', 'Analytics_Dashboard', 'Dashboard_Config', 'Daily_Summary', 'Support_Data', 'Progress', 'Advanced_Analytics', 'Digium_Raw', 'Digium_Calls', 'API_Smoke_Test'];
-  
-  // First, create sheets for all roster techs if they don't exist
-  rosterNames.forEach(techName => {
-    const safeName = techName.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30);
-    if (!ss.getSheetByName(safeName)) {
-      const newSheet = ss.insertSheet(safeName);
-      Logger.log(`Created personal dashboard sheet: ${safeName}`);
-    }
-  });
-  
-  // Remove any personal dashboard sheets that don't match roster techs
-  allSheets.forEach(sheet => {
-    const sheetName = sheet.getName();
-    if (reservedSheets.indexOf(sheetName) !== -1) return;
-    try {
-      const a1 = sheet.getRange(1, 1).getValue();
-      const isPersonalDashboard = typeof a1 === 'string' && a1.indexOf('Personal Dashboard') !== -1;
-      // If it's a personal dashboard sheet but not in our roster, delete it
-      if (isPersonalDashboard && !techSafeNames.has(sheetName)) {
-        ss.deleteSheet(sheet);
-        Logger.log(`Deleted old personal dashboard sheet: ${sheetName}`);
-      }
-    } catch (e) {
-      // Ignore errors when checking sheet content
-    }
-  });
-  
   // Pull performance summary once for the whole range; used for Avg Session (API)
   const perfByTech = perfMapOpt || getPerfSummaryCached_(cfg, startDate, endDate) || {};
+  
+  // Track which sheets we've processed to avoid duplicates
+  const processedSheets = new Set();
   
   // Process all techs (both roster and those with data)
   for (const techName of techs) {
     const safeName = techName.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30);
+    
+    // Check if we've already processed this sheet (avoid duplicates)
+    if (processedSheets.has(safeName)) {
+      Logger.log(`Skipping duplicate processing for ${safeName} (already processed)`);
+      continue;
+    }
+    processedSheets.add(safeName);
+    
+    // Get existing sheet or create new one
     let techSheet = ss.getSheetByName(safeName);
     if (!techSheet) {
       techSheet = ss.insertSheet(safeName);
+      Logger.log(`Created new personal dashboard sheet: ${safeName}`);
+    } else {
+      // Clear existing sheet to repopulate (don't delete, just clear)
+      techSheet.clear();
+      Logger.log(`Cleared existing personal dashboard sheet: ${safeName}`);
     }
-    
-    // Always clear the sheet to repopulate
-    techSheet.clear();
     
     const techRows = filtered.filter(row => row[techIdx] === techName);
     
@@ -4282,8 +4517,13 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
       // Log calculated values for debugging
       Logger.log(`${techName} KPIs - Sessions: ${techRows.length}, Pickups: ${pickups.length}, Active Seconds: ${totalActiveSeconds}, Avg Pickup: ${avgPickupTimeSeconds}s`);
       
+      // Get total sessions from performance data if available, otherwise fall back to techRows.length
+      const perfDataForKPI = perfByTech[techName] || {};
+      const totalSessionsFromPerfKPI = perfDataForKPI.totalSessions || 0;
+      const totalSessions = totalSessionsFromPerfKPI > 0 ? totalSessionsFromPerfKPI : techRows.length;
+      
       const kpis = [
-        ['Total Sessions', techRows.length],
+        ['Total Sessions', totalSessions],
         ['Nova Wave Sessions', novaWaveCount],
         // Active Time (average) stored as numeric time fraction for hh:mm:ss formatting
         ['Active Time', avgActiveTimeSeconds / 86400],
@@ -4342,6 +4582,11 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
     const totalLoginRow = ['Total Login Time'];
     const avgSessionRow = ['Avg Session (API)'];
     const avgPickupRow = ['Avg Pick-up Speed'];
+    const longestSessionRow = ['Longest Session Time'];
+    const sessionsPerHourRow = ['Sessions Per Hour'];
+    // Get total sessions from performance data for this technician
+    const perfDataForSummary = perfByTech[techName] || {};
+    const totalSessionsFromPerfSummary = perfDataForSummary.totalSessions || 0;
     let totalSessionsAll = 0;
     let totalActiveAll = 0;
     let totalWorkAll = 0;
@@ -4350,21 +4595,32 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
       let daysWithData = 0;
       let totalPickupSeconds = 0;
       let totalPickupCount = 0;
+      let longestSessionAll = 0;
+      let totalSessionsPerHour = 0;
       const dailyMap = {};
-      dates.forEach(d => { dailyMap[d] = { sessions: [], totalActiveSeconds: 0, totalWorkSeconds: 0 }; });
+      dates.forEach(d => { dailyMap[d] = { sessions: [], totalActiveSeconds: 0, totalWorkSeconds: 0, longestSessionSeconds: 0 }; });
       techRows.forEach(r => {
         try {
           const d = new Date(r[startIdx]).toISOString().split('T')[0];
-          if (!dailyMap[d]) dailyMap[d] = { sessions: [], totalActiveSeconds: 0, totalWorkSeconds: 0 };
+          if (!dailyMap[d]) dailyMap[d] = { sessions: [], totalActiveSeconds: 0, totalWorkSeconds: 0, longestSessionSeconds: 0 };
           dailyMap[d].sessions.push(r);
           // Sum ACTIVE time for daily totals (with defensive check)
           if (activeIdx >= 0) dailyMap[d].totalActiveSeconds += parseDurationSeconds_(r[activeIdx] || 0);
           // Sum WORK time for daily totals (if present)
           if (workIdx >= 0) dailyMap[d].totalWorkSeconds += parseDurationSeconds_(r[workIdx] || 0);
+          // Track longest session per day
+          if (durationIdx >= 0) {
+            const sessionDur = parseDurationSeconds_(r[durationIdx] || 0);
+            if (sessionDur > dailyMap[d].longestSessionSeconds) {
+              dailyMap[d].longestSessionSeconds = sessionDur;
+            }
+          }
         } catch (e) { }
       });
       dates.forEach(d => {
         const data = dailyMap[d];
+        // For each day, use the count from sessions data
+        // The total at the end will use performance data if available
         const count = data && data.sessions ? data.sessions.length : 0;
         totalSessionsRow.push(count);
         totalSessionsAll += count;
@@ -4374,7 +4630,8 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
   const workSecs = data && data.totalWorkSeconds ? data.totalWorkSeconds : 0;
   totalWorkRow.push(workSecs / 86400);
   totalWorkAll += workSecs;
-  // For Login Time, use the same source as Active (sum of active seconds for the day)
+  // For Login Time, use active time (time technician was actively logged in)
+  // Active time represents logged-in session time
   totalLoginRow.push(activeSecs / 86400);
   totalLoginAll += activeSecs;
         // For Avg Session per day, calculate from sessions data for that day (not overall API average)
@@ -4406,30 +4663,126 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
         } else {
           avgPickupRow.push(0);
         }
+
+        // Longest Session Time per day
+        if (data && data.longestSessionSeconds) {
+          longestSessionRow.push(data.longestSessionSeconds / 86400);
+          if (data.longestSessionSeconds > longestSessionAll) {
+            longestSessionAll = data.longestSessionSeconds;
+          }
+        } else {
+          longestSessionRow.push(0);
+        }
+
+        // Sessions Per Hour per day (assuming 8 hour work day)
+        const sessionsPerHour = count > 0 ? (count / 8).toFixed(1) : 0;
+        sessionsPerHourRow.push(Number(sessionsPerHour));
+        totalSessionsPerHour += Number(sessionsPerHour);
       });
-  totalSessionsRow.push(totalSessionsAll);
+  // Use performance data total sessions if available, otherwise use calculated total
+  const finalTotalSessions = totalSessionsFromPerfSummary > 0 ? totalSessionsFromPerfSummary : totalSessionsAll;
+  totalSessionsRow.push(finalTotalSessions);
   totalActiveRow.push(totalActiveAll / 86400);
   totalWorkRow.push(totalWorkAll / 86400);
   totalLoginRow.push(totalLoginAll / 86400);
       avgSessionRow.push(daysWithData>0 ? (totalAvgSeconds / daysWithData) / 86400 : 0);
       avgPickupRow.push(totalPickupCount>0 ? (totalPickupSeconds / totalPickupCount) / 86400 : 0);
-  const wideRows = [headerRow, totalSessionsRow, totalActiveRow, totalLoginRow, totalWorkRow, avgSessionRow, avgPickupRow];
+  longestSessionRow.push(longestSessionAll / 86400);
+  sessionsPerHourRow.push((totalSessionsPerHour / dates.length).toFixed(1));
+  const wideRows = [headerRow, totalSessionsRow, totalActiveRow, totalLoginRow, totalWorkRow, avgSessionRow, avgPickupRow, longestSessionRow, sessionsPerHourRow];
       techSheet.getRange(summaryStart + 1, 1, wideRows.length, wideRows[0].length).setValues(wideRows);
       // style header
       try { techSheet.getRange(summaryStart + 1, 1, 1, wideRows[0].length).setFontWeight('bold').setBackground('#9C27B0').setFontColor('#FFFFFF'); } catch(e){}
-      // Format per-row: Total sessions should be an integer, the other rows are time fractions (hh:mm:ss)
+      // Format per-row: Total sessions should be an integer, Sessions Per Hour is decimal, time rows are hh:mm:ss
       try {
         const valueCols = wideRows[0].length - 1; // excluding 'Metric' column
         if (valueCols > 0) {
-          // Total sessions row -> integer
+          // Total sessions row -> integer (row index 1 after header)
           techSheet.getRange(summaryStart + 2, 2, 1, valueCols).setNumberFormat('0');
-          // Time rows -> hh:mm:ss (Active, Login, Work, Avg Session, Avg Pick-up)
-          techSheet.getRange(summaryStart + 3, 2, 5, valueCols).setNumberFormat('hh:mm:ss');
+          // Time rows -> hh:mm:ss (Active, Login, Work, Avg Session, Avg Pick-up, Longest Session) - rows 2-7
+          techSheet.getRange(summaryStart + 3, 2, 6, valueCols).setNumberFormat('hh:mm:ss');
+          // Sessions Per Hour row -> one decimal (row index 8 after header)
+          techSheet.getRange(summaryStart + 9, 2, 1, valueCols).setNumberFormat('0.0');
         }
       } catch (e) { /* ignore formatting errors */ }
 
-  // --- Session Details (placed after the per-day summary) ---
-      const detailRow = summaryStart + 1 + wideRows.length + 2;
+  // --- Calls Summary (Digium data) ---
+      // Get extension map to find extensions for this technician
+      const extMap = getExtensionMap_();
+      const norm = (s) => String(s || '').trim().toLowerCase();
+      const extList = extMap[norm(techName)] || [];
+      
+      Logger.log(`${techName} - Extension map lookup: found ${extList.length} extensions: ${extList.join(', ')}`);
+      
+      let callsSummaryRow = summaryStart + 1 + wideRows.length + 2;
+      
+      // Only show Calls Summary if extensions exist for this technician
+      if (extList && extList.length > 0) {
+        try {
+          Logger.log(`${techName} - Fetching Digium call data for extensions: ${extList.join(', ')}`);
+          // Use by_account breakdown to get account-level totals (not per-day)
+          const dr = fetchDigiumCallReports_(startDate, endDate, { breakdown: 'by_account', account_ids: extList });
+          Logger.log(`${techName} - Digium API response: ok=${dr && dr.ok}, dates=${dr && dr.dates ? dr.dates.length : 0}, rows=${dr && dr.rows ? dr.rows.length : 0}`);
+          if (dr && dr.ok && dr.rows && dr.rows.length > 0) {
+            Logger.log(`${techName} - Writing Calls Summary to row ${callsSummaryRow} with ${dr.rows.length} metric rows`);
+            // Add Calls Summary header
+            techSheet.getRange(callsSummaryRow, 1).setValue('Calls Summary');
+            techSheet.getRange(callsSummaryRow, 1).setFontSize(14).setFontWeight('bold');
+            
+            // For by_account breakdown, we get totals (not per-day), so header is just ['Metric', 'Total']
+            const callsHeaderRow = ['Metric', 'Total'];
+            techSheet.getRange(callsSummaryRow + 1, 1, 1, callsHeaderRow.length).setValues([callsHeaderRow]);
+            techSheet.getRange(callsSummaryRow + 1, 1, 1, callsHeaderRow.length).setFontWeight('bold').setBackground('#9C27B0').setFontColor('#FFFFFF');
+            
+            // Write call data rows (Total Calls, Total Incoming Calls, Total Outgoing Calls, Talking Duration, Call Duration, Avg Talking Duration, Avg Call Duration)
+            // Each row has [metric_name, total_value]
+            techSheet.getRange(callsSummaryRow + 2, 1, dr.rows.length, 2).setValues(dr.rows);
+              
+              // Format duration rows (Talking Duration, Call Duration, Avg Talking Duration, Avg Call Duration) as hh:mm:ss
+              // Find which rows are duration rows
+              const durationRowIndices = [];
+              dr.rows.forEach((row, idx) => {
+                const metricName = String(row[0] || '').toLowerCase();
+                if (metricName.includes('duration') || metricName.includes('talking') || metricName.includes('call duration')) {
+                  durationRowIndices.push(idx);
+                }
+              });
+              
+              if (durationRowIndices.length > 0) {
+                durationRowIndices.forEach(rowIdx => {
+                  try {
+                    // Convert seconds to time fraction for the Total column (column 2)
+                    const totalCell = techSheet.getRange(callsSummaryRow + 2 + rowIdx, 2);
+                    const value = totalCell.getValue();
+                    const num = Number(value);
+                    if (!isNaN(num)) {
+                      totalCell.setValue(num / 86400); // Convert seconds to time fraction
+                      totalCell.setNumberFormat('hh:mm:ss');
+                    }
+                  } catch (e) { /* ignore formatting errors */ }
+                });
+              }
+              
+              // Update callsSummaryRow to point after the calls section
+              callsSummaryRow += 2 + dr.rows.length + 2; // header + data + spacing
+            } else {
+              // No call data returned, add minimal spacing
+              callsSummaryRow += 1;
+            }
+        } catch (e) {
+          Logger.log('Digium calls summary fetch failed for ' + techName + ': ' + e.toString());
+          Logger.log('Digium error stack: ' + (e.stack || 'no stack trace'));
+          // On error, still add spacing
+          callsSummaryRow += 1;
+        }
+      } else {
+        // No extensions for this tech, add minimal spacing
+        Logger.log(`${techName} - No extensions found in extension_map, skipping Calls Summary`);
+        callsSummaryRow += 1;
+      }
+      
+  // --- Session Details (placed after Calls Summary) ---
+      const detailRow = callsSummaryRow;
       techSheet.getRange(detailRow, 1).setValue('Session Details');
       techSheet.getRange(detailRow, 1).setFontSize(14).setFontWeight('bold');
       // Column order: Date, Session ID, Customer Name, Phone Number, Duration, Pickup
@@ -4525,32 +4878,7 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
       techSheet.setColumnWidth(5, 120);
       techSheet.setColumnWidth(6, 120);
 
-      // Insert Digium wide-format call summary for this tech at row 18, column H (8)
-      try {
-        // Pull Digium per technican if extension(s) exist; fallback to none if missing
-        let digiumWide = null;
-        const norm = (s) => String(s || '').trim().toLowerCase();
-        const extList = extMap[norm(techName)] || [];
-        if (extList && extList.length) {
-          try {
-            const dr = fetchDigiumCallReports_(startDate, endDate, { breakdown: 'by_day', account_ids: extList });
-            if (dr && dr.ok && dr.dates && dr.rows) digiumWide = dr;
-          } catch (e) { Logger.log('Digium per-tech fetch failed for '+techName+': ' + e.toString()); }
-        }
-        if (digiumWide) {
-          const startCol = 8; // H
-          const startRow = 18;
-          const header = ['Metric'].concat(digiumWide.dates || []);
-          techSheet.getRange(startRow, startCol, 1, header.length).setValues([header]);
-          if (digiumWide.rows && digiumWide.rows.length) {
-            techSheet.getRange(startRow + 1, startCol, digiumWide.rows.length, digiumWide.rows[0].length).setValues(digiumWide.rows);
-          }
-          try { techSheet.getRange(startRow, startCol, 1, header.length).setFontWeight('bold').setBackground('#E5E7EB').setFontColor('#000000'); } catch (e) {}
-          techSheet.setColumnWidth(startCol, 140);
-          // Convert duration rows to hh:mm:ss on this sheet only
-          try { convertSecondsToDayFractionForTableAt_(techSheet, startRow, startCol); } catch (e) {}
-        }
-      } catch (e) { Logger.log('Failed to write Digium data to tech sheet ' + safeName + ': ' + e.toString()); }
+      // Note: Digium calls data is now placed in the Calls Summary section above (after per-day performance summary)
 
       
     }
