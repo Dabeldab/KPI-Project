@@ -52,11 +52,7 @@ function onOpen() {
     .addSeparator()
     .addItem('🚀 Analytics Dashboard', 'createAnalyticsDashboard')
     .addItem('🔄 Refresh Dashboard (Pull from API)', 'refreshDashboardFromAPI')
-    .addItem('🧭 Migrate Sessions Headers (Official)', 'migrateSessionsHeaders')
-  .addItem('🧾 Dump Performance Raw', 'dumpPerformanceRawMenu')
-  .addItem('🗺️ Dump Digium Map (raw)', 'dumpDigiumMapMenu')
-  .addItem('🗺️ Dump Rescue LISTALL (raw)', 'dumpRescueListAllRawMenu')
-  .addItem('⬅️ Shift Rescue_Map data (Session ID → Technician ID)', 'shiftRescueMapDataAlignMenu')
+
     .addSeparator()
     .addSubMenu(
       SpreadsheetApp.getUi().createMenu('SUMMARY Mode')
@@ -938,19 +934,46 @@ function setDelimiter_(base, cookie, delimiter) {
 
 // Per Rescue API docs (see API.asmx?op=setOutput), the allowed HTTP GET endpoint is /API/setOutput.aspx
 // with parameter 'output=XML' or 'output=TEXT'. We use GET with the authenticated session cookie.
+// Response format: "OK" or "OK OUTPUT:XML" or "OK OUTPUT:TEXT"
 function setOutputXMLOrFallback_(base, cookie) {
   if (FORCE_TEXT_OUTPUT) {
     const rt = apiGet_(base, 'setOutput.aspx', { output: 'TEXT' }, cookie, 2, true);
     const tt = (rt.getContentText() || '').trim();
     if (!/^OK/i.test(tt)) throw new Error(`setOutput TEXT failed: ${tt}`);
+    // Verify it was set
+    const verified = getOutput_(base, cookie);
+    if (verified !== 'TEXT') {
+      Logger.log(`Warning: setOutput TEXT returned OK but getOutput returned ${verified}`);
+    }
     return 'TEXT';
   }
   try {
     const rx = apiGet_(base, 'setOutput.aspx', {output: 'XML'}, cookie, 2, true);
     const tx = (rx.getContentText()||'').trim();
-    if (!/^OK/i.test(tx)) throw new Error(tx);
+    if (!/^OK/i.test(tx)) {
+      Logger.log(`setOutput XML failed: ${tx}, falling back to TEXT`);
+      throw new Error(tx);
+    }
+    // Verify XML was actually set using getOutput
+    const verified = getOutput_(base, cookie);
+    if (verified !== 'XML') {
+      Logger.log(`Warning: setOutput XML returned OK but getOutput returned ${verified}, retrying...`);
+      // Retry once
+      const rx2 = apiGet_(base, 'setOutput.aspx', {output: 'XML'}, cookie, 2, true);
+      const tx2 = (rx2.getContentText()||'').trim();
+      if (!/^OK/i.test(tx2)) throw new Error(`setOutput XML retry failed: ${tx2}`);
+      const verified2 = getOutput_(base, cookie);
+      if (verified2 !== 'XML') {
+        Logger.log(`setOutput XML still not verified after retry (got ${verified2}), falling back to TEXT`);
+        throw new Error(`XML output not verified: ${verified2}`);
+      }
+      Logger.log('XML output verified after retry');
+      return 'XML';
+    }
+    Logger.log('XML output verified');
     return 'XML';
   } catch (e) {
+    Logger.log(`setOutput XML failed: ${e.toString()}, falling back to TEXT`);
     const rt = apiGet_(base, 'setOutput.aspx', {output: 'TEXT'}, cookie, 2, true);
     const tt = (rt.getContentText()||'').trim();
     if (!/^OK/i.test(tt)) throw new Error(`setOutput fallback TEXT failed: ${tt}`);
@@ -960,11 +983,21 @@ function setOutputXMLOrFallback_(base, cookie) {
 
 function getReportTry_(base, cookie, nodeId, noderef) {
   try {
-    const r = apiGet_(base, 'getReport.aspx', { node: String(nodeId), noderef: noderef }, cookie, 4, true);
+    const r = apiGet_(base, 'getReport.aspx', { 
+      node: String(nodeId), 
+      noderef: noderef
+    }, cookie, 4, true);
     const t = (r.getContentText()||'').trim();
     // Accept both TEXT (starts with OK) and XML (starts with '<') responses
-    if (/^OK/i.test(t)) return t;
-    if (t && t[0] === '<') return t;
+    if (/^OK/i.test(t)) {
+      Logger.log(`getReportTry_ node ${nodeId} (${noderef}): TEXT format response (${t.length} chars)`);
+      return t;
+    }
+    if (t && t[0] === '<') {
+      Logger.log(`getReportTry_ node ${nodeId} (${noderef}): XML format response (${t.length} chars)`);
+      return t;
+    }
+    Logger.log(`getReportTry_ node ${nodeId} (${noderef}): Unexpected response format (first 100 chars: ${t.substring(0, 100)})`);
     return null;
   } catch (e) {
     Logger.log(`getReportTry_ failed for node ${nodeId} (${noderef}): ${e.toString()}`);
@@ -981,18 +1014,28 @@ function parsePipe_(okBody, delimiter) {
   const body = raw.replace(/^OK\s*/i, '').trim();
   if (!body) return { headers: [], rows: [] };
   if (body[0] === '<') return parseRescueXmlBody_(body);
+  
+  // Optimize TEXT parsing for large responses
   const lines = body.split(/\r?\n/).filter(Boolean);
   if (!lines.length) return { headers: [], rows: [] };
   const delim = String(delimiter || '|');
-  const header = lines[0].split(delim).map(h => h.trim());
+  const header = lines[0].split(delim); // No trim - preserve raw header names from API
   if (!header.length) return { headers: [], rows: [] };
+  
+  // Limit processing to prevent timeout on extremely large datasets
+  const maxRows = 10000; // Process max 10k rows to prevent timeout
+  const rowsToProcess = Math.min(lines.length - 1, maxRows);
+  if (lines.length - 1 > maxRows) {
+    Logger.log(`Warning: Response has ${lines.length - 1} rows, processing first ${maxRows} to prevent timeout`);
+  }
+  
   const out = [];
-  for (let i=1; i<lines.length; i++) {
+  for (let i=1; i<=rowsToProcess; i++) {
     const cols = lines[i].split(delim);
     while (cols.length < header.length) cols.push('');
     const obj = {};
     for (let j=0; j<header.length; j++) {
-      obj[header[j]] = (cols[j] || '').trim();
+      obj[header[j]] = cols[j] || ''; // No trim - preserve raw values from API
     }
     out.push(obj);
   }
@@ -1055,15 +1098,31 @@ function parseRescueXmlBody_(xmlText) {
 }
 
 // Get current output format from Rescue ('XML' or 'TEXT')
+// Per API docs: https://secure.logmeinrescue.com/welcome/webhelp/en/rescueapi/API/API_Rescue_getOutput.html
+// Response formats: "OK OUTPUT:XML" or "OK OUTPUT:TEXT" or XML response
 function getOutput_(base, cookie) {
   try {
     // Per Rescue API docs, allowed HTTP GET endpoint is /API/getOutput.aspx
     const r = apiGet_(base, 'getOutput.aspx', {}, cookie, 2, true);
     const t = (r.getContentText()||'').trim();
-    // Accept common plain text formats
-    let m = t.match(/OUTPUT\s*:\s*(XML|TEXT)/i) || t.match(/OK\s+(XML|TEXT)/i);
-    if (m) return m[1].toUpperCase();
-    // Some environments may return minimal XML; try to parse
+    
+    // Response format 1: "OK OUTPUT:XML" or "OK OUTPUT:TEXT"
+    let m = t.match(/OUTPUT\s*:\s*(XML|TEXT)/i);
+    if (m) {
+      const fmt = m[1].toUpperCase();
+      Logger.log(`getOutput returned: ${fmt}`);
+      return fmt;
+    }
+    
+    // Response format 2: "OK XML" or "OK TEXT"
+    m = t.match(/^OK\s+(XML|TEXT)/i);
+    if (m) {
+      const fmt = m[1].toUpperCase();
+      Logger.log(`getOutput returned (format 2): ${fmt}`);
+      return fmt;
+    }
+    
+    // Response format 3: XML response (parse XML structure)
     if (t && t[0] === '<') {
       try {
         const doc = XmlService.parse(t);
@@ -1072,16 +1131,29 @@ function getOutput_(base, cookie) {
         const stack = [root];
         while (stack.length) {
           const el = stack.pop();
-          if (String(el.getName()||'').toLowerCase() === 'output') {
-            const val = (el.getText ? el.getText() : '') || (el.getAttribute && el.getAttribute('value') ? el.getAttribute('value').getValue() : '');
-            if (/^xml$/i.test(val)) return 'XML';
-            if (/^text$/i.test(val)) return 'TEXT';
+          const name = String(el.getName()||'').toLowerCase();
+          if (name === 'output' || name === 'setoutputresult') {
+            const val = (el.getText ? el.getText() : '') || 
+                       (el.getAttribute && el.getAttribute('value') ? el.getAttribute('value').getValue() : '') ||
+                       (el.getAttribute && el.getAttribute('output') ? el.getAttribute('output').getValue() : '');
+            if (/^xml$/i.test(val)) {
+              Logger.log('getOutput returned XML (from XML response)');
+              return 'XML';
+            }
+            if (/^text$/i.test(val)) {
+              Logger.log('getOutput returned TEXT (from XML response)');
+              return 'TEXT';
+            }
           }
           const kids = el.getChildren();
           for (let i=0;i<kids.length;i++) stack.push(kids[i]);
         }
-      } catch (e) { /* ignore XML parse failure */ }
+      } catch (e) { 
+        Logger.log('getOutput XML parse failed: ' + e.toString());
+      }
     }
+    
+    Logger.log(`getOutput unexpected format: ${t.substring(0, 100)}`);
     return null;
   } catch (e) {
     Logger.log('getOutput_ error: ' + e.toString());
@@ -1105,7 +1177,13 @@ function logUnmappedHeader_(header, sample) {
       sh.setColumnWidth(5, 80);
     }
     const headerLower = String(header || '').toLowerCase();
-    const dataRange = sh.getRange(2,1,Math.max(0, sh.getLastRow()-1),1);
+    const lastRow = sh.getLastRow();
+    if (lastRow <= 1) {
+      // Sheet only has header, no data rows yet
+      sh.appendRow([String(header || ''), String(sample || ''), new Date().toISOString(), new Date().toISOString(), 1]);
+      return;
+    }
+    const dataRange = sh.getRange(2, 1, lastRow - 1, 1);
     const existing = dataRange.getValues().map(r => String(r[0] || '').toLowerCase());
     const foundIdx = existing.indexOf(headerLower);
     const now = new Date().toISOString();
@@ -1293,168 +1371,49 @@ function parseDurationSeconds_(val) {
 
 /* ===== Sheets Storage ===== */
 function getOrCreateSessionsSheet_(ss) {
+  // Just get or create the sheet - don't touch headers, order, or formatting
+  // Headers will be set by writeRowsToSheets_ from actual API response
   let sh = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
   if (!sh) {
     sh = ss.insertSheet(SHEETS_SESSIONS_TABLE);
+    Logger.log('Created Sessions sheet (headers will be set from API data)');
   }
-  
-  // Use the exact column titles from LogMeIn Rescue API (Report Area: Session, Type: LISTALL)
-  // This ensures we store raw data exactly as returned to avoid mixed-column issues.
-  const headers = [
-    'Start Time','End Time','Last Action Time',
-    'Technician Name','Technician ID','Technician Email','Technician Group',
-    'Session ID','Session Type','Status',
-    'Your Name:','Your Phone #:','Company name:','Location Name:',
-    'Custom field 4','Custom field 5','Tracking ID','Customer IP','Device ID','Incident Tools Used',
-    'Resolved Unresolved','Channel ID','Channel Name','Calling Card',
-    'Connecting Time','Waiting Time','Total Time','Active Time','Work Time','Hold Time','Time in Transfer','Rebooting Time','Reconnecting Time',
-    'Platform','Browser Type','Host Name',
-    // Additional internal field for ingestion timestamp
-    'ingested_at'
-  ];
-  
-  // Check if header row exists and is correct
-  const headerRange = sh.getRange(1, 1, 1, headers.length);
-  const existingHeaders = headerRange.getValues()[0];
-  const needsHeaderUpdate = !existingHeaders || existingHeaders.length !== headers.length || 
-                           !existingHeaders[0] || existingHeaders[0] !== 'Start Time';
-  
-  if (needsHeaderUpdate) {
-    // Clear and set headers with improved styling
-    headerRange.clear();
-    headerRange.setValues([headers]);
-    headerRange.setFontWeight('bold')
-      .setBackground('#07123B')
-      .setFontColor('#FFFFFF')
-      .setHorizontalAlignment('left')
-      .setVerticalAlignment('middle');
-    sh.setFrozenRows(1);
-    Logger.log('Updated Sessions sheet headers');
-  }
-  
-  // Set column widths for better readability
-  // Set key column widths for readability
-  sh.setColumnWidth(1, 160);  // Start Time
-  sh.setColumnWidth(2, 160);  // End Time
-  sh.setColumnWidth(3, 160);  // Last Action Time
-  sh.setColumnWidth(4, 180);  // Technician Name
-  sh.setColumnWidth(6, 200);  // Technician Email
-  sh.setColumnWidth(9, 160);  // Session Type
-  sh.setColumnWidth(11, 160); // Your Phone #:
-  sh.setColumnWidth(13, 180); // Company name:
-  sh.setColumnWidth(23, 160); // Channel Name
-  sh.setColumnWidth(headers.length, 180); // ingested_at
-  
-  // Apply consistent styling
-  try { applyProfessionalTableStyling_(sh, headers.length); } catch (e) { Logger.log('Styling sessions sheet failed: ' + e.toString()); }
-
-  // No duplicate columns in the official header set
-
   return sh;
 }
 
-// Migrate existing Sessions sheet to official LISTALL headers with correct column mapping.
-// Keeps raw values; attempts to map from prior normalized headers and synonyms.
-function migrateSessionsSheetToOfficial_() {
-  const ss = SpreadsheetApp.getActive();
-  const sh = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
-  if (!sh) { SpreadsheetApp.getActive().toast('Sessions sheet not found'); return false; }
-
-  // Official header order (same as getOrCreateSessionsSheet_)
-  const official = [
-    'Start Time','End Time','Last Action Time','Technician Name','Technician ID','Technician Email','Technician Group',
-    'Session ID','Session Type','Status','Your Name:','Your Phone #:','Company name:','Location Name:',
-    'Custom field 4','Custom field 5','Tracking ID','Customer IP','Device ID','Incident Tools Used',
-    'Resolved Unresolved','Channel ID','Channel Name','Calling Card',
-    'Connecting Time','Waiting Time','Total Time','Active Time','Work Time','Hold Time','Time in Transfer','Rebooting Time','Reconnecting Time',
-    'Platform','Browser Type','Host Name','ingested_at'
-  ];
-
-  // Build alias -> canonical map (canonical is close to snake_case keys)
-  const A = (k)=>k.toLowerCase().trim();
-  const alias = new Map([
-    ['Start Time',['Start Time','start_time']],
-    ['End Time',['End Time','end_time']],
-    ['Last Action Time',['Last Action Time','last_action_time']],
-    ['Technician Name',['Technician Name','technician_name','Technician']],
-    ['Technician ID',['Technician ID','technician_id']],
-    ['Technician Email',['Technician Email','technician_email']],
-    ['Technician Group',['Technician Group','technician_group','group_name']],
-    ['Session ID',['Session ID','session_id']],
-    ['Session Type',['Session Type','session_type']],
-    ['Status',['Status','session_status']],
-    ['Your Name:',['Your Name:','Your Name','Customer Name','customer_name']],
-    ['Your Phone #:',['Your Phone #:','Phone','Phone Number','Caller Phone','caller_phone','customer_phone']],
-    ['Company name:',['Company name:','Company Name','Company','company_name']],
-    ['Location Name:',['Location Name:','Location Name','location_name']],
-    ['Custom field 4',['Custom field 4','Custom Field 4','custom_field_4']],
-    ['Custom field 5',['Custom field 5','Custom Field 5','custom_field_5']],
-    ['Tracking ID',['Tracking ID','tracking_id']],
-    ['Customer IP',['Customer IP','IP Address','ip_address']],
-    ['Device ID',['Device ID','device_id']],
-    ['Incident Tools Used',['Incident Tools Used','incident_tools_used']],
-    ['Resolved Unresolved',['Resolved Unresolved','resolved_unresolved']],
-    ['Channel ID',['Channel ID','channel_id']],
-    ['Channel Name',['Channel Name','channel_name']],
-    ['Calling Card',['Calling Card','calling_card']],
-    ['Connecting Time',['Connecting Time','connecting_time']],
-    ['Waiting Time',['Waiting Time','waiting_time','pickup_seconds']],
-    ['Total Time',['Total Time','total_time','duration_total_seconds']],
-    ['Active Time',['Active Time','active_time','duration_active_seconds']],
-    ['Work Time',['Work Time','work_time','duration_work_seconds']],
-    ['Hold Time',['Hold Time','hold_time']],
-    ['Time in Transfer',['Time in Transfer','time_in_transfer']],
-    ['Rebooting Time',['Rebooting Time','rebooting_time']],
-    ['Reconnecting Time',['Reconnecting Time','reconnecting_time']],
-    ['Platform',['Platform','platform']],
-    ['Browser Type',['Browser Type','browser_type','browser']],
-    ['Host Name',['Host Name','host','host_name']],
-    ['ingested_at',['ingested_at','Ingested At']]
-  ]);
-
-  // Current header row
-  const lastCol = sh.getLastColumn();
-  const lastRow = sh.getLastRow();
-  if (lastCol === 0 || lastRow < 1) { SpreadsheetApp.getActive().toast('Sessions sheet empty'); return false; }
-  const currentHeaders = sh.getRange(1,1,1,lastCol).getValues()[0];
-  const currentMap = new Map();
-  currentHeaders.forEach((h, i) => { if (h != null && String(h).trim()) currentMap.set(A(String(h)), i); });
-
-  // Resolve mapping: for each official header, find source column index
-  const resolveIndex = (header) => {
-    const alts = alias.get(header) || [header];
-    for (const alt of alts) {
-      const idx = currentMap.get(A(alt));
-      if (typeof idx === 'number') return idx;
+// Helper: Get column letter(s) by header name in Sessions sheet (for formulas)
+function getSessionsColumnByHeader_(headerVariants) {
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const sessionsSheet = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
+    if (!sessionsSheet) return 'A'; // Fallback
+    
+    const headers = sessionsSheet.getRange(1, 1, 1, sessionsSheet.getLastColumn()).getValues()[0];
+    for (const variant of headerVariants) {
+      const idx = headers.findIndex(h => String(h || '').toLowerCase().trim() === String(variant).toLowerCase().trim());
+      if (idx >= 0) {
+        // Convert 0-based index to column letter (A=1, B=2, etc.)
+        const colNum = idx + 1;
+        let colLetter = '';
+        let temp = colNum;
+        while (temp > 0) {
+          const remainder = (temp - 1) % 26;
+          colLetter = String.fromCharCode(65 + remainder) + colLetter;
+          temp = Math.floor((temp - 1) / 26);
+        }
+        return colLetter;
+      }
     }
-    return -1;
-  };
-
-  // Read all data rows
-  const dataRows = lastRow > 1 ? sh.getRange(2,1,lastRow-1,lastCol).getValues() : [];
-
-  // Build new table with official headers
-  const newHeaders = official.slice();
-  const newValues = dataRows.map(row => {
-    return newHeaders.map(h => {
-      const srcIdx = resolveIndex(h);
-      return (srcIdx >= 0 && srcIdx < row.length) ? row[srcIdx] : '';
-    });
-  });
-
-  // Replace sheet contents
-  sh.clear();
-  sh.getRange(1,1,1,newHeaders.length).setValues([newHeaders]);
-  if (newValues.length) sh.getRange(2,1,newValues.length,newHeaders.length).setValues(newValues);
-  try { applyProfessionalTableStyling_(sh, newHeaders.length); } catch (e) {}
-  SpreadsheetApp.getActive().toast(`Sessions migrated to official headers (${newHeaders.length} columns)`);
-  return true;
+    return 'A'; // Fallback to column A if header not found
+  } catch (e) {
+    Logger.log('getSessionsColumnByHeader_ error: ' + e.toString());
+    return 'A';
+  }
 }
 
-// Public wrapper for menu/run list
-function migrateSessionsHeaders() {
-  try { migrateSessionsSheetToOfficial_(); } catch (e) { SpreadsheetApp.getActive().toast('Migration failed: ' + e.toString()); }
-}
+
+
+
 
 // Apply consistent, professional styling to a sheet's table area.
 // headerCols: number of header columns (optional). If omitted, uses sheet.getLastColumn().
@@ -1505,16 +1464,14 @@ function applyProfessionalTableStyling_(sheet, headerCols) {
   }
 }
 
-function writeRowsToSheets_(ss, rows, clearExisting = false) {
-  if (!rows || !rows.length) return 0;
+function writeRowsToSheets_(ss, rawDataChunks, clearExisting = false) {
+  if (!rawDataChunks || !rawDataChunks.length) return 0;
   const sh = getOrCreateSessionsSheet_(ss);
   
-  // Clear existing data if requested (for range-specific pulls)
-  // IMPORTANT: Keep header row (row 1) intact
+  // Clear existing data if requested
   if (clearExisting) {
     const dataRange = sh.getDataRange();
     if (dataRange.getNumRows() > 1) {
-      // Clear contents of all data rows (keep header and sheet structure)
       const numRows = dataRange.getNumRows() - 1;
       const numCols = dataRange.getNumColumns();
       sh.getRange(2, 1, numRows, numCols).clearContent();
@@ -1522,132 +1479,106 @@ function writeRowsToSheets_(ss, rows, clearExisting = false) {
     }
   }
   
-  const existingIds = new Set();
-  const dataRange = sh.getDataRange();
-  if (dataRange.getNumRows() > 1) {
-    // Find the 'Session ID' column in the Sessions table header for proper de-duplication
-    const headerVals = sh.getRange(1, 1, 1, dataRange.getNumColumns()).getValues()[0];
-    let idColIdx = headerVals.findIndex(h => String(h || '').toLowerCase().trim() === 'session id');
-    if (idColIdx < 0) idColIdx = headerVals.findIndex(h => /session\s*id/i.test(String(h || '')));
-    if (idColIdx < 0) idColIdx = 7; // Fallback to 0-based index 7 (8th col) per official header order
-    const existing = sh.getRange(2, idColIdx + 1, dataRange.getNumRows() - 1, 1).getValues();
-    existing.forEach(r => { const v = r[0]; if (v != null && String(v).trim() !== '') existingIds.add(String(v)); });
+  // Use first chunk's headers as master order (preserves API header order)
+  // Then collect any additional headers from other chunks that might not be in first chunk
+  let allHeaders = [];
+  const allHeadersSet = new Set();
+  
+  // Get headers from first chunk to preserve API order
+  if (rawDataChunks[0] && rawDataChunks[0].headers && Array.isArray(rawDataChunks[0].headers)) {
+    allHeaders = rawDataChunks[0].headers; // Use exact order from API
+    rawDataChunks[0].headers.forEach(h => allHeadersSet.add(h));
   }
-  // Filter by session_id
-  const toInsert = rows.filter(r => r && r.session_id && !existingIds.has(String(r.session_id)));
-  if (!toInsert.length) return 0;
-
-  // Heuristic normalization to fix common header/value shifts seen in some API responses.
-  // If the API returns different header labels the parsed fields can shift; apply
-  // content-based fixes so columns like caller_name / caller_phone / company_name
-  // contain sensible values.
-  const isPhone = (s) => { if (!s) return false; const t = String(s).replace(/[^0-9]/g,''); return t.length >= 6; };
-  const isName = (s) => { if (!s) return false; const t = String(s).trim(); if (t.length < 2) return false; if (/\d/.test(t)) return false; if (/\b(rc|sp|ps)\b/i.test(t)) return false; return /^[A-Za-z .,'-]+$/.test(t); };
-  const isStatus = (s) => { if (!s) return false; return /closed|waiting|active|connected|resolved|unresolved|connecting|in session|closed by/i.test(String(s)); };
-
-  toInsert.forEach(r => {
-    try {
-      // Pattern observed: company_name contains phone, caller_name contains status text,
-      // caller_phone contains the actual caller name. Shift into correct fields.
-      if (isStatus(r.caller_name) && isPhone(r.company_name) && isName(r.caller_phone)) {
-        // Move status into session_status
-        r.session_status = r.caller_name;
-        // Move caller name from caller_phone into caller_name
-        r.caller_name = r.caller_phone;
-        // Move phone from company_name into caller_phone
-        r.caller_phone = r.company_name;
-        // Clear company_name (unknown)
-        r.company_name = '';
-      }
-
-      // If company_name looks like a phone but caller_phone is empty, move it
-      if (!r.caller_phone && isPhone(r.company_name)) {
-        r.caller_phone = r.company_name;
-        r.company_name = '';
-      }
-
-      // If caller_phone appears numeric and company_name looks like a name, swap
-      if (isPhone(r.caller_phone) && isName(r.company_name)) {
-        const tmp = r.caller_phone;
-        r.caller_phone = tmp;
-        // company_name likely already correct; leave as-is
-      }
-    } catch (e) { /* ignore per-row normalization errors */ }
+  
+  // Collect any additional headers from other chunks (append to end)
+  rawDataChunks.slice(1).forEach(chunk => {
+    if (chunk.headers && Array.isArray(chunk.headers)) {
+      chunk.headers.forEach(h => {
+        if (!allHeadersSet.has(h)) {
+          allHeaders.push(h); // Append new headers to end
+          allHeadersSet.add(h);
+        }
+      });
+    }
   });
-
-  // Additional normalization: some API rows arrive shifted so session_id contains a timestamp
-  // Detect session_id values that look like dates/times and shift them into start_time
-  const looksLikeDateTime = (s) => {
-    if (!s) return false;
-    const t = String(s).trim();
-    // common patterns: MM/DD/YYYY or YYYY-MM-DD or include ':' for time
-    if (/\d{1,2}\/\d{1,2}\/\d{2,4}/.test(t)) return true;
-    if (/\d{4}-\d{2}-\d{2}/.test(t)) return true;
-    if (/\d{1,2}:\d{2}:\d{2}/.test(t)) return true;
-    return false;
-  };
-  toInsert.forEach(r => {
-    try {
-      if (looksLikeDateTime(r.session_id) && !r.start_time) {
-        // move timestamp into start_time and attempt to get a better session id
-        const ts = r.session_id;
-        r.start_time = ts;
-        // prefer tracking_id as fallback session id
-        if (r.tracking_id && String(r.tracking_id).length) {
-          r.session_id = String(r.tracking_id);
-        } else {
-          r.session_id = '';
+  
+  if (!allHeaders.length) {
+    Logger.log('No headers found in raw data chunks');
+    return 0;
+  }
+  
+  // Identify which column header contains "Nova Point of Sale" values (company name)
+  // We'll keep the header but replace "Nova Point of Sale" values with empty strings
+  let headerWithCompanyName = null;
+  for (const chunk of rawDataChunks) {
+    if (chunk.rows && Array.isArray(chunk.rows) && chunk.rows.length > 0) {
+      // Check first row to find which column has "Nova Point of Sale"
+      const firstRow = chunk.rows[0];
+      for (const header of allHeaders) {
+        const value = String(firstRow[header] || '').trim();
+        if (value && value.toLowerCase().includes('nova point of sale')) {
+          headerWithCompanyName = header;
+          break;
         }
       }
-    } catch(e) {}
-  });
-  
-  // Convert ISO timestamp strings to Date objects for proper timezone handling
-  const toDate = (isoStr) => {
-    if (!isoStr) return null;
-    try {
-      return new Date(isoStr);
-    } catch (e) {
-      return null;
+      if (headerWithCompanyName) break;
     }
-  };
-  
-  // Map data to the official LISTALL column order defined in getOrCreateSessionsSheet_ headers
-  const values = toInsert.map(r => [
-    // Start/End/Last Action Time (keep raw API strings when STORE_RAW_SESSIONS is true)
-    (STORE_RAW_SESSIONS ? (r.start_time || '') : toDate(r.start_time)),
-    (STORE_RAW_SESSIONS ? (r.end_time || '') : toDate(r.end_time)),
-    (STORE_RAW_SESSIONS ? (r.last_action_time || '') : toDate(r.last_action_time)),
-    // Technician details
-    r.technician_name, r.technician_id, r.technician_email, r.technician_group,
-    // Session IDs and status
-    r.session_id, r.session_type, r.session_status,
-    // Customer fields
-    (r.customer_name || r.caller_name), r.caller_phone, r.company_name, r.location_name || '',
-    // Custom fields
-    r.custom_field_4 || '', r.custom_field_5 || '', r.tracking_id, r.ip_address, r.device_id, r.incident_tools_used || '',
-    // Resolution / Channel / Calling Card
-    r.resolved_unresolved, r.channel_id, r.channel_name, r.calling_card,
-    // Timings (keep original seconds or hh:mm:ss as stored by mapRow_)
-    r.connecting_time, r.waiting_time, r.total_time, r.active_time, r.work_time, r.hold_time, r.time_in_transfer, r.rebooting_time, r.reconnecting_time,
-    // Platform / Browser / Host
-    r.platform, r.browser_type || r.browser, r.host,
-    // Ingested timestamp
-    (STORE_RAW_SESSIONS ? (r.ingested_at || '') : toDate(r.ingested_at))
-  ]);
-  
-  const newRowStart = sh.getLastRow() + 1;
-  // Per your direction: keep raw values for timings (seconds or HH:MM:SS). Do not auto-convert to day-fractions here.
-  sh.getRange(newRowStart, 1, values.length, values[0].length).setValues(values);
-  
-  // Optional: if not storing raw, apply date formats to the first three columns and ingested_at
-  const dateFormat = 'mm/dd/yyyy hh:mm:ss AM/PM';
-  if (!STORE_RAW_SESSIONS && values.length > 0) {
-    sh.getRange(newRowStart, 1, values.length, 3).setNumberFormat(dateFormat); // Start/End/Last Action
-    sh.getRange(newRowStart, headers.length, values.length, 1).setNumberFormat(dateFormat); // ingested_at
   }
   
-  return toInsert.length;
+  if (headerWithCompanyName) {
+    Logger.log(`Found column "${headerWithCompanyName}" containing company name - will replace "Nova Point of Sale" with empty values`);
+  }
+  
+  if (!allHeaders.length) {
+    Logger.log('No headers found in raw data chunks');
+    return 0;
+  }
+  
+  // Write headers if sheet is empty (no headers exist yet)
+  const hasData = sh.getLastRow() > 0;
+  if (!hasData) {
+    sh.getRange(1, 1, 1, allHeaders.length).setValues([allHeaders]);
+    Logger.log(`Wrote headers from API (${allHeaders.length} columns) in API order`);
+  }
+  
+  // Flatten all rows from all chunks - preserve original types (numbers, strings, nulls)
+  // Replace "Nova Point of Sale" values with empty string in the identified column
+  // NO DEDUPLICATION - write all rows as-is from API
+  const allRows = [];
+  
+  rawDataChunks.forEach(chunk => {
+    if (chunk.rows && Array.isArray(chunk.rows)) {
+      chunk.rows.forEach(row => {
+        // Create row array matching header order
+        const rowArray = allHeaders.map(header => {
+          let value = row[header];
+          // If this is the column with company name and value is "Nova Point of Sale", replace with empty string
+          if (headerWithCompanyName && header === headerWithCompanyName) {
+            const valueStr = String(value || '').trim();
+            if (valueStr.toLowerCase().includes('nova point of sale')) {
+              value = '';
+            }
+          }
+          // Return value as-is: numbers stay numbers, strings stay strings, null stays null
+          return value;
+        });
+        
+        // Add all rows - no deduplication
+        allRows.push(rowArray);
+      });
+    }
+  });
+  
+  if (!allRows.length) {
+    Logger.log('No rows to write after flattening chunks');
+    return 0;
+  }
+  
+  const newRowStart = sh.getLastRow() + 1;
+  sh.getRange(newRowStart, 1, allRows.length, allHeaders.length).setValues(allRows);
+  Logger.log(`Wrote ${allRows.length} rows to Sessions sheet with ${allHeaders.length} columns (no deduplication)`);
+  
+  return allRows.length;
 }
 
 /* ===== Ingestion Functions ===== */
@@ -1821,7 +1752,14 @@ function ingestTimeRangeToSheets_(startTimestamp, endTimestamp, cfg, clearExisti
     } catch (e) {
       Logger.log('getReportType check failed (non-fatal): ' + e.toString());
     }
-    setOutputXMLOrFallback_(cfg.rescueBase, cookie);
+    // Use TEXT output format (XML not working reliably)
+    try {
+      const rt = apiGet_(cfg.rescueBase, 'setOutput.aspx', { output: 'TEXT' }, cookie, 2, true);
+      const tt = (rt.getContentText() || '').trim();
+      if (!/^OK/i.test(tt)) Logger.log(`setOutput TEXT warning: ${tt}`);
+    } catch (e) {
+      Logger.log('setOutput TEXT failed (non-fatal): ' + e.toString());
+    }
     setDelimiter_(cfg.rescueBase, cookie, '|');
     // Extract date strings (YYYY-MM-DD) for API date setting
     const startDateIso = startTimestamp.split('T')[0];
@@ -1854,35 +1792,50 @@ function ingestTimeRangeToSheets_(startTimestamp, endTimestamp, cfg, clearExisti
       Logger.log('getReportType pre-query check failed (non-fatal): ' + e.toString());
     }
     let allMappedRows = [];
+    const startTime = new Date().getTime();
+    const maxProcessingTime = 240000; // 4 minutes max processing time
     for (const nr of noderefs) {
       for (const node of nodes) {
+        // Check if we're approaching timeout
+        const elapsed = new Date().getTime() - startTime;
+        if (elapsed > maxProcessingTime) {
+          Logger.log(`Processing timeout protection: ${elapsed}ms elapsed, stopping to prevent script timeout`);
+          break;
+        }
         try {
+          Logger.log(`Processing node ${node} (${nr})...`);
+          // Add delay before each request to prevent rate limiting
+          Utilities.sleep(500);
           const t = getReportTry_(cfg.rescueBase, cookie, node, nr);
           if (!t) continue;
+          const parseStart = new Date().getTime();
           const parseResult = parsePipe_(t, '|');
+          Logger.log(`Parsed ${parseResult.rows.length} rows in ${new Date().getTime() - parseStart}ms`);
           const parsed = parseResult.rows || [];
           if (!parsed || !parsed.length) continue;
-          // Extract date strings (YYYY-MM-DD) from timestamps for comparison
-          // startTimestamp format: YYYY-MM-DDTHH:MM:SS.sssZ
-          const startDateStr = startTimestamp.split('T')[0];
-          const endDateStr = endTimestamp.split('T')[0];
           
-          Logger.log(`Filtering sessions: date range=${startDateStr} to ${endDateStr} (strict: only dates within this range)`);
-          
-          // Trust the API date/time scope (we set date+time range above) to avoid timezone edge cases
-          const mapped = parsed.map(mapRow_).filter(r => r && r.session_id);
-          
-          Logger.log(`After filtering: ${mapped.length} sessions match date range ${startDateStr} to ${endDateStr} (from ${parsed.length} total parsed rows)`);
-          if (!mapped.length) {
-            Logger.log(`No sessions found in date range ${startDateStr} to ${endDateStr} for node ${node} (${nr})`);
-            continue;
+          // Debug: log first row keys to see what headers we're getting
+          if (parsed.length > 0) {
+            const firstRow = parsed[0];
+            const firstRowKeys = Object.keys(firstRow).slice(0, 10);
+            Logger.log(`Sample row keys: ${firstRowKeys.join(', ')}`);
           }
-          allMappedRows.push(...mapped);
-          Utilities.sleep(200);
+          
+          // Store raw parsed data with headers for direct dump
+          allMappedRows.push({
+            headers: parseResult.headers || [],
+            rows: parsed,
+            node: node,
+            noderef: nr
+          });
+          // Increased delay to prevent POLLRATEEXCEEDED - wait 1 second between requests
+          Utilities.sleep(1000);
         } catch (e) {
           Logger.log(`Error processing node ${node} (${nr}): ${e.toString()}`);
         }
       }
+      // Break outer loop if timeout approaching
+      if (new Date().getTime() - startTime > maxProcessingTime) break;
     }
     if (allMappedRows.length > 0) {
       const written = writeRowsToSheets_(ss, allMappedRows, clearExisting);
@@ -1936,7 +1889,12 @@ function fetchLiveActiveSessions_(cfg) {
     let cookie = login_(cfg.rescueBase, cfg.user, cfg.pass);
     setReportAreaSession_(cfg.rescueBase, cookie);
     setReportTypeListAll_(cfg.rescueBase, cookie);
-    setOutputXMLOrFallback_(cfg.rescueBase, cookie);
+    // Set TEXT output (XML not working reliably)
+    try {
+      const rt = apiGet_(cfg.rescueBase, 'setOutput.aspx', { output: 'TEXT' }, cookie, 2, true);
+      const tt = (rt.getContentText() || '').trim();
+      if (!/^OK/i.test(tt)) Logger.log(`setOutput TEXT warning: ${tt}`);
+    } catch (e) { Logger.log('setOutput TEXT failed (non-fatal): ' + e.toString()); }
     setDelimiter_(cfg.rescueBase, cookie, '|');
     setReportDate_(cfg.rescueBase, cookie, todayStr, todayStr);
     setReportTimeAllDay_(cfg.rescueBase, cookie);
@@ -2242,7 +2200,12 @@ function fetchPerformanceSummaryData_(cfg, startDate, endDate) {
     // Set up for performance/summary report
     setReportAreaPerformance_(cfg.rescueBase, cookie);
     setReportTypeSummary_(cfg.rescueBase, cookie);
-    setOutputXMLOrFallback_(cfg.rescueBase, cookie);
+    // Set TEXT output (XML not working reliably)
+    try {
+      const rt = apiGet_(cfg.rescueBase, 'setOutput.aspx', { output: 'TEXT' }, cookie, 2, true);
+      const tt = (rt.getContentText() || '').trim();
+      if (!/^OK/i.test(tt)) Logger.log(`setOutput TEXT warning: ${tt}`);
+    } catch (e) { Logger.log('setOutput TEXT failed (non-fatal): ' + e.toString()); }
     setDelimiter_(cfg.rescueBase, cookie, '|');
     
     // Set date range
@@ -2515,7 +2478,12 @@ function dumpRescueListAllRaw_(startDate, endDate) {
     // Prepare LISTALL text pipe output
     setReportAreaSession_(base, cookie);
     setReportTypeListAll_(base, cookie);
-    setOutputXMLOrFallback_(base, cookie); // will set TEXT if FORCE_TEXT_OUTPUT
+    // Set TEXT output (XML not working reliably)
+    try {
+      const rt = apiGet_(base, 'setOutput.aspx', { output: 'TEXT' }, cookie, 2, true);
+      const tt = (rt.getContentText() || '').trim();
+      if (!/^OK/i.test(tt)) Logger.log(`setOutput TEXT warning: ${tt}`);
+    } catch (e) { Logger.log('setOutput TEXT failed (non-fatal): ' + e.toString()); }
     setDelimiter_(base, cookie, '|');
     setReportDate_(base, cookie, isoDate_(startDate), isoDate_(endDate));
     setReportTimeAllDay_(base, cookie);
@@ -2645,7 +2613,12 @@ function fetchChannelSummaryData_(cfg, startDate, endDate) {
   setReportAreaPerformance_(cfg.rescueBase, cookie);
     
     // Set output format and delimiter BEFORE setting report type
-    setOutputXMLOrFallback_(cfg.rescueBase, cookie);
+    // Set TEXT output (XML not working reliably)
+    try {
+      const rt = apiGet_(cfg.rescueBase, 'setOutput.aspx', { output: 'TEXT' }, cookie, 2, true);
+      const tt = (rt.getContentText() || '').trim();
+      if (!/^OK/i.test(tt)) Logger.log(`setOutput TEXT warning: ${tt}`);
+    } catch (e) { Logger.log('setOutput TEXT failed (non-fatal): ' + e.toString()); }
     setDelimiter_(cfg.rescueBase, cookie, '|');
     
     // Set date range BEFORE setting report type
@@ -3642,17 +3615,24 @@ function createMainAnalyticsPage_(ss) {
   sh.getRange(2, 4).setValue('Last Updated:');
   sh.getRange(2, 5).setValue(new Date().toLocaleString());
   const kpiRow = 4;
-    const kpiCards = [
-    ['Total Sessions', '=COUNTA(Sessions!A2:A)'], // Column A is session_id
-    ['Active Sessions', '=COUNTIFS(Sessions!C2:C, "Active")'], // Column C is session_status
+  
+  // Get dynamic column references for Sessions sheet
+  const sessionIdCol = getSessionsColumnByHeader_(['Session ID', 'session_id', 'Session ID']);
+  const statusCol = getSessionsColumnByHeader_(['Status', 'session_status', 'Status']);
+  const totalTimeCol = getSessionsColumnByHeader_(['Total Time', 'duration_total_seconds', 'Total Time']);
+  const waitingTimeCol = getSessionsColumnByHeader_(['Waiting Time', 'pickup_seconds', 'Waiting Time']);
+  
+  const kpiCards = [
+    [`Total Sessions`, `=COUNTA(Sessions!${sessionIdCol}2:${sessionIdCol})`],
+    [`Active Sessions`, `=COUNTIFS(Sessions!${statusCol}2:${statusCol}, "Active")`],
     ['Nova Wave Sessions', ''], // Will be calculated dynamically in refreshAnalyticsDashboard_ based on time frame
     // Use numeric formulas returning time fractions (seconds/86400) instead of TEXT so cells remain numeric
-    ['Avg Duration', '=IF(COUNT(Sessions!U2:U)>0, AVERAGE(Sessions!U2:U)/86400, 0)'], // Column U is duration_total_seconds
-    ['Avg Pickup Time', '=IF(COUNT(Sessions!V2:V)>0, AVERAGE(Sessions!V2:V)/86400, 0)'], // Column V is pickup_seconds
-    ['Longest Session', '=IF(MAX(Sessions!U2:U)>0, MAX(Sessions!U2:U)/86400, 0)'],
+    [`Avg Duration`, `=IF(COUNT(Sessions!${totalTimeCol}2:${totalTimeCol})>0, AVERAGE(Sessions!${totalTimeCol}2:${totalTimeCol})/86400, 0)`],
+    [`Avg Pickup Time`, `=IF(COUNT(Sessions!${waitingTimeCol}2:${waitingTimeCol})>0, AVERAGE(Sessions!${waitingTimeCol}2:${waitingTimeCol})/86400, 0)`],
+    [`Longest Session`, `=IF(MAX(Sessions!${totalTimeCol}2:${totalTimeCol})>0, MAX(Sessions!${totalTimeCol}2:${totalTimeCol})/86400, 0)`],
     // SLA as numeric fraction (0..1) so we can apply a percentage format
-    ['SLA Hit %', '=IF(COUNT(Sessions!V2:V)>0, COUNTIFS(Sessions!V2:V, "<=60")/COUNT(Sessions!V2:V), 0)'],
-    ['Avg Sessions/Hour', '=IF(COUNTA(Sessions!A2:A)>0, ROUND(COUNTA(Sessions!A2:A)/8, 1), 0)'] // Column A is session_id
+    [`SLA Hit %`, `=IF(COUNT(Sessions!${waitingTimeCol}2:${waitingTimeCol})>0, COUNTIFS(Sessions!${waitingTimeCol}2:${waitingTimeCol}, "<=60")/COUNT(Sessions!${waitingTimeCol}2:${waitingTimeCol}), 0)`],
+    [`Avg Sessions/Hour`, `=IF(COUNTA(Sessions!${sessionIdCol}2:${sessionIdCol})>0, ROUND(COUNTA(Sessions!${sessionIdCol}2:${sessionIdCol})/8, 1), 0)`]
   ];
   // Build polished KPI cards (3 cards per row). Each card is 3 columns wide × 3 rows tall.
   const cardWidth = 3;
@@ -3715,21 +3695,9 @@ function createMainAnalyticsPage_(ss) {
     }
   } catch (e) { Logger.log('Failed to apply KPI separator rows: ' + e.toString()); }
   
-  // Add Live Active Sessions section (current sessions)
-  // Place live area below KPI cards
+  // Place Team Performance section directly below KPI cards
   const cardRows = Math.ceil(kpiCards.length / 3) * cardHeight;
-  const liveRow = kpiRow + cardRows + 2;
-  sh.getRange(liveRow, 1).setValue('🟢 LIVE ACTIVE SESSIONS');
-  sh.getRange(liveRow, 1).setFontSize(14).setFontWeight('bold').setFontColor('#0F172A');
-  sh.getRange(liveRow, 1, 1, 6).merge();
-  const liveHeaders = ['Technician', 'Customer', 'Start Time', 'Live Duration', 'Channel', 'Session ID'];
-  sh.getRange(liveRow + 1, 1, 1, liveHeaders.length).setValues([liveHeaders]);
-  // clearly visible header - use green for live sessions
-  sh.getRange(liveRow + 1, 1, 1, liveHeaders.length).setFontWeight('bold').setBackground('#34A853').setFontColor('#FFFFFF');
-  sh.getRange(liveRow + 1, 1, 1, liveHeaders.length).setBorder(false, false, false, false, false, false); // Remove borders
-  // reserve space for live rows (approx)
-  const liveSectionHeight = 12;
-  const tableRow = liveRow + liveSectionHeight + 2;
+  const tableRow = kpiRow + cardRows + 2;
   sh.getRange(tableRow, 1).setValue('Team Performance');
   sh.getRange(tableRow, 1).setFontSize(14).setFontWeight('bold').setFontColor('#0F172A');
   const headers = ['Technician', 'Total Sessions', 'Avg Duration', 'Avg Pickup', 'SLA Hit %', 'Sessions/Hour', 'Total Work Time'];
@@ -3744,15 +3712,6 @@ function createMainAnalyticsPage_(ss) {
   // Use blue header for clarity (white text on blue background)
   sh.getRange(activeRow + 1, 1, 1, activeHeaders.length).setFontWeight('bold').setBackground('#1A73E8').setFontColor('#FFFFFF');
   sh.getRange(activeRow + 1, 1, 1, activeHeaders.length).setBorder(false, false, false, false, false, false); // Remove borders
-  // Place Waiting Queue to the right of Live Active Sessions (row 16, starting at column J)
-  const queueRow = 16;
-  const queueCol = 9; // column I (moved one left)
-  sh.getRange(queueRow, queueCol).setValue('⏳ Waiting Queue');
-  sh.getRange(queueRow, queueCol).setFontSize(14).setFontWeight('bold').setFontColor('#0F172A');
-  const queueHeaders = ['Channel', 'Customer', 'Waiting Since', 'Wait Duration'];
-  sh.getRange(queueRow + 1, queueCol, 1, queueHeaders.length).setValues([queueHeaders]);
-  sh.getRange(queueRow + 1, queueCol, 1, queueHeaders.length).setFontWeight('bold').setBackground('#EA8600').setFontColor('#FFFFFF');
-  sh.getRange(queueRow + 1, queueCol, 1, queueHeaders.length).setBorder(false, false, false, false, false, false); // Remove borders
   sh.setColumnWidth(1, 150);
   sh.setColumnWidth(2, 120);
   sh.setColumnWidth(3, 150);
@@ -3760,13 +3719,6 @@ function createMainAnalyticsPage_(ss) {
   sh.setColumnWidth(5, 150);
   sh.setColumnWidth(6, 120);
   sh.setColumnWidth(7, 150);
-  // Ensure waiting queue columns (J-M) are visible and wide enough
-  try {
-    sh.setColumnWidth(10, 150);
-    sh.setColumnWidth(11, 150);
-    sh.setColumnWidth(12, 160);
-    sh.setColumnWidth(13, 120);
-  } catch (e) {}
   sh.setFrozenRows(1);
   try { applyProfessionalTableStyling_(sh, sh.getLastColumn()); } catch (e) { Logger.log('Styling analytics dashboard failed: ' + e.toString()); }
 }
@@ -3802,6 +3754,62 @@ function refreshDashboardFromAPI() {
 function refreshAnalyticsDashboard_(startDate, endDate, perfMapOpt) {
   try {
     const ss = SpreadsheetApp.getActive();
+    
+    // Get or create Analytics_Dashboard sheet (preserve layout if exists)
+    let dashboardSheet = ss.getSheetByName('Analytics_Dashboard');
+    if (!dashboardSheet) {
+      createMainAnalyticsPage_(ss); // Create structure if doesn't exist
+      dashboardSheet = ss.getSheetByName('Analytics_Dashboard');
+    } else {
+      // Update formulas with current column references (in case headers changed)
+      const kpiRow = 4;
+      const sessionIdCol = getSessionsColumnByHeader_(['Session ID', 'session_id', 'Session ID']);
+      const statusCol = getSessionsColumnByHeader_(['Status', 'session_status', 'Status']);
+      const totalTimeCol = getSessionsColumnByHeader_(['Total Time', 'duration_total_seconds', 'Total Time']);
+      const waitingTimeCol = getSessionsColumnByHeader_(['Waiting Time', 'pickup_seconds', 'Waiting Time']);
+      
+      // Update KPI card formulas (cards are at positions: 0,1,3,4,5,6,7 - skip 2 which is Nova Wave)
+      const kpiCards = [
+        {row: 0, formula: `=COUNTA(Sessions!${sessionIdCol}2:${sessionIdCol})`},
+        {row: 1, formula: `=COUNTIFS(Sessions!${statusCol}2:${statusCol}, "Active")`},
+        {row: 3, formula: `=IF(COUNT(Sessions!${totalTimeCol}2:${totalTimeCol})>0, AVERAGE(Sessions!${totalTimeCol}2:${totalTimeCol})/86400, 0)`},
+        {row: 4, formula: `=IF(COUNT(Sessions!${waitingTimeCol}2:${waitingTimeCol})>0, AVERAGE(Sessions!${waitingTimeCol}2:${waitingTimeCol})/86400, 0)`},
+        {row: 5, formula: `=IF(MAX(Sessions!${totalTimeCol}2:${totalTimeCol})>0, MAX(Sessions!${totalTimeCol}2:${totalTimeCol})/86400, 0)`},
+        {row: 6, formula: `=IF(COUNT(Sessions!${waitingTimeCol}2:${waitingTimeCol})>0, COUNTIFS(Sessions!${waitingTimeCol}2:${waitingTimeCol}, "<=60")/COUNT(Sessions!${waitingTimeCol}2:${waitingTimeCol}), 0)`},
+        {row: 7, formula: `=IF(COUNTA(Sessions!${sessionIdCol}2:${sessionIdCol})>0, ROUND(COUNTA(Sessions!${sessionIdCol}2:${sessionIdCol})/8, 1), 0)`}
+      ];
+      
+      const cardWidth = 3;
+      const cardHeight = 3;
+      kpiCards.forEach(kpi => {
+        const cardTop = kpiRow + Math.floor(kpi.row / 3) * cardHeight;
+        const cardLeft = (kpi.row % 3) * cardWidth + 1;
+        const valRange = dashboardSheet.getRange(cardTop + 1, cardLeft, 1, cardWidth);
+        valRange.merge();
+        valRange.setFormula(kpi.formula);
+        // Re-apply number formats
+        try {
+          if (kpi.row === 3 || kpi.row === 4 || kpi.row === 5) {
+            valRange.setNumberFormat('hh:mm:ss');
+          } else if (kpi.row === 6) {
+            valRange.setNumberFormat('0.0%');
+          } else if (kpi.row === 0) {
+            valRange.setNumberFormat('0');
+          } else if (kpi.row === 7) {
+            valRange.setNumberFormat('0.0');
+          }
+        } catch (e) {}
+      });
+      
+      // Clear existing data but preserve layout/headers
+      const lastRow = dashboardSheet.getLastRow();
+      const lastCol = dashboardSheet.getLastColumn();
+      if (lastRow > 2 && lastCol > 0) {
+        // Keep header rows (1-2) and clear data rows
+        dashboardSheet.getRange(3, 1, lastRow - 2, lastCol).clearContent();
+      }
+    }
+    
     const cfg = getCfg_();
     const sessionsSheet = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
     if (!sessionsSheet) return;
@@ -3874,37 +3882,6 @@ function refreshAnalyticsDashboard_(startDate, endDate, perfMapOpt) {
       return [tech, String(td.sessions), avgDur + ' min', avgPickup + ' sec', slaPct + '%', sessionsPerHour, workHours + ' hrs'];
     }).sort((a, b) => Number(b[1]) - Number(a[1]));
     
-    // Always get current sessions from getSession_v3 API (for real-time queue and active sessions)
-    // This refreshes regardless of time frame - always shows current live data
-    // Reference: https://support.logmein.com/rescue/help/rescue-api-reference-guide
-    const currentSessionData = fetchCurrentSessions_(cfg);
-    
-    // LIVE Active Sessions from getSession_v3 API
-    const liveActiveRows = currentSessionData.active.slice(0, 25).map(session => {
-      const startTime = session.startTime ? new Date(session.startTime).toLocaleString('en-US', { 
-        timeZone: 'America/New_York',
-        hour: 'numeric', 
-        minute: '2-digit', 
-        second: '2-digit', 
-        hour12: true 
-      }) : '';
-      const now = new Date();
-      const startDate = session.startTime ? new Date(session.startTime) : now;
-      const liveDurationSec = Math.floor((now - startDate) / 1000);
-      const hours = Math.floor(liveDurationSec / 3600);
-      const minutes = Math.floor((liveDurationSec % 3600) / 60);
-      const seconds = liveDurationSec % 60;
-      const liveDuration = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-      return [
-        session.technician || '', 
-        session.customer || 'Anonymous', 
-        startTime, 
-        liveDuration,
-        session.channel || '—',
-        session.sessionId || ''
-      ];
-    });
-    
     // Get active sessions from filtered data (for the selected time frame)
     // Shows all sessions (not just Active status) from the selected time frame
     // Format: Technician, Customer Name, Start Time, Duration, Session ID, Calling Card
@@ -3924,48 +3901,17 @@ function refreshAnalyticsDashboard_(startDate, endDate, perfMapOpt) {
       return [row[techIdx] || '', customerName, startTime, duration, row[sessionIdIdx] || '', callingCard];
     });
     
-    // Waiting Queue from getSession_v3 API
-    const waitingRows = currentSessionData.waiting.map(session => {
-      const waitSince = session.startTime ? new Date(session.startTime).toLocaleString('en-US', { 
-        timeZone: 'America/New_York',
-        hour: 'numeric', 
-        minute: '2-digit', 
-        hour12: true 
-      }) : '';
-      const waitDur = session.waitDuration ? `${Math.floor(session.waitDuration/60)}:${String(session.waitDuration%60).padStart(2,'0')}` : '0:00';
-      return [session.channel || '—', session.customer || '—', waitSince, waitDur];
-    });
-    const dashboardSheet = ss.getSheetByName('Analytics_Dashboard');
+    // Use the dashboard sheet we got/created at the start of this function
     if (dashboardSheet) {
   // Compute positions so refresh uses the same layout as creation
   const kpiRow = 4;
   const kpiCardsCount = 8; // keep in sync with createMainAnalyticsPage_
   const cardHeight = 3;
   const cardRows = Math.ceil(kpiCardsCount / 3) * cardHeight;
-  const liveRow = kpiRow + cardRows + 2;
-  const liveSectionHeight = 12; // reservation used during creation
-  const liveHeaderRow = liveRow + 1;
-  const liveDataRow = liveHeaderRow + 1;
-  // Column where the Waiting Queue is placed (matches createMainAnalyticsPage_ layout)
-  const queueCol = 9; // column I (to the right side of the main table)
+  const tableRow = kpiRow + cardRows + 2;
       
-      // Ensure headers are always present
-      const liveHeaders = ['Technician', 'Customer', 'Start Time', 'Live Duration', 'Channel', 'Session ID'];
-      dashboardSheet.getRange(liveHeaderRow, 1, 1, liveHeaders.length).setValues([liveHeaders]);
-      dashboardSheet.getRange(liveHeaderRow, 1, 1, liveHeaders.length).setFontWeight('bold').setBackground('#34A853').setFontColor('#FFFFFF');
-      dashboardSheet.getRange(liveHeaderRow, 1, 1, liveHeaders.length).setBorder(false, false, false, false, false, false); // Remove borders
-      
-      // Clear data rows and populate
-      dashboardSheet.getRange(liveDataRow, 1, 100, 6).clearContent();
-      if (liveActiveRows.length > 0) {
-        dashboardSheet.getRange(liveDataRow, 1, liveActiveRows.length, 6).setValues(liveActiveRows);
-      } else {
-        dashboardSheet.getRange(liveDataRow, 1).setValue('No active sessions');
-        dashboardSheet.getRange(liveDataRow, 1).setFontStyle('italic').setFontColor('#999999');
-      }
-      
-      // Update Team Performance section (positioned after live area)
-      const teamTitleRow = liveRow + liveSectionHeight + 1; // title row just after live reservation
+      // Update Team Performance section (positioned after KPI cards)
+      const teamTitleRow = tableRow;
       const teamHeaderRow = teamTitleRow + 1;
       const teamDataRow = teamHeaderRow + 1;
 
@@ -3989,20 +3935,20 @@ function refreshAnalyticsDashboard_(startDate, endDate, perfMapOpt) {
       // Uses isAnyTechAvailableOnChannel API per documentation
       const loggedInTechs = fetchLoggedInTechnicians_(cfg);
 
-      // Place Currently Logged In technicians to the right of Team Performance (same column as Waiting Queue)
-      // Move to row 28 as requested and align to the queue column
+      // Place Currently Logged In technicians to the right of Team Performance
       const techStatusRow = 28;
-      dashboardSheet.getRange(techStatusRow, queueCol).setValue('👥 Currently Logged In Technicians');
-      dashboardSheet.getRange(techStatusRow, queueCol).setFontSize(14).setFontWeight('bold').setFontColor('#07123B');
+      const techStatusCol = 9; // Column I (right side)
+      dashboardSheet.getRange(techStatusRow, techStatusCol).setValue('👥 Currently Logged In Technicians');
+      dashboardSheet.getRange(techStatusRow, techStatusCol).setFontSize(14).setFontWeight('bold').setFontColor('#07123B');
       // Merge the title across two columns (name + status)
-      try { dashboardSheet.getRange(techStatusRow, queueCol, 1, 2).merge(); } catch (e) {}
+      try { dashboardSheet.getRange(techStatusRow, techStatusCol, 1, 2).merge(); } catch (e) {}
       // Clear the area where we'll place logged-in rows (two columns: name, status)
-      dashboardSheet.getRange(techStatusRow + 1, queueCol, 100, 2).clearContent();
+      dashboardSheet.getRange(techStatusRow + 1, techStatusCol, 100, 2).clearContent();
       if (loggedInTechs.length > 0) {
-        dashboardSheet.getRange(techStatusRow + 1, queueCol, loggedInTechs.length, 2).setValues(loggedInTechs);
+        dashboardSheet.getRange(techStatusRow + 1, techStatusCol, loggedInTechs.length, 2).setValues(loggedInTechs);
       } else {
-        dashboardSheet.getRange(techStatusRow + 1, queueCol).setValue('No technicians currently logged in');
-        dashboardSheet.getRange(techStatusRow + 1, queueCol).setFontStyle('italic').setFontColor('#999999');
+        dashboardSheet.getRange(techStatusRow + 1, techStatusCol).setValue('No technicians currently logged in');
+        dashboardSheet.getRange(techStatusRow + 1, techStatusCol).setFontStyle('italic').setFontColor('#999999');
       }
       
       // Update Active Sessions section (shows sessions from selected time frame)
@@ -4032,23 +3978,6 @@ function refreshAnalyticsDashboard_(startDate, endDate, perfMapOpt) {
       } else {
         dashboardSheet.getRange(activeDataRow, 1).setValue('No sessions found for selected time frame');
         dashboardSheet.getRange(activeDataRow, 1).setFontStyle('italic').setFontColor('#999999');
-      }
-      
-    // Update Waiting Queue placed to the right of Live Active Sessions (row 16, column J)
-    const queueRow = 16;
-    /* queueCol already defined above to keep placement consistent */
-      dashboardSheet.getRange(queueRow, queueCol).setValue('⏳ Waiting Queue');
-      dashboardSheet.getRange(queueRow, queueCol).setFontSize(14).setFontWeight('bold');
-      const queueHeaders = ['Channel', 'Customer', 'Waiting Since', 'Wait Duration'];
-      dashboardSheet.getRange(queueRow + 1, queueCol, 1, 4).setValues([queueHeaders]);
-      dashboardSheet.getRange(queueRow + 1, queueCol, 1, 4).setFontWeight('bold').setBackground('#EA8600').setFontColor('#FFFFFF');
-      dashboardSheet.getRange(queueRow + 1, queueCol, 1, 4).setBorder(false, false, false, false, false, false); // Remove borders
-      dashboardSheet.getRange(queueRow + 2, queueCol, 100, 4).clearContent();
-      if (waitingRows.length > 0) {
-        dashboardSheet.getRange(queueRow + 2, queueCol, waitingRows.length, 4).setValues(waitingRows);
-      } else {
-        dashboardSheet.getRange(queueRow + 2, queueCol).setValue('No sessions waiting');
-        dashboardSheet.getRange(queueRow + 2, queueCol).setFontStyle('italic').setFontColor('#999999');
       }
       
       // Update Nova Wave Sessions count for selected time frame
@@ -4083,11 +4012,6 @@ function refreshAnalyticsDashboard_(startDate, endDate, perfMapOpt) {
         const slaValueRow = slaGroupTop + 1; // value row under SLA header
         try { dashboardSheet.getRange(slaValueRow, 1, 1, kpiCols).setBackground('#1A73E8').setFontColor('#FFFFFF').setFontWeight('bold'); } catch (e) {}
 
-        // Live header (green)
-        if (typeof liveHeaderRow !== 'undefined') {
-          dashboardSheet.getRange(liveHeaderRow, 1, 1, liveHeaders.length).setBackground('#34A853').setFontColor('#FFFFFF').setFontWeight('bold');
-        }
-
         // Team header (blue)
         if (typeof teamHeaderRow !== 'undefined') {
           dashboardSheet.getRange(teamHeaderRow, 1, 1, teamHeaders.length).setBackground('#1A73E8').setFontColor('#FFFFFF').setFontWeight('bold');
@@ -4098,14 +4022,9 @@ function refreshAnalyticsDashboard_(startDate, endDate, perfMapOpt) {
           dashboardSheet.getRange(activeHeaderRow, 1, 1, activeHeaders.length).setBackground('#1A73E8').setFontColor('#FFFFFF').setFontWeight('bold');
         }
 
-        // Waiting Queue header (orange) — uses queueRow/queueCol
-        if (typeof queueRow !== 'undefined' && typeof queueCol !== 'undefined') {
-          dashboardSheet.getRange(queueRow + 1, queueCol, 1, 4).setBackground('#EA8600').setFontColor('#FFFFFF').setFontWeight('bold');
-        }
-
-        // Currently Logged In header (we merge 2 columns) - give it the same orange header style so it visually matches the waiting queue
-        if (typeof techStatusRow !== 'undefined' && typeof queueCol !== 'undefined') {
-          try { dashboardSheet.getRange(techStatusRow, queueCol, 1, 2).setBackground('#EA8600').setFontColor('#FFFFFF').setFontWeight('bold'); } catch (e) {}
+        // Currently Logged In header (we merge 2 columns)
+        if (typeof techStatusRow !== 'undefined') {
+          try { dashboardSheet.getRange(techStatusRow, 9, 1, 2).setBackground('#EA8600').setFontColor('#FFFFFF').setFontWeight('bold'); } catch (e) {}
         }
 
         // Ensure team data rows have dark font color (so values are visible)
@@ -4134,29 +4053,6 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
     if (dataRange.getNumRows() <= 1) return;
     // Load extension -> technician mapping for per-account Digium pulls (sheet: extension_map)
     const extMap = getExtensionMap_();
-    
-    // Clear existing personal dashboard tabs only (avoid wiping other sheets)
-    const allSheets = ss.getSheets();
-    const reservedSheets = ['Sessions', 'Analytics_Dashboard', 'Dashboard_Config', 'Daily_Summary', 'Support_Data', 'Progress', 'Advanced_Analytics', 'Digium_Raw', 'Digium_Calls', 'API_Smoke_Test'];
-    const existingTechSheets = allSheets.filter(sheet => {
-      const sheetName = sheet.getName();
-      if (reservedSheets.indexOf(sheetName) !== -1) return false;
-      try {
-        const a1 = sheet.getRange(1, 1).getValue();
-        return typeof a1 === 'string' && a1.indexOf('Personal Dashboard') !== -1;
-      } catch (e) {
-        return false;
-      }
-    });
-    // Clear detected personal dashboards before regenerating
-    for (const techSheet of existingTechSheets) {
-      try {
-        techSheet.clear();
-        Logger.log(`Cleared existing technician tab: ${techSheet.getName()}`);
-      } catch (e) {
-        Logger.log(`Error clearing sheet ${techSheet.getName()}: ${e.toString()}`);
-      }
-    }
     
   const allData = sessionsSheet.getRange(2, 1, dataRange.getNumRows() - 1, dataRange.getNumColumns()).getValues();
     const headers = sessionsSheet.getRange(1, 1, 1, dataRange.getNumColumns()).getValues()[0];
@@ -4195,15 +4091,45 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
   const techSet = new Set((rosterNames || []).filter(Boolean));
   filtered.forEach(row => { const t = row[techIdx]; if (t) techSet.add(String(t)); });
   const techs = Array.from(techSet);
+  
+  // Generate safe names for all techs first, then clean up any duplicate/old personal dashboard sheets
+  const techSafeNames = new Set();
+  techs.forEach(techName => {
+    const safeName = techName.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30);
+    techSafeNames.add(safeName);
+  });
+  
+  // Remove any personal dashboard sheets that don't match current tech safe names
+  const allSheets = ss.getSheets();
+  const reservedSheets = ['Sessions', 'Analytics_Dashboard', 'Dashboard_Config', 'Daily_Summary', 'Support_Data', 'Progress', 'Advanced_Analytics', 'Digium_Raw', 'Digium_Calls', 'API_Smoke_Test'];
+  allSheets.forEach(sheet => {
+    const sheetName = sheet.getName();
+    if (reservedSheets.indexOf(sheetName) !== -1) return;
+    try {
+      const a1 = sheet.getRange(1, 1).getValue();
+      const isPersonalDashboard = typeof a1 === 'string' && a1.indexOf('Personal Dashboard') !== -1;
+      // If it's a personal dashboard sheet but not in our current tech list, delete it
+      if (isPersonalDashboard && !techSafeNames.has(sheetName)) {
+        ss.deleteSheet(sheet);
+        Logger.log(`Deleted old personal dashboard sheet: ${sheetName}`);
+      }
+    } catch (e) {
+      // Ignore errors when checking sheet content
+    }
+  });
+  
   // Pull performance summary once for the whole range; used for Avg Session (API)
   const perfByTech = perfMapOpt || getPerfSummaryCached_(cfg, startDate, endDate) || {};
     for (const techName of techs) {
       const safeName = techName.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30);
       let techSheet = ss.getSheetByName(safeName);
-      if (!techSheet) techSheet = ss.insertSheet(safeName);
+      if (!techSheet) {
+        techSheet = ss.insertSheet(safeName);
+      } else {
+        // Sheet exists - clear it completely to repopulate
+        techSheet.clear();
+      }
   const techRows = filtered.filter(row => row[techIdx] === techName);
-      // Clear again to ensure clean slate (in case sheet existed)
-      techSheet.clear();
       // Important: clearing values does not remove row/column groups; fully reset any prior groups
       try {
         const maxRows = techSheet.getMaxRows();
@@ -4529,7 +4455,12 @@ function apiSmokeTest() {
     let cookie = login_(cfg.rescueBase, cfg.user, cfg.pass);
     setReportAreaSession_(cfg.rescueBase, cookie);
     setReportTypeListAll_(cfg.rescueBase, cookie);
-    setOutputXMLOrFallback_(cfg.rescueBase, cookie);
+    // Set TEXT output (XML not working reliably)
+    try {
+      const rt = apiGet_(cfg.rescueBase, 'setOutput.aspx', { output: 'TEXT' }, cookie, 2, true);
+      const tt = (rt.getContentText() || '').trim();
+      if (!/^OK/i.test(tt)) Logger.log(`setOutput TEXT warning: ${tt}`);
+    } catch (e) { Logger.log('setOutput TEXT failed (non-fatal): ' + e.toString()); }
     setDelimiter_(cfg.rescueBase, cookie, '|');
     const today = new Date();
     const todayET = new Date(today.getFullYear(), today.getMonth(), today.getDate());
@@ -4667,10 +4598,11 @@ function refreshAdvancedAnalyticsDashboard_(startDate, endDate) {
     // Update last updated timestamp
     analyticsSheet.getRange(2, 5).setValue(new Date().toLocaleString());
     
-    // Clear existing content (except header rows 1-2)
+    // Clear existing content (except header rows 1-2) to ensure fresh data
     const lastRow = analyticsSheet.getLastRow();
-    if (lastRow > 2) {
-      analyticsSheet.getRange(3, 1, lastRow - 2, analyticsSheet.getLastColumn()).clearContent();
+    const lastCol = analyticsSheet.getLastColumn();
+    if (lastRow > 2 && lastCol > 0) {
+      analyticsSheet.getRange(3, 1, lastRow - 2, lastCol).clearContent();
     }
     
     // Generate all analytics sections
