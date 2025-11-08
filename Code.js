@@ -1,3 +1,4 @@
+
 // Cache Performance SUMMARY results for a short period to avoid redundant API calls
 function getPerfSummaryCached_(cfg, startDate, endDate) {
   try {
@@ -419,10 +420,9 @@ function areTechnicianNameVariations_(name1, name2) {
   }
   return false;
 }
-
 function collectSalesforceTicketMetrics_(startDate, endDate) {
   const result = {
-    overall: { totalCreated: 0, totalClosed: 0, openCreated: 0, topIssues: {} },
+    overall: { totalCreated: 0, totalClosed: 0, openCurrent: 0, topIssues: {} },
     perCanonical: {}
   };
   try {
@@ -453,7 +453,8 @@ function collectSalesforceTicketMetrics_(startDate, endDate) {
     const closedByIdx = getIndex(['ticket closed by rep.', 'ticket closed by rep']);
     const createdDateIdx = getIndex(['ticket created date', 'created date']);
     const closedDateIdx = getIndex(['ticket closed date', 'closed date']);
-    const closedFlagIdx = getIndex(['is this issue closed?', 'is this issue closed']);
+    const recordTypeIdx = getIndex(['novapos ticket: record type', 'record type']);
+    const daysToCloseIdx = getIndex(['days to close ticket / ticket age', 'days to close ticket', 'ticket age']);
     const mainIssueIdx = getIndex(['tech main issue']);
     const techIssueIdx = getIndex(['technical issue']);
     const novaIssueIdx = getIndex(['nova wave issue', 'nova issue']);
@@ -464,20 +465,55 @@ function collectSalesforceTicketMetrics_(startDate, endDate) {
       return result;
     }
 
+    if (recordTypeIdx < 0) {
+      Logger.log('collectSalesforceTicketMetrics_: record type column missing, no metrics produced');
+      return result;
+    }
+
+    const allowedRecordTypes = ['nova classic', 'nova wave'];
+    const normalizeRecordType = (value) => String(value || '').trim().toLowerCase();
     const parseDateCell = (value) => {
       if (value instanceof Date && !isNaN(value)) return value;
       if (value == null || value === '') return null;
       const parsed = new Date(value);
       return (parsed instanceof Date && !isNaN(parsed)) ? parsed : null;
     };
+    const parseDaysToClose = (value) => {
+      if (value == null || value === '') return null;
+      if (typeof value === 'number') return isNaN(value) ? null : value;
+      const cleaned = String(value).replace(/[^0-9.\-]/g, '').trim();
+      if (!cleaned) return null;
+      const num = parseFloat(cleaned);
+      return isNaN(num) ? null : num;
+    };
 
     const rangeStart = startDate.getTime();
     const rangeEnd = endDate.getTime();
+
+    const extMap = getExtensionMap_();
+    const technicianIsMapped = (rawName) => {
+      const names = [];
+      const canonical = canonicalTechnicianName_(rawName);
+      if (canonical) names.push(canonical);
+      const normFull = normalizeTechnicianNameFull_(rawName);
+      if (normFull && names.indexOf(normFull) === -1) names.push(normFull);
+      const firstKey = technicianFirstNameKey_(rawName);
+      if (firstKey && names.indexOf(firstKey) === -1) names.push(firstKey);
+      for (const key of names) {
+        if (key && extMap && Array.isArray(extMap[key]) && extMap[key].length > 0) return true;
+      }
+      return false;
+    };
 
     const data = sfSheet.getRange(2, 1, range.getNumRows() - 1, range.getNumColumns()).getValues();
     data.forEach(row => {
       const ticketVal = row[ticketIdx];
       if (ticketVal == null || ticketVal === '') return;
+
+      const typeNorm = recordTypeIdx >= 0 ? normalizeRecordType(row[recordTypeIdx]) : '';
+      const matchesAllowed = typeNorm
+        ? allowedRecordTypes.some(rt => typeNorm.indexOf(rt) >= 0)
+        : false;
 
       const createdDate = parseDateCell(createdDateIdx >= 0 ? row[createdDateIdx] : null);
       const closedDate = parseDateCell(closedDateIdx >= 0 ? row[closedDateIdx] : null);
@@ -487,10 +523,8 @@ function collectSalesforceTicketMetrics_(startDate, endDate) {
       const createdInRange = createdMillis != null && createdMillis >= rangeStart && createdMillis <= rangeEnd;
       const closedInRange = closedMillis != null && closedMillis >= rangeStart && closedMillis <= rangeEnd;
 
-      const flagRaw = closedFlagIdx >= 0 ? row[closedFlagIdx] : '';
-      const flagStr = String(flagRaw || '').trim().toLowerCase();
-      const isClosedFlag = flagStr === '1' || flagStr === 'true' || flagStr === 'yes';
-      const stillOpen = !isClosedFlag || closedMillis == null || closedMillis > rangeEnd;
+      const daysToCloseVal = parseDaysToClose(daysToCloseIdx >= 0 ? row[daysToCloseIdx] : null);
+      const isCurrentlyOpen = daysToCloseVal === 0;
 
       const createdByRaw = createdByIdx >= 0 ? row[createdByIdx] : '';
       const closedByRaw = closedByIdx >= 0 ? row[closedByIdx] : '';
@@ -500,7 +534,7 @@ function collectSalesforceTicketMetrics_(startDate, endDate) {
       const ensureEntry = (canonical, rawName) => {
         if (!canonical) return null;
         if (!result.perCanonical[canonical]) {
-          result.perCanonical[canonical] = { created: 0, closed: 0, open: 0, issues: {}, rawNames: new Set() };
+          result.perCanonical[canonical] = { created: 0, closed: 0, open: 0, issues: {}, rawNames: new Set(), daysToClose: [] };
         }
         if (rawName) {
           const trimmed = String(rawName || '').trim();
@@ -527,40 +561,47 @@ function collectSalesforceTicketMetrics_(startDate, endDate) {
         return primaryStr && secondaryStr ? `${primaryStr} – ${secondaryStr}` : (primaryStr || secondaryStr);
       };
 
-      if (createdInRange) {
-        const creatorEntry = ensureEntry(createdCanonical, createdByRaw);
-        result.overall.totalCreated += 1;
-        if (stillOpen) {
-          result.overall.openCreated += 1;
-          if (creatorEntry) creatorEntry.open += 1;
-        }
-        if (creatorEntry) creatorEntry.created += 1;
+      const ticketBelongsToMapped = technicianIsMapped(createdByRaw);
+      const creatorEntry = ticketBelongsToMapped ? ensureEntry(createdCanonical, createdByRaw) : null;
+      const closerIsMapped = technicianIsMapped(closedByRaw) && matchesAllowed;
+      const closerEntry = closerIsMapped ? ensureEntry(closedCanonical, closedByRaw) : null;
 
-        const issue1 = buildIssueLabel(mainIssue, techIssue);
-        const issue2 = buildIssueLabel(novaIssue, novaTechIssue);
-        if (issue1) issues.push(issue1);
-        if (issue2) issues.push(issue2);
-
-        issues.forEach(label => {
-          addIssueLabel(result.overall.topIssues, label);
-          if (creatorEntry) addIssueLabel(creatorEntry.issues, label);
-        });
+      if (isCurrentlyOpen && matchesAllowed && ticketBelongsToMapped) {
+        result.overall.openCurrent += 1;
+        if (creatorEntry) creatorEntry.open += 1;
       }
 
-      if (closedInRange) {
-        const closerEntry = ensureEntry(closedCanonical, closedByRaw);
+      if (createdInRange && ticketBelongsToMapped) {
+        result.overall.totalCreated += 1;
+        if (creatorEntry) creatorEntry.created += 1;
+
+        if (matchesAllowed) {
+          const issue1 = buildIssueLabel(mainIssue, techIssue);
+          const issue2 = buildIssueLabel(novaIssue, novaTechIssue);
+          if (issue1) issues.push(issue1);
+          if (issue2) issues.push(issue2);
+          issues.forEach(label => {
+            addIssueLabel(result.overall.topIssues, label);
+            if (creatorEntry) addIssueLabel(creatorEntry.issues, label);
+          });
+        }
+      }
+
+      if (closedInRange && matchesAllowed && ticketBelongsToMapped) {
         result.overall.totalClosed += 1;
-        if (closerEntry) closerEntry.closed += 1;
-      } else {
-        // still record raw names for reference even if not counted above
-        ensureEntry(createdCanonical, createdByRaw);
-        ensureEntry(closedCanonical, closedByRaw);
+        if (closerEntry) {
+          closerEntry.closed += 1;
+        }
+        if (creatorEntry && daysToCloseVal != null && daysToCloseVal > 0) {
+          creatorEntry.daysToClose.push(daysToCloseVal);
+        }
       }
     });
 
     Object.keys(result.perCanonical).forEach(key => {
       const entry = result.perCanonical[key];
       entry.rawNames = Array.from(entry.rawNames || []);
+      entry.daysToClose = entry.daysToClose || [];
     });
   } catch (e) {
     Logger.log('collectSalesforceTicketMetrics_ error: ' + e.toString());
@@ -781,7 +822,6 @@ function fetchDigiumCallReports_(startDate, endDate, options) {
     const n = Number(s);
     return isNaN(n) ? 0 : n;
   };
-
   // Try to parse results based on breakdown type
   try {
     const doc = r.xml;
@@ -1225,8 +1265,16 @@ function createDigiumCallsSheet_(byDateData, byAccountData, extensionMeta) {
     const fields = byAccountData.fields || Object.keys(byAccountData.totalsAll || {});
     const human = byAccountData.humanLabels || {};
 
+    const totalsAll = byAccountData.totalsAll || {};
+    const totalCallsOverall = Number(totalsAll.total_calls) || 0;
+    const totalCallDurationSecondsOverall = parseDurationSecondsSafe(totalsAll.call_duration);
+    const totalTalkingSecondsOverall = parseDurationSecondsSafe(totalsAll.talking_duration);
+
     const rows = fields.map(field => {
-      const label = human[field] || field;
+      let label = human[field] || field;
+      if (String(field || '').toLowerCase().includes('avg_call_duration')) {
+        label = 'Avg Call Time per Call';
+      }
       let total = 0;
       const row = [label, 0];
       filteredExtensions.forEach(ext => {
@@ -1241,7 +1289,36 @@ function createDigiumCallsSheet_(byDateData, byAccountData, extensionMeta) {
         row.push(value);
         total += value;
       });
-      row[1] = total;
+      switch (String(field || '').toLowerCase()) {
+        case 'call_duration':
+        case 'call_duration (s)':
+          row[1] = totalCallDurationSecondsOverall || total;
+          break;
+        case 'talking_duration':
+        case 'talking_duration (s)':
+          row[1] = totalTalkingSecondsOverall || total;
+          break;
+        case 'avg_call_duration':
+        case 'avg_call_duration (s)':
+          row[1] = totalCallsOverall > 0 ? totalCallDurationSecondsOverall / totalCallsOverall : 0;
+          break;
+        case 'avg_talking_duration':
+        case 'avg_talking_duration (s)':
+          row[1] = totalCallsOverall > 0 ? totalTalkingSecondsOverall / totalCallsOverall : 0;
+          break;
+        default: {
+          const totalRaw = totalsAll[field];
+          if (totalRaw != null && totalRaw !== '') {
+            if (isDurationMetric(label)) {
+              row[1] = parseDurationSecondsSafe(totalRaw);
+            } else {
+              row[1] = Number(totalRaw) || 0;
+            }
+          } else {
+            row[1] = total;
+          }
+        }
+      }
       return row;
     });
 
@@ -1766,7 +1843,6 @@ function setReportTimeAllDay_(base, cookie) {
   const t = (r.getContentText()||'').trim();
   if (!/^OK/i.test(t)) throw new Error(`setReportTime: ${t}`);
 }
-
 // Set timezone to Eastern Time (EDT/EST) with automatic DST detection
 // Per LogMeIn API documentation
 // EDT (Daylight Saving) = UTC-4 = -240 minutes
@@ -2231,7 +2307,6 @@ function mdy_(iso) {
   const d = new Date(iso + 'T00:00:00');
   return `${d.getMonth()+1}/${d.getDate()}/${d.getFullYear()}`;
 }
-
 // Normalize a duration-like value into seconds.
 // Accepts: numeric seconds, numeric time-fraction (days), or hh:mm:ss string.
 function parseDurationSeconds_(val) {
@@ -2730,7 +2805,6 @@ function getTimeFrameRange_(label) {
       return buildRange(todayStart, todayEnd);
   }
 }
-
 function uiIngestRangeToSheets() {
   const html = HtmlService.createHtmlOutput(`
     <style>
@@ -4309,6 +4383,7 @@ function createDailySummarySheet_(ss, startDate, endDate) {
     
     // Calculate per-technician stats
     const techStats = {};
+    const sfMetrics = collectSalesforceTicketMetrics_(startDate, endDate);
     filtered.forEach(row => {
       const tech = row[techIdx] || 'Unknown';
       if (!techStats[tech]) {
@@ -4316,7 +4391,10 @@ function createDailySummarySheet_(ss, startDate, endDate) {
           sessions: 0,
           durations: [],
           pickups: [],
-          workSeconds: 0
+          workSeconds: 0,
+          talkSeconds: 0,
+          tickets: 0,
+          daysToCloseAvg: 0
         };
       }
       techStats[tech].sessions++;
@@ -4337,6 +4415,7 @@ function createDailySummarySheet_(ss, startDate, endDate) {
         }
         (entry.rawNames || []).forEach(rawName => {
           const normalized = canonicalTechnicianName_(rawName);
+          if (!normalized || normalized === canonical) return;
           ticketsByCanonical[normalized] = (ticketsByCanonical[normalized] || 0) + (entry.created || 0);
           if (entry.daysToClose && entry.daysToClose.length) {
             daysToCloseByCanonical[normalized] = (daysToCloseByCanonical[normalized] || []).concat(entry.daysToClose);
@@ -4643,7 +4722,7 @@ function createSupportDataSheet_(ss, startDate, endDate) {
     // Aggregate Salesforce ticket data
     const sfMetrics = collectSalesforceTicketMetrics_(startDate, endDate);
     const totalTickets = sfMetrics.overall.totalCreated;
-    const openTickets = sfMetrics.overall.totalCreated - sfMetrics.overall.totalClosed;
+    const openTickets = sfMetrics.overall.openCurrent || 0;
     const closedTickets = sfMetrics.overall.totalClosed;
     const topIssuesOverall = Object.entries(sfMetrics.overall.topIssues || {})
       .sort((a, b) => Number(b[1]) - Number(a[1]))
@@ -4731,14 +4810,13 @@ function createSupportDataSheet_(ss, startDate, endDate) {
           durations: [],
           pickups: [],
           workSeconds: 0,
-          resolved: 0,
+          tickets: 0,
+          daysToCloseAvg: 0,
           novaWave: 0,
           totalCalls: 0,
           inboundCalls: 0,
           outboundCalls: 0,
-          talkSeconds: 0,
-          tickets: 0,
-          daysToCloseAvg: 0
+          talkSeconds: 0
         };
       }
       return techStats[tech];
@@ -4764,25 +4842,83 @@ function createSupportDataSheet_(ss, startDate, endDate) {
       })();
       if (isNovaWave) stats.novaWave++;
     });
-    if (digTotals && digTotals.ok && Array.isArray(digTotals.rows)) {
-      const metricMap = {};
-      digTotals.rows.forEach(row => {
-        const metricName = String(row[0] || '').toLowerCase();
-        const value = Number(row[1]) || 0;
-        metricMap[metricName] = value;
-      });
-      const totalCallsValue = metricMap['total calls'] || 0;
-      const inboundValue = metricMap['total incoming calls'] || 0;
-      const outboundValue = metricMap['total outgoing calls'] || 0;
-      const talkValue = metricMap['talking duration (s)'] || metricMap['talking duration'] || 0;
-      Object.keys(techStats).forEach(tech => {
-        const stats = techStats[tech];
-        stats.totalCalls += totalCallsValue;
-        stats.inboundCalls += inboundValue;
-        stats.outboundCalls += outboundValue;
-        stats.talkSeconds += talkValue;
+
+    const callMetricsByCanonical = {};
+    const perExtensionData = (digTotals && digTotals.perExtension && typeof digTotals.perExtension === 'object')
+      ? digTotals.perExtension
+      : null;
+    if (perExtensionData && Object.keys(perExtensionData).length > 0) {
+      const extensionMapData = getExtensionMap_();
+      const extToCanonical = {};
+      const extPriority = {};
+      const assignExtCanonical = (ext, name, priority) => {
+        const extKey = String(ext || '').trim();
+        if (!extKey) return;
+        const canonical = canonicalTechnicianName_(name);
+        if (!canonical) return;
+        const currentPriority = extPriority[extKey];
+        if (currentPriority == null || priority > currentPriority) {
+          extToCanonical[extKey] = canonical;
+          extPriority[extKey] = priority;
+        }
+      };
+      if (extensionMeta && extensionMeta.extToName) {
+        Object.keys(extensionMeta.extToName).forEach(ext => {
+          assignExtCanonical(ext, extensionMeta.extToName[ext], 3);
+        });
+      }
+      if (extensionMapData && Object.keys(extensionMapData).length > 0) {
+        Object.keys(extensionMapData).forEach(nameKey => {
+          const exts = extensionMapData[nameKey];
+          if (!Array.isArray(exts) || !exts.length) return;
+          const hasSpace = nameKey.indexOf(' ') >= 0;
+          const priority = hasSpace ? 2 : 1;
+          exts.forEach(ext => assignExtCanonical(ext, nameKey, priority));
+        });
+      }
+      const parseMetricNumber = (value) => {
+        const n = Number(value);
+        return isNaN(n) ? 0 : n;
+      };
+      Object.keys(perExtensionData).forEach(ext => {
+        const meta = perExtensionData[ext] || {};
+        let canonical = extToCanonical[String(ext).trim()];
+        if (!canonical && meta.label) {
+          const parts = String(meta.label || '').split('-').map(s => s.trim()).filter(Boolean);
+          if (parts.length >= 2) {
+            assignExtCanonical(ext, parts.slice(1).join(' - '), 1);
+          } else if (parts.length === 1) {
+            assignExtCanonical(ext, parts[0], 1);
+          }
+          canonical = extToCanonical[String(ext).trim()];
+        }
+        if (!canonical) return;
+        const metrics = meta.metrics || {};
+        const bucket = callMetricsByCanonical[canonical] || { totalCalls: 0, inbound: 0, outbound: 0, talkSeconds: 0 };
+        bucket.totalCalls += parseMetricNumber(metrics.total_calls);
+        bucket.inbound += parseMetricNumber(metrics.total_incoming_calls);
+        bucket.outbound += parseMetricNumber(metrics.total_outgoing_calls);
+        let talkSeconds = 0;
+        if (metrics.hasOwnProperty('talking_duration')) {
+          talkSeconds = parseMetricNumber(metrics.talking_duration);
+        } else if (metrics.hasOwnProperty('talking_duration (s)')) {
+          talkSeconds = parseMetricNumber(metrics['talking_duration (s)']);
+        }
+        bucket.talkSeconds += talkSeconds;
+        callMetricsByCanonical[canonical] = bucket;
       });
     }
+    Object.keys(techStats).forEach(tech => {
+      const canonical = canonicalTechnicianName_(tech);
+      if (!canonical) return;
+      const metrics = callMetricsByCanonical[canonical];
+      if (!metrics) return;
+      const stats = techStats[tech];
+      stats.totalCalls = metrics.totalCalls;
+      stats.inboundCalls = metrics.inbound;
+      stats.outboundCalls = metrics.outbound;
+      stats.talkSeconds = metrics.talkSeconds;
+    });
     const ticketsByCanonical = {};
     const daysToCloseByCanonical = {};
     if (sfMetrics && sfMetrics.perCanonical) {
@@ -4795,6 +4931,7 @@ function createSupportDataSheet_(ss, startDate, endDate) {
         }
         (entry.rawNames || []).forEach(rawName => {
           const normalized = canonicalTechnicianName_(rawName);
+          if (!normalized || normalized === canonical) return;
           ticketsByCanonical[normalized] = (ticketsByCanonical[normalized] || 0) + (entry.created || 0);
           if (entry.daysToClose && entry.daysToClose.length) {
             daysToCloseByCanonical[normalized] = (daysToCloseByCanonical[normalized] || []).concat(entry.daysToClose);
@@ -4971,7 +5108,6 @@ function createSupportDataSheet_(ss, startDate, endDate) {
     } else {
       avgPickupRow.push(0);
     }
-
     const wideRows = [headerRow, totalSessionsRow, totalWorkRow, avgSessionRow, avgPickupRow];
     supportSheet.getRange(channelRow, 1, 1, wideRows[0].length).setValues([wideRows[0]]);
     supportSheet.getRange(channelRow, 1, 1, wideRows[0].length).setFontWeight('bold').setBackground('#1E3A8A').setFontColor('#FFFFFF').setFontSize(12);
@@ -5723,6 +5859,25 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
     Logger.log(`${techName} - Extension map lookup: found ${extList.length} extensions: ${extList.join(', ')} (searched: "${techNameNorm}", "${firstName}")`);
     
     const ticketStats = ticketStatsByTech[techName] || { created: 0, closed: 0, open: 0, issues: {} };
+    const callMetrics = { totalCalls: 0, inboundCalls: 0, outboundCalls: 0, talkSeconds: 0 };
+    const applyCallMetrics = (rows) => {
+      if (!Array.isArray(rows)) return;
+      rows.forEach(row => {
+        const metricName = String(row && row[0] ? row[0] : '').toLowerCase();
+        const raw = row && row.length > 1 ? row[1] : 0;
+        const num = typeof raw === 'number' ? raw : Number(raw);
+        const value = isNaN(num) ? 0 : num;
+        if (metricName.includes('total calls') && !metricName.includes('incoming') && !metricName.includes('outgoing')) {
+          callMetrics.totalCalls = value;
+        } else if (metricName.includes('total incoming')) {
+          callMetrics.inboundCalls = value;
+        } else if (metricName.includes('total outgoing')) {
+          callMetrics.outboundCalls = value;
+        } else if (metricName.includes('talking duration')) {
+          callMetrics.talkSeconds = value;
+        }
+      });
+    };
     
     // Create dashboard if there's session data OR if there's an extension (Digium data will be fetched)
     const hasSessionData = techRows && techRows.length > 0;
@@ -5779,10 +5934,10 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
         ? (sfMetrics.perCanonical[canonicalTechnicianName_(techName)].daysToClose || [])
         : [];
       const avgDaysToClose = daysToCloseArr.length ? (daysToCloseArr.reduce((a,b)=>a+b,0) / daysToCloseArr.length) : 0;
-      const totalCallsForTech = techStats.totalCalls || 0;
-      const inboundCalls = techStats.inboundCalls || 0;
-      const outboundCalls = techStats.outboundCalls || 0;
-      const talkSeconds = techStats.talkSeconds || 0;
+      const totalCallsForTech = callMetrics.totalCalls || 0;
+      const inboundCalls = callMetrics.inboundCalls || 0;
+      const outboundCalls = callMetrics.outboundCalls || 0;
+      const talkSeconds = callMetrics.talkSeconds || 0;
       const ticketsCreated = ticketStats.created || 0;
       
       // Log sample values to debug why values are 0
@@ -5854,20 +6009,11 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
       
       // Get Digium data once per technician (by_account breakdown)
       let digiumSummary = null;
-      let totalCalls = 0;
       if (extList && extList.length) {
         try {
           Logger.log(`${techName} - Fetching Digium call data for extensions: ${extList.join(', ')}`);
           digiumSummary = fetchDigiumCallReports_(startDate, endDate, { breakdown: 'by_account', account_ids: extList });
-          if (digiumSummary && digiumSummary.ok && digiumSummary.rows && digiumSummary.rows.length > 0) {
-            const totalCallsRow = digiumSummary.rows.find(row => {
-              const metricName = String(row[0] || '').toLowerCase();
-              return metricName.includes('total calls') && !metricName.includes('incoming') && !metricName.includes('outgoing');
-            });
-            if (totalCallsRow && totalCallsRow[1] != null) {
-              totalCalls = Number(totalCallsRow[1]) || 0;
-            }
-          }
+          if (digiumSummary && digiumSummary.ok) applyCallMetrics(digiumSummary.rows);
         } catch (e) {
           Logger.log(`Warning: Could not fetch Total Calls for ${techName}: ${e.toString()}`);
         }
@@ -6173,6 +6319,7 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
           Logger.log(`${techName} - Digium API response: ok=${dr && dr.ok}, dates=${dr && dr.dates ? dr.dates.length : 0}, rows=${dr && dr.rows ? dr.rows.length : 0}`);
           // Always show Calls Summary section, even if no data (will show zeros)
           if (dr && dr.ok) {
+            applyCallMetrics(dr.rows);
             Logger.log(`${techName} - Writing Calls Summary to row ${callsSummaryRow} with ${dr.rows.length} metric rows`);
             // Add Calls Summary header
             techSheet.getRange(callsSummaryRow, 1).setValue('Calls Summary');
@@ -6197,7 +6344,7 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt) {
               'avg_call_duration': 'Avg Call Duration (s)'
             };
             // Process rows: convert duration values from seconds to time fractions (for hh:mm:ss formatting)
-            // Raw data from API is in seconds, we need to convert to time fraction (seconds/86400)
+            // Raw data from API is in seconds, we need to convert to time fraction (seconds / 86400)
             const processedRows = (dr.rows && dr.rows.length > 0) ? dr.rows.map(row => {
               const metricName = String(row[0] || '').toLowerCase();
               const value = row[1];
@@ -6639,7 +6786,6 @@ function applyAnalyticsHighlight_(sheet, entry) {
     Logger.log('applyAnalyticsHighlight_ error: ' + e.toString());
   }
 }
-
 function analyticsGetHeaderIndex_(headers, variants) {
   if (!headers || !headers.length) return -1;
   const normalized = headers.map(h => String(h || '').trim().toLowerCase());
@@ -6777,6 +6923,7 @@ function createPeakHoursAnalysis_(sheet, startRow, startDate, endDate, styleRegi
     const headers = sessionsSheet.getRange(1, 1, 1, dataRange.getNumColumns()).getValues()[0];
     const allData = filterOutExcludedTechnicians_(headers, allDataRaw);
     const startIdx = analyticsGetHeaderIndex_(headers, ['start_time', 'start time', 'Start Time']);
+    const techIdx = analyticsGetHeaderIndex_(headers, ['technician name', 'technician_name', 'technician', 'tech']);
     if (startIdx < 0) {
       Logger.log('createPeakHoursAnalysis_: start_time header not found');
       return startRow;
@@ -6870,6 +7017,167 @@ function createPeakHoursAnalysis_(sheet, startRow, startDate, endDate, styleRegi
   } catch (e) {
     Logger.log('createPeakHoursAnalysis_ error: ' + e.toString());
     return startRow + 50;
+  }
+}
+// 2. Technician Effectiveness Comparison
+function createTechnicianEffectiveness_(sheet, startRow, startDate, endDate, styleRegistry) {
+  try {
+    styleRegistry = styleRegistry || [];
+    const ss = SpreadsheetApp.getActive();
+    const sessionsSheet = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
+    if (!sessionsSheet) return startRow;
+
+    const dataRange = sessionsSheet.getDataRange();
+    if (dataRange.getNumRows() <= 1) return startRow;
+
+    const allDataRaw = sessionsSheet.getRange(2, 1, dataRange.getNumRows() - 1, dataRange.getNumColumns()).getValues();
+    const headers = sessionsSheet.getRange(1, 1, 1, dataRange.getNumColumns()).getValues()[0];
+    const allData = filterOutExcludedTechnicians_(headers, allDataRaw);
+
+    const startIdx = analyticsGetHeaderIndex_(headers, ['start_time', 'start time', 'Start Time']);
+    const techIdx = analyticsGetHeaderIndex_(headers, ['technician name', 'technician_name', 'technician', 'tech']);
+    const durationIdx = analyticsGetHeaderIndex_(headers, ['total time', 'total_time', 'duration_total_seconds', 'duration seconds']);
+    const pickupIdx = analyticsGetHeaderIndex_(headers, ['waiting time', 'waiting_time', 'pickup_seconds', 'pickup seconds']);
+    const workIdx = analyticsGetHeaderIndex_(headers, ['work time', 'work_time', 'duration_work_seconds', 'work seconds']);
+    const activeIdx = analyticsGetHeaderIndex_(headers, ['active time', 'active_time', 'duration_active_seconds', 'active seconds']);
+
+    if (startIdx < 0 || techIdx < 0) {
+      Logger.log('createTechnicianEffectiveness_: required headers missing (start or technician)');
+      return startRow;
+    }
+
+    const startMillis = startDate.getTime();
+    const endMillis = endDate.getTime();
+    const filtered = allData.filter(row => {
+      if (!row || !row[startIdx]) return false;
+      try {
+        const rowObj = row[startIdx] instanceof Date ? row[startIdx] : new Date(row[startIdx]);
+        if (!(rowObj instanceof Date) || isNaN(rowObj)) return false;
+        const rowMillis = rowObj.getTime();
+        if (rowMillis < startMillis || rowMillis > endMillis) return false;
+        if (techIdx >= 0 && isExcludedTechnician_(row[techIdx])) return false;
+        return true;
+      } catch (e) {
+        return false;
+      }
+    });
+
+    if (!filtered.length) return startRow;
+
+    const techStats = {};
+    const ensureEntry = (name) => {
+      if (!techStats[name]) {
+        techStats[name] = {
+          sessions: 0,
+          totalDuration: 0,
+          durationCount: 0,
+          totalPickup: 0,
+          pickupCount: 0,
+          slaHits: 0,
+          workSeconds: 0,
+          activeSeconds: 0
+        };
+      }
+      return techStats[name];
+    };
+
+    filtered.forEach(row => {
+      const tech = row[techIdx] || 'Unknown';
+      const stats = ensureEntry(tech);
+      stats.sessions++;
+
+      if (durationIdx >= 0 && row[durationIdx]) {
+        const dur = parseDurationSeconds_(row[durationIdx]);
+        if (!isNaN(dur) && dur > 0) {
+          stats.totalDuration += dur;
+          stats.durationCount++;
+        }
+      }
+      if (pickupIdx >= 0 && row[pickupIdx]) {
+        const pickup = parseDurationSeconds_(row[pickupIdx]);
+        if (!isNaN(pickup) && pickup > 0) {
+          stats.totalPickup += pickup;
+          stats.pickupCount++;
+          if (pickup <= 60) stats.slaHits++;
+        }
+      }
+      if (workIdx >= 0 && row[workIdx]) {
+        const work = parseDurationSeconds_(row[workIdx]);
+        if (!isNaN(work) && work > 0) {
+          stats.workSeconds += work;
+        }
+      }
+      if (activeIdx >= 0 && row[activeIdx]) {
+        const active = parseDurationSeconds_(row[activeIdx]);
+        if (!isNaN(active) && active > 0) {
+          stats.activeSeconds += active;
+        }
+      }
+    });
+
+    const effectivenessRows = Object.keys(techStats)
+      .map(name => {
+        const stats = techStats[name];
+        const avgDuration = stats.durationCount > 0 ? stats.totalDuration / stats.durationCount : 0;
+        const avgPickup = stats.pickupCount > 0 ? stats.totalPickup / stats.pickupCount : 0;
+        const workHours = stats.workSeconds / 3600;
+        const activeHours = stats.activeSeconds / 3600;
+        const sessionsPerHour = stats.workSeconds > 0 ? (stats.sessions / (stats.workSeconds / 3600)) : 0;
+        const slaPct = stats.pickupCount > 0 ? (stats.slaHits / stats.pickupCount) : 0;
+        return {
+          name,
+          sessions: stats.sessions,
+          avgDuration,
+          avgPickup,
+          workHours,
+          activeHours,
+          sessionsPerHour,
+          slaPct
+        };
+      })
+      .sort((a, b) => b.sessions - a.sessions || a.name.localeCompare(b.name))
+      .slice(0, 20) // cap to top 20 to keep section compact
+      .map(entry => [
+        entry.name,
+        entry.sessions,
+        entry.avgDuration / 86400,
+        entry.avgPickup / 86400,
+        entry.workHours,
+        entry.activeHours,
+        entry.sessionsPerHour,
+        entry.slaPct
+      ]);
+
+    const sectionTitleRow = startRow;
+    const headerRow = startRow + 1;
+    const dataStartRow = headerRow + 1;
+
+    styleAnalyticsSectionHeader_(sheet, sectionTitleRow, 8);
+    sheet.getRange(sectionTitleRow, 1).setValue('Technician Effectiveness Comparison');
+
+    const headersRowValues = [['Technician', 'Sessions', 'Avg Duration', 'Avg Pickup', 'Work Hours', 'Active Hours', 'Sessions / Hour', 'SLA %']];
+    sheet.getRange(headerRow, 1, 1, headersRowValues[0].length).setValues(headersRowValues);
+
+    if (effectivenessRows.length) {
+      sheet.getRange(dataStartRow, 1, effectivenessRows.length, headersRowValues[0].length).setValues(effectivenessRows);
+      registerAnalyticsTable_(styleRegistry, headerRow, 1, headersRowValues[0].length, effectivenessRows.length);
+
+      try {
+        sheet.getRange(dataStartRow, 2, effectivenessRows.length, 1).setNumberFormat('0'); // Sessions
+        sheet.getRange(dataStartRow, 3, effectivenessRows.length, 2).setNumberFormat('hh:mm:ss'); // Avg duration/pickup
+        sheet.getRange(dataStartRow, 5, effectivenessRows.length, 2).setNumberFormat('0.0'); // Work/Active hours
+        sheet.getRange(dataStartRow, 7, effectivenessRows.length, 1).setNumberFormat('0.0'); // Sessions / Hour
+        sheet.getRange(dataStartRow, 8, effectivenessRows.length, 1).setNumberFormat('0.0%'); // SLA %
+      } catch (e) { /* non-fatal */ }
+    } else {
+      sheet.getRange(dataStartRow, 1).setValue('No technician session data for the selected range.')
+        .setFontColor(ANALYTICS_THEME.muted);
+    }
+
+    return dataStartRow + Math.max(effectivenessRows.length, 1) + 2;
+  } catch (e) {
+    Logger.log('createTechnicianEffectiveness_ error: ' + e.toString());
+    return startRow + 10;
   }
 }
 // Styling helper for Advanced_Analytics to improve readability without changing data
