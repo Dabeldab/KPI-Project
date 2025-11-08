@@ -3739,7 +3739,7 @@ function ingestTimeRangeToSheets_(startTimestamp, endTimestamp, cfg, clearExisti
         const extensionMeta = getActiveExtensionMetadata_();
       const digiumDataset = getDigiumDataset_(pullStartDate, pullEndDate, extensionMeta);
       createDailySummarySheet_(ss, pullStartDate, pullEndDate, digiumDataset, extensionMeta);
-      createSupportDataSheet_(ss, pullStartDate, pullEndDate, digiumDataset, extensionMeta);
+      createSupportDataSheet_(ss, pullStartDate, pullEndDate, digiumDataset, extensionMeta, perfMap);
       refreshAdvancedAnalyticsDashboard_(pullStartDate, pullEndDate, digiumDataset, extensionMeta);
       
       // Generate/refresh personal dashboards (reuse Digium dataset)
@@ -4125,16 +4125,22 @@ function fetchPerformanceSummaryData_(cfg, startDate, endDate) {
   // Only use node 5648341 - filter out failed nodes
   let nodes = [];
   if (Array.isArray(cfg.nodes) && cfg.nodes.length) {
-    nodes = cfg.nodes.map(n => Number(n)).filter(n => Number.isFinite(n));
+    nodes = cfg.nodes
+      .map(n => Number(n))
+      .filter(n => Number.isFinite(n) && n >= 0);
   }
   if (!nodes.length) {
-    nodes = NODE_CANDIDATES_DEFAULT.slice();
+    nodes = NODE_CANDIDATES_DEFAULT.filter(n => Number.isFinite(n) && n >= 0);
   }
   if (!nodes.length) {
-    Logger.log('fetchPerformanceSummaryData_: No nodes configured; defaulting to 5648341');
+    Logger.log('fetchPerformanceSummaryData_: No valid nodes configured; defaulting to 5648341');
     nodes = [5648341];
   }
-  const noderefSet = new Set(getSummaryNoderefs_().map(n => String(n || '').toUpperCase()));
+  const noderefSet = new Set(
+    getSummaryNoderefs_()
+      .map(n => String(n || '').toUpperCase())
+      .filter(Boolean)
+  );
   const noderefs = Array.from(noderefSet.size ? noderefSet : ['CHANNEL']);
   Logger.log(`fetchPerformanceSummaryData_: Using nodes ${nodes.join(', ')}, noderefs: ${noderefs.join(', ')}`);
     
@@ -4364,6 +4370,11 @@ function fetchPerformanceSummaryData_(cfg, startDate, endDate) {
     } catch (e) {
       Logger.log('Warning: Failed to dump performance summary raw data: ' + e.toString());
     }
+    try {
+      writePerformanceSummarySheet_(startDate, endDate, performanceData);
+    } catch (e) {
+      Logger.log('Warning: Failed to write performance summary sheet: ' + e.toString());
+    }
     
     Logger.log(`fetchPerformanceSummaryData_: Found performance data for ${Object.keys(performanceData).length} technicians, ${allRawRows.length} total raw rows`);
   } catch (e) {
@@ -4521,6 +4532,83 @@ function dumpPerformanceSummaryRaw_(startDate, endDate, allRawRows, allHeaders) 
     
   } catch (e) {
     Logger.log('dumpPerformanceSummaryRaw_ error: ' + e.toString());
+  }
+}
+
+function writePerformanceSummarySheet_(startDate, endDate, performanceData) {
+  try {
+    const ss = SpreadsheetApp.getActive();
+    if (!ss) return;
+    let sheet = ss.getSheetByName('Performance_Summary');
+    if (!sheet) {
+      sheet = ss.insertSheet('Performance_Summary');
+    }
+    sheet.clear();
+
+    sheet.getRange(1, 1).setValue('LogMeIn Performance Summary');
+    sheet.getRange(1, 1).setFontSize(16).setFontWeight('bold');
+
+    sheet.getRange(2, 1).setValue(`Date Range: ${isoDate_(startDate)} to ${isoDate_(endDate)}`);
+    sheet.getRange(3, 1).setValue(`Last Updated: ${new Date().toLocaleString()}`);
+    sheet.getRange(2, 1, 2, 1).setFontSize(10).setFontColor('#666666');
+
+    const headers = [
+      'Technician',
+      'Total Sessions',
+      'Sessions per Hour',
+      'Avg Pickup Time',
+      'Avg Session Duration',
+      'Avg Work Time',
+      'Total Login Time',
+      'Total Active Time',
+      'Total Work Time'
+    ];
+    sheet.getRange(5, 1, 1, headers.length).setValues([headers]);
+    sheet.getRange(5, 1, 1, headers.length)
+      .setFontWeight('bold')
+      .setBackground('#1E3A8A')
+      .setFontColor('#FFFFFF');
+
+    const rows = [];
+    Object.keys(performanceData || {}).sort().forEach(name => {
+      const perf = performanceData[name];
+      if (!perf) return;
+      const avgWorkSeconds = perf.count > 0 ? (perf.totalWorkTime || 0) / perf.count : 0;
+      rows.push([
+        name,
+        perf.totalSessions || 0,
+        perf.sessionsPerHour || 0,
+        (perf.avgPickup || 0) / 86400,
+        (perf.avgDuration || 0) / 86400,
+        avgWorkSeconds / 86400,
+        (perf.totalLoginTime || 0) / 86400,
+        (perf.totalActiveTime || 0) / 86400,
+        (perf.totalWorkTime || 0) / 86400
+      ]);
+    });
+
+    if (rows.length) {
+      sheet.getRange(6, 1, rows.length, headers.length).setValues(rows);
+      try {
+        sheet.getRange(6, 2, rows.length, 1).setNumberFormat('0');
+        sheet.getRange(6, 3, rows.length, 1).setNumberFormat('0.0');
+        sheet.getRange(6, 4, rows.length, headers.length - 3).setNumberFormat('hh:mm:ss');
+      } catch (e) { /* ignore */ }
+      try {
+        const banding = sheet.getRange(5, 1, rows.length + 1, headers.length)
+          .applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY);
+        banding.setHeaderRowColor('#1E3A8A')
+               .setFirstRowColor('#F5F7FB')
+               .setSecondRowColor('#FFFFFF')
+               .setFooterRowColor(null);
+      } catch (e) { /* ignore */ }
+    } else {
+      sheet.getRange(6, 1).setValue('No performance data available for the selected range.');
+      sheet.getRange(6, 1).setFontColor('#757575').setFontStyle('italic');
+    }
+    try { sheet.autoResizeColumns(1, headers.length); } catch (e) { /* ignore */ }
+  } catch (err) {
+    Logger.log('writePerformanceSummarySheet_ error: ' + err.toString());
   }
 }
 
@@ -4994,6 +5082,8 @@ function createDailySummarySheet_(ss, startDate, endDate, digiumDatasetOpt, exte
     
     const extensionMeta = extensionMetaOpt || getActiveExtensionMetadata_();
     const digiumDataset = digiumDatasetOpt || getDigiumDataset_(startDate, endDate, extensionMeta);
+    const cfgLocal = getCfg_();
+    const performanceData = performanceDataOpt || getPerfSummaryCached_(cfgLocal, startDate, endDate) || {};
     const digByAccount = digiumDataset && digiumDataset.byAccount && digiumDataset.byAccount.ok ? digiumDataset.byAccount : null;
     const digByDay = digiumDataset && digiumDataset.byDay && digiumDataset.byDay.ok ? digiumDataset.byDay : null;
     const callMetricsByCanonicalGlobal = (digiumDataset && digiumDataset.callMetricsByCanonical) ? digiumDataset.callMetricsByCanonical : {};
@@ -5458,7 +5548,7 @@ function createDailySummarySheet_(ss, startDate, endDate, digiumDatasetOpt, exte
     Logger.log('createDailySummarySheet_ error: ' + e.toString());
   }
 }
-function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, extensionMetaOpt) {
+function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, extensionMetaOpt, performanceDataOpt) {
   try {
     const sessionsSheet = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
     if (!sessionsSheet) return;
@@ -5470,11 +5560,13 @@ function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, exten
     try { supportSheet.getBandings().forEach(b => b.remove()); } catch (e) { Logger.log('Support_Data: failed to remove existing banding: ' + e.toString()); }
     try { supportSheet.setConditionalFormatRules([]); } catch (e) { Logger.log('Support_Data: failed to clear conditional formats: ' + e.toString()); }
     
+    const cfgLocal = getCfg_();
     const extensionMeta = extensionMetaOpt || getActiveExtensionMetadata_();
     const digiumDataset = digiumDatasetOpt || getDigiumDataset_(startDate, endDate, extensionMeta);
     const digByAccount = digiumDataset && digiumDataset.byAccount && digiumDataset.byAccount.ok ? digiumDataset.byAccount : null;
     const digByDay = digiumDataset && digiumDataset.byDay && digiumDataset.byDay.ok ? digiumDataset.byDay : null;
     const callMetricsByCanonicalGlobal = (digiumDataset && digiumDataset.callMetricsByCanonical) ? digiumDataset.callMetricsByCanonical : {};
+    const performanceData = performanceDataOpt || getPerfSummaryCached_(cfgLocal, startDate, endDate) || {};
 
     // Get all data from Sessions
     const dataRange = sessionsSheet.getDataRange();
@@ -5971,6 +6063,8 @@ function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, exten
       avgPickupRow.push(0);
     }
 
+    const dayCount = Math.max(1, dates.length);
+
     const normalizeDateKey = (value) => {
       const str = String(value || '').trim();
       if (!str) return '';
@@ -6038,6 +6132,47 @@ function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, exten
     });
 
     const summaryMetricRows = [totalSessionsRow, totalWorkRow, avgSessionRow, avgPickupRow];
+
+    const performanceValues = Object.values(performanceData || {});
+    if (performanceValues.length) {
+      let totalRescueSessions = 0;
+      let totalRescueLoginSeconds = 0;
+      let totalRescueActiveSeconds = 0;
+      let totalRescueWorkSeconds = 0;
+      performanceValues.forEach(perf => {
+        if (!perf) return;
+        totalRescueSessions += Number(perf.totalSessions || 0);
+        totalRescueLoginSeconds += Number(perf.totalLoginTime || 0);
+        totalRescueActiveSeconds += Number(perf.totalActiveTime || 0);
+        totalRescueWorkSeconds += Number(perf.totalWorkTime || 0);
+      });
+      const buildRescueRow = (label, totalValue, opts) => {
+        const options = opts || {};
+        const row = [label];
+        const perDay = totalValue / dayCount;
+        if (options.asDuration) {
+          dates.forEach(() => row.push(perDay / 86400));
+          row.push(totalValue / 86400);
+        } else {
+          dates.forEach(() => row.push(perDay));
+          row.push(totalValue);
+        }
+        return row;
+      };
+      if (totalRescueSessions > 0) {
+        summaryMetricRows.push(buildRescueRow('Total Sessions (Rescue Summary)', totalRescueSessions));
+      }
+      if (totalRescueLoginSeconds > 0) {
+        summaryMetricRows.push(buildRescueRow('Total Login Time (Rescue Summary)', totalRescueLoginSeconds, { asDuration: true }));
+      }
+      if (totalRescueActiveSeconds > 0) {
+        summaryMetricRows.push(buildRescueRow('Total Active Time (Rescue Summary)', totalRescueActiveSeconds, { asDuration: true }));
+      }
+      if (totalRescueWorkSeconds > 0) {
+        summaryMetricRows.push(buildRescueRow('Total Work Time (Rescue Summary)', totalRescueWorkSeconds, { asDuration: true }));
+      }
+    }
+
     const hasCallData = (totalCalls || totalIncomingCalls || totalOutgoingCalls || totalTalkingSeconds || totalCallSeconds);
     if (hasCallData) {
       const buildCallRow = (label, extractor, opts) => {
