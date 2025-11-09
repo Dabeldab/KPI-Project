@@ -1,0 +1,15 @@
+{
+  "name": "devops-dashboard",
+  "version": "1.0.0",
+  "description": "DevOps Live Dashboard - LogMeIn Rescue & Digium Switchvox Monitor",
+  "scripts": {
+    "start": "./start.sh",
+    "backend": "cd backend && npm run dev",
+    "frontend": "cd frontend && npm run dev",
+    "install-all": "./install.sh",
+    "install": "./install.sh"
+  },
+  "keywords": ["devops", "dashboard", "monitoring", "logmein", "digium", "switchvox"],
+  "author": "",
+  "license": "MIT"
+}
