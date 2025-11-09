@@ -16,7 +16,45 @@
 https://secure.logmeinrescue.com/API
 ```
 
+### Authentication Method
+
+**✅ NEW: Session-Based Authentication (Recommended)**
+
+The dashboard now implements the official LogMeIn Rescue API login method:
+
+1. **Login**: `POST /API/login?userName=USERNAME&password=PASSWORD`
+2. **Session Token**: Receive session cookie/token
+3. **API Calls**: Use session token for subsequent requests
+4. **Auto-Refresh**: Session automatically renewed when expired
+
+**Legacy: Basic Authentication (Fallback)**
+
+Basic authentication is still supported as fallback if login endpoint fails.
+
 ### Endpoints Used
+
+#### 0. login (NEW)
+**Purpose**: Authenticate and obtain session token
+
+**Documentation**: https://secure.logmeinrescue.com/welcome/webhelp/EN/RescueAPI/API/API_Rescue_login.html
+
+**Request**:
+```
+POST /API/login?userName=your_username&password=your_password
+```
+
+**Response** (expected):
+```
+Status: 200 OK
+Set-Cookie: [session cookie]
+
+{
+  "token": "session_token_here",
+  "sessionId": "session_id_here"
+}
+```
+
+**Backend Implementation**: The server automatically handles login and session management. You don't need to call this manually.
 
 #### 1. isAnyTechAvailableOnChannel
 **Purpose**: Check if any technicians are available
@@ -24,7 +62,7 @@ https://secure.logmeinrescue.com/API
 **Request**:
 ```
 GET /API/isAnyTechAvailableOnChannel
-Authorization: Basic <base64(username:password)>
+Cookie: [session cookie from login]
 ```
 
 **Response** (expected):
@@ -42,7 +80,7 @@ Authorization: Basic <base64(username:password)>
 **Request**:
 ```
 GET /API/getSession_v2
-Authorization: Basic <base64(username:password)>
+Cookie: [session cookie from login]
 ```
 
 **Response** (expected):
@@ -60,10 +98,28 @@ Authorization: Basic <base64(username:password)>
 
 ### Testing Your LogMeIn Credentials
 
+**Method 1: Use the Test Script (Recommended)**
 ```bash
-# Replace with your actual credentials
-curl -u "your_username:your_password" \
-  https://secure.logmeinrescue.com/API/isAnyTechAvailableOnChannel
+cd /home/runner/work/KPI-Project/KPI-Project/dashboard/backend
+npm run test-creds
+```
+
+**Method 2: Test Login Directly**
+```bash
+# Test the new login endpoint
+curl -X POST "https://secure.logmeinrescue.com/API/login?userName=your_username&password=your_password"
+```
+
+**Method 3: Test via Backend API**
+```bash
+# Start the backend server first
+cd dashboard/backend && npm run dev
+
+# In another terminal, test the login endpoint
+curl -X POST http://localhost:3001/api/rescue/login
+
+# Test tech availability
+curl http://localhost:3001/api/rescue/tech-available
 ```
 
 ---
