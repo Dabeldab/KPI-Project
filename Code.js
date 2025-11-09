@@ -1,4 +1,3 @@
-
 // Cache Performance SUMMARY results for a short period to avoid redundant API calls
 function getPerfSummaryCached_(cfg, startDate, endDate) {
   try {
@@ -8,12 +7,12 @@ function getPerfSummaryCached_(cfg, startDate, endDate) {
     if (cached) {
       try { return JSON.parse(cached); } catch (e) {}
     }
-    const map = fetchPerformanceSummaryData_(cfg, startDate, endDate) || {};
-    try { cache.put(key, JSON.stringify(map), 300); } catch (e) {}
-    return map;
+    const empty = {};
+    try { cache.put(key, JSON.stringify(empty), 300); } catch (e) {}
+    return empty;
   } catch (e) {
     Logger.log('getPerfSummaryCached_ error: ' + e.toString());
-    return fetchPerformanceSummaryData_(cfg, startDate, endDate) || {};
+    return {};
   }
 }
 /************************************************************
@@ -349,7 +348,6 @@ function fetchDigiumCallSummary_(startDate, endDate) {
   // For now, return the raw XML so we can iterate on parsing once we confirm method/response shape.
   return { ok: true, xml: r.xml, raw: r.raw };
 }
-
 // Send a Digium-style <request method="..."> XML envelope. Returns {ok, raw, xml (XmlService.Document)}
 function digiumApiCall_(methodName, parametersXmlString, user, pass, host) {
   try {
@@ -430,10 +428,23 @@ function normalizeTechnicianNameFull_(name) {
 }
 
 function canonicalTechnicianName_(name) {
+  if (!name) return '';
   const normalized = normalizeTechnicianNameFull_(name);
   if (!normalized) return '';
-  if (normalized === 'eddie' || normalized === 'eddie talal') return 'ahmed talal';
+  switch (normalized) {
+    case 'eddie talal':
+      return 'ahmed talal';
+    default:
   return normalized;
+  }
+}
+
+function canonicalTechnicianKey_(name) {
+  const canonical = canonicalTechnicianName_(name);
+  if (canonical) return canonical;
+  const normalized = normalizeTechnicianNameFull_(name);
+  if (normalized) return normalized;
+  return String(name || '').trim().toLowerCase();
 }
 
 function technicianFirstNameKey_(name) {
@@ -631,7 +642,6 @@ function collectSalesforceTicketMetrics_(startDate, endDate) {
   }
   return result;
 }
-
 function createResolutionDistribution_(sheet, startRow, startDate, endDate, styleRegistry) {
   try {
     styleRegistry = styleRegistry || [];
@@ -652,7 +662,6 @@ function createResolutionDistribution_(sheet, startRow, startDate, endDate, styl
     return startRow + 5;
   }
 }
-
 function createCapacityIndicators_(sheet, startRow, styleRegistry) {
   try {
     styleRegistry = styleRegistry || [];
@@ -1297,7 +1306,6 @@ function fetchDigiumCallReports_(startDate, endDate, options) {
     return { ok: false, error: 'parse_failed: ' + e.toString(), raw: r.raw };
   }
 }
-
 // Resolve Switchvox account_ids from a list of extension numbers
 // Returns array of account_id strings. Falls back to returning the input list if lookup fails.
 var EXTENSION_ACCOUNT_ID_MAP_CACHE = (typeof EXTENSION_ACCOUNT_ID_MAP_CACHE !== 'undefined' && EXTENSION_ACCOUNT_ID_MAP_CACHE) || {};
@@ -1446,12 +1454,12 @@ function resolveDigiumAccountIdsDetailed_(extensions) {
     };
 
       const root = r.xml.getRootElement();
-    const result = root.getChild('result') || root;
-    const collect = (el) => {
+      const result = root.getChild('result') || root;
+      const collect = (el) => {
       const children = el.getChildren ? el.getChildren() : [];
       children.forEach(child => {
         const name = String(child.getName() || '').toLowerCase();
-        if (name === 'row' || name === 'extension' || name === 'account') {
+          if (name === 'row' || name === 'extension' || name === 'account') {
           const accountAttr =
             (child.getAttribute && child.getAttribute('account_id') && child.getAttribute('account_id').getValue()) ||
             (child.getAttribute && child.getAttribute('user_id') && child.getAttribute('user_id').getValue()) ||
@@ -1463,9 +1471,9 @@ function resolveDigiumAccountIdsDetailed_(extensions) {
           addMapping(extAttr || '', accountAttr || '');
         }
         collect(child);
-      });
-    };
-    collect(result);
+        });
+      };
+      collect(result);
 
     idsForLookup.forEach(ext => {
       const key = String(ext || '').trim();
@@ -1485,7 +1493,7 @@ function resolveDigiumAccountIdsDetailed_(extensions) {
     });
     details.list = Array.from(manualAccountSet.size ? manualAccountSet : accountSet);
     return finalizeDetails();
-  } catch (e) {
+    } catch (e) {
     Logger.log('resolveDigiumAccountIdsDetailed_ error: ' + e.toString());
     const fallbackList = Array.isArray(extensions) ? extensions : [String(extensions)];
     details.list = fallbackList.map(ext => String(ext || '').trim()).filter(Boolean);
@@ -1557,7 +1565,6 @@ function aggregateDigiumCallsForExtensions_(startDate, endDate, breakdown, exten
   }
   return cloned;
 }
-
 function computeDigiumTotalsFromRows_(rows) {
   const totals = {
     total_calls: 0,
@@ -1653,13 +1660,13 @@ function fetchDigiumDataset_(startDate, endDate, extensionMetaOpt) {
   }
 
   dataset.callMetricsByCanonical = buildCallMetricsByCanonical_(dataset.byAccount, extensionMeta);
+  dataset.callDailyPerCanonical = buildCallDailyPerCanonical_(startDate, endDate, extensionMeta);
   dataset.byDay = aggregateDigiumCallsByDateForExtensions_(startDate, endDate, activeExtensions);
   dataset.byHour = aggregateDigiumCallsByHourForExtensions_(startDate, endDate, activeExtensions);
   dataset.byDow = aggregateDigiumCallsByDayOfWeekForExtensions_(startDate, endDate, activeExtensions);
   dataset.generatedAt = new Date();
   return dataset;
 }
-
 function buildCallMetricsByCanonical_(digTotals, extensionMeta) {
   const perExtension = digTotals && digTotals.perExtension && typeof digTotals.perExtension === 'object'
     ? digTotals.perExtension
@@ -1746,6 +1753,125 @@ function buildCallMetricsByCanonical_(digTotals, extensionMeta) {
   Object.keys(result).forEach(key => {
     const bucket = result[key];
     bucket.extensions = Array.from(bucket.extensions || []);
+  });
+
+  return result;
+}
+
+function buildCallDailyPerCanonical_(startDate, endDate, extensionMeta) {
+  const result = {};
+  const extToName = extensionMeta && extensionMeta.extToName ? extensionMeta.extToName : {};
+  const extensions = Object.keys(extToName || {});
+  if (!extensions.length) return result;
+
+  const normalizeDateKey = (value) => {
+    const str = String(value || '').trim();
+    if (!str) return '';
+    if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
+    const mmdd = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (mmdd) {
+      return `${mmdd[3]}-${('0' + mmdd[1]).slice(-2)}-${('0' + mmdd[2]).slice(-2)}`;
+    }
+    const parsed = new Date(str);
+    if (!isNaN(parsed.getTime())) {
+      return parsed.toISOString().split('T')[0];
+    }
+    return '';
+  };
+
+  extensions.forEach(ext => {
+    const rawName = extToName[ext];
+    if (!rawName) return;
+    const canonical = canonicalTechnicianName_(rawName);
+    if (!canonical) return;
+
+    const res = aggregateDigiumCallsForExtensions_(startDate, endDate, 'by_day', [ext]);
+    if (!res || !res.ok || !res.rows || !res.rows.length) return;
+
+    const rawDates = (res.dates && res.dates.length ? res.dates : (res.categories || [])) || [];
+    if (!rawDates.length) return;
+
+    const normalizedDates = rawDates.map(normalizeDateKey).filter(Boolean);
+    if (!normalizedDates.length) return;
+
+    const perDay = {};
+    normalizedDates.forEach(dateKey => {
+      perDay[dateKey] = {
+        totalCalls: 0,
+        inbound: 0,
+        outbound: 0,
+        talkSeconds: 0,
+        callSeconds: 0
+      };
+    });
+
+    res.rows.forEach(row => {
+      if (!row || row.length < 2) return;
+      const label = String(row[0] || '').toLowerCase();
+      for (let i = 1; i < row.length && i <= normalizedDates.length; i++) {
+        const dateKey = normalizedDates[i - 1];
+        if (!dateKey || !perDay[dateKey]) continue;
+        const rawVal = row[i] != null ? Number(row[i]) : 0;
+        const value = isNaN(rawVal) ? 0 : rawVal;
+        if (label.includes('total calls') && !label.includes('incoming') && !label.includes('outgoing')) {
+          perDay[dateKey].totalCalls += value;
+        } else if (label.includes('incoming')) {
+          perDay[dateKey].inbound += value;
+        } else if (label.includes('outgoing')) {
+          perDay[dateKey].outbound += value;
+        } else if (label.includes('talk')) {
+          perDay[dateKey].talkSeconds += value;
+        } else if (label.includes('call duration')) {
+          perDay[dateKey].callSeconds += value;
+        }
+      }
+    });
+
+    const accumulator = result[canonical] || {
+      perDay: {},
+      totals: {
+        totalCalls: 0,
+        inbound: 0,
+        outbound: 0,
+        talkSeconds: 0,
+        callSeconds: 0
+      },
+      dates: []
+    };
+
+    normalizedDates.forEach(dateKey => {
+      const dayMetrics = perDay[dateKey] || {
+        totalCalls: 0,
+        inbound: 0,
+        outbound: 0,
+        talkSeconds: 0,
+        callSeconds: 0
+      };
+      if (!accumulator.perDay[dateKey]) {
+        accumulator.perDay[dateKey] = {
+          totalCalls: 0,
+          inbound: 0,
+          outbound: 0,
+          talkSeconds: 0,
+          callSeconds: 0
+        };
+      }
+      const accDay = accumulator.perDay[dateKey];
+      accDay.totalCalls += dayMetrics.totalCalls;
+      accDay.inbound += dayMetrics.inbound;
+      accDay.outbound += dayMetrics.outbound;
+      accDay.talkSeconds += dayMetrics.talkSeconds;
+      accDay.callSeconds += dayMetrics.callSeconds;
+
+      accumulator.totals.totalCalls += dayMetrics.totalCalls;
+      accumulator.totals.inbound += dayMetrics.inbound;
+      accumulator.totals.outbound += dayMetrics.outbound;
+      accumulator.totals.talkSeconds += dayMetrics.talkSeconds;
+      accumulator.totals.callSeconds += dayMetrics.callSeconds;
+    });
+
+    accumulator.dates = Array.from(new Set([...(accumulator.dates || []), ...normalizedDates])).sort();
+    result[canonical] = accumulator;
   });
 
   return result;
@@ -2008,7 +2134,6 @@ function createDigiumCallsSheet_(datasetOrByDate, byAccountDataOpt, extensionMet
 
     writeTable(header, rows, isDurationMetric);
   }
-
   try { sh.setFrozenRows(2); } catch (e) {}
   try { sh.autoResizeColumns(1, Math.max(1, sh.getLastColumn())); } catch (e) {}
   return sh;
@@ -2191,7 +2316,6 @@ function initializeExtensionMapSheet_() {
     Logger.log('initializeExtensionMapSheet_ failed: ' + e.toString());
   }
 }
-
 // Read extension_map sheet and return { technician_name_lower: [ext1, ext2, ...] }
 function getExtensionMap_() {
   const out = {};
@@ -2272,14 +2396,14 @@ function getExtensionMap_() {
           acctList = overrides.map(id => String(id || '').trim()).filter(Boolean);
         }
         addMappingForKey(nameNorm.full, ext, acctList);
-        if (nameNorm.first && nameNorm.first !== nameNorm.full) {
+            if (nameNorm.first && nameNorm.first !== nameNorm.full) {
           addMappingForKey(nameNorm.first, ext, acctList);
-        }
-        if (nameNorm.full === 'eddie talal' || nameNorm.full === 'ahmed talal') {
-          const otherName = nameNorm.full === 'eddie talal' ? 'ahmed talal' : 'eddie talal';
+            }
+            if (nameNorm.full === 'eddie talal' || nameNorm.full === 'ahmed talal') {
+              const otherName = nameNorm.full === 'eddie talal' ? 'ahmed talal' : 'eddie talal';
           addMappingForKey(otherName, ext, acctList);
-          Logger.log(`getExtensionMap_: Mapped ${name} -> also mapped to ${otherName} (same person)`);
-        }
+              Logger.log(`getExtensionMap_: Mapped ${name} -> also mapped to ${otherName} (same person)`);
+            }
         Logger.log(`getExtensionMap_: Mapped ${name} -> extension ${ext}${acctList.length ? ' (account_ids: ' + acctList.join(', ') + ')' : ''}`);
       });
     }
@@ -2635,7 +2759,6 @@ function setDelimiter_(base, cookie, delimiter) {
   const t = (r.getContentText()||'').trim();
   if (!/^OK/i.test(t)) throw new Error(`setDelimiter: ${t}`);
 }
-
 // Per Rescue API docs (see API.asmx?op=setOutput), the allowed HTTP GET endpoint is /API/setOutput.aspx
 // with parameter 'output=XML' or 'output=TEXT'. We use GET with the authenticated session cookie.
 // Response format: "OK" or "OK OUTPUT:XML" or "OK OUTPUT:TEXT"
@@ -2689,12 +2812,12 @@ function getReportTry_(base, cookie, nodeId, noderef) {
   const maxAttempts = 4;
   let delayMs = 500;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      const r = apiGet_(base, 'getReport.aspx', { 
-        node: String(nodeId), 
-        noderef: noderef
-      }, cookie, 4, true);
-      const t = (r.getContentText()||'').trim();
+  try {
+    const r = apiGet_(base, 'getReport.aspx', { 
+      node: String(nodeId), 
+      noderef: noderef
+    }, cookie, 4, true);
+    const t = (r.getContentText()||'').trim();
       if (/POLLRATEEXCEEDED/i.test(t)) {
         Logger.log(`getReportTry_ node ${nodeId} (${noderef}): POLLRATEEXCEEDED (attempt ${attempt}/${maxAttempts})`);
         if (attempt < maxAttempts) {
@@ -2704,18 +2827,18 @@ function getReportTry_(base, cookie, nodeId, noderef) {
         }
         return null;
       }
-      // Accept both TEXT (starts with OK) and XML (starts with '<') responses
-      if (/^OK/i.test(t)) {
-        Logger.log(`getReportTry_ node ${nodeId} (${noderef}): TEXT format response (${t.length} chars)`);
-        return t;
-      }
-      if (t && t[0] === '<') {
-        Logger.log(`getReportTry_ node ${nodeId} (${noderef}): XML format response (${t.length} chars)`);
-        return t;
-      }
-      Logger.log(`getReportTry_ node ${nodeId} (${noderef}): Unexpected response format (first 100 chars: ${t.substring(0, 100)})`);
-      return null;
-    } catch (e) {
+    // Accept both TEXT (starts with OK) and XML (starts with '<') responses
+    if (/^OK/i.test(t)) {
+      Logger.log(`getReportTry_ node ${nodeId} (${noderef}): TEXT format response (${t.length} chars)`);
+      return t;
+    }
+    if (t && t[0] === '<') {
+      Logger.log(`getReportTry_ node ${nodeId} (${noderef}): XML format response (${t.length} chars)`);
+      return t;
+    }
+    Logger.log(`getReportTry_ node ${nodeId} (${noderef}): Unexpected response format (first 100 chars: ${t.substring(0, 100)})`);
+    return null;
+  } catch (e) {
       Logger.log(`getReportTry_ failed for node ${nodeId} (${noderef}) attempt ${attempt}/${maxAttempts}: ${e.toString()}`);
       if (attempt >= maxAttempts) return null;
       Utilities.sleep(delayMs);
@@ -3107,6 +3230,214 @@ function parseDurationSeconds_(val) {
   return isNaN(n2) ? 0 : Math.round(n2);
 }
 
+function createEmptyDayStats_() {
+  return {
+    sessions: 0,
+    durationSum: 0,
+    durationCount: 0,
+    pickupSum: 0,
+    pickupCount: 0,
+    workSeconds: 0,
+    activeSeconds: 0,
+    loginSeconds: 0,
+    longestSeconds: 0,
+    novaWave: 0,
+    techSet: new Set()
+  };
+}
+
+function buildTechnicianSessionContext_(rows, indexes, tz) {
+  const {
+    startIdx,
+    techIdx,
+    durationIdx,
+    workIdx,
+    pickupIdx,
+    activeIdx,
+    channelIdx,
+    callingCardIdx
+  } = indexes || {};
+
+  const perCanonical = {};
+  const teamDaily = {};
+  const dateSet = new Set();
+
+  const formatDateKey = (dateObj) => {
+    try {
+      return Utilities.formatDate(dateObj, tz || 'Etc/GMT', 'yyyy-MM-dd');
+    } catch (e) {
+      try {
+        return dateObj.toISOString().split('T')[0];
+      } catch (err) {
+        return '';
+      }
+    }
+  };
+
+  const ensureDay = (container, dateKey) => {
+    if (!container[dateKey]) container[dateKey] = createEmptyDayStats_();
+    return container[dateKey];
+  };
+
+  const titleize = (txt) => {
+    if (!txt) return '';
+    return String(txt).split(/\s+/).map(part => part ? part.charAt(0).toUpperCase() + part.slice(1) : '').join(' ').trim();
+  };
+
+  const ensureCanonicalEntry = (canonical, rawName) => {
+    if (!perCanonical[canonical]) {
+      perCanonical[canonical] = {
+        displayName: '',
+        totals: createEmptyDayStats_(),
+        daily: {}
+      };
+    }
+    if (rawName) {
+      const candidate = String(rawName).trim();
+      if (candidate) {
+        const existing = perCanonical[canonical].displayName;
+        if (!existing || candidate.length > existing.length) {
+          perCanonical[canonical].displayName = candidate;
+        }
+      }
+    }
+    return perCanonical[canonical];
+  };
+
+  const ensureTeamDay = (dateKey) => ensureDay(teamDaily, dateKey);
+
+  const isNovaWaveRow = (row) => {
+    if (!row) return false;
+    if (channelIdx != null && channelIdx >= 0 && row[channelIdx]) {
+      const ch = String(row[channelIdx]).toLowerCase();
+      if (ch.includes('nova wave')) return true;
+    }
+    if (callingCardIdx != null && callingCardIdx >= 0 && row[callingCardIdx]) {
+      const cc = String(row[callingCardIdx]).toLowerCase();
+      if (cc.includes('nova wave')) return true;
+    }
+    return false;
+  };
+
+  const toCanonical = (name) => {
+    if (!name) return 'unknown';
+    return canonicalTechnicianName_(name) || normalizeTechnicianNameFull_(name) || 'unknown';
+  };
+
+  (rows || []).forEach(row => {
+    if (!row) return;
+    if (startIdx == null || startIdx < 0) return;
+    const startValue = row[startIdx];
+    if (!startValue) return;
+    const dateObj = startValue instanceof Date ? startValue : new Date(startValue);
+    if (!(dateObj instanceof Date) || isNaN(dateObj)) return;
+    const dateKey = formatDateKey(dateObj);
+    if (!dateKey) return;
+
+    dateSet.add(dateKey);
+
+    const rawTech = techIdx != null && techIdx >= 0 && row[techIdx]
+      ? String(row[techIdx]).trim()
+      : 'Unknown';
+    const canonical = toCanonical(rawTech);
+    const entry = ensureCanonicalEntry(canonical, rawTech);
+    const dayStats = ensureDay(entry.daily, dateKey);
+    const teamDay = ensureTeamDay(dateKey);
+
+    const techIdentifier = canonical || (rawTech ? rawTech.toLowerCase() : '');
+    if (techIdentifier) {
+      if (!dayStats.techSet) dayStats.techSet = new Set();
+      dayStats.techSet.add(techIdentifier);
+      if (!teamDay.techSet) teamDay.techSet = new Set();
+      teamDay.techSet.add(techIdentifier);
+    }
+
+    entry.totals.sessions++;
+    dayStats.sessions++;
+    teamDay.sessions++;
+
+    const addDuration = (seconds) => {
+      if (!seconds) return;
+      entry.totals.durationSum += seconds;
+      entry.totals.durationCount++;
+      entry.totals.loginSeconds += seconds;
+      if (seconds > entry.totals.longestSeconds) entry.totals.longestSeconds = seconds;
+      dayStats.durationSum += seconds;
+      dayStats.durationCount++;
+      dayStats.loginSeconds += seconds;
+      if (seconds > dayStats.longestSeconds) dayStats.longestSeconds = seconds;
+      teamDay.durationSum += seconds;
+      teamDay.durationCount++;
+      teamDay.loginSeconds += seconds;
+      if (seconds > teamDay.longestSeconds) teamDay.longestSeconds = seconds;
+    };
+
+    const addPickup = (seconds) => {
+      if (!seconds) return;
+      entry.totals.pickupSum += seconds;
+      entry.totals.pickupCount++;
+      dayStats.pickupSum += seconds;
+      dayStats.pickupCount++;
+      teamDay.pickupSum += seconds;
+      teamDay.pickupCount++;
+    };
+
+    if (durationIdx != null && durationIdx >= 0 && row[durationIdx]) {
+      const sec = parseDurationSeconds_(row[durationIdx]);
+      if (sec > 0) addDuration(sec);
+    }
+
+    if (pickupIdx != null && pickupIdx >= 0 && row[pickupIdx]) {
+      const pickSec = parseDurationSeconds_(row[pickupIdx]);
+      if (pickSec > 0) addPickup(pickSec);
+    }
+
+    if (workIdx != null && workIdx >= 0 && row[workIdx]) {
+      const workSec = parseDurationSeconds_(row[workIdx]);
+      if (workSec > 0) {
+        entry.totals.workSeconds += workSec;
+        dayStats.workSeconds += workSec;
+        teamDay.workSeconds += workSec;
+      }
+    }
+
+    if (activeIdx != null && activeIdx >= 0 && row[activeIdx]) {
+      const activeSec = parseDurationSeconds_(row[activeIdx]);
+      if (activeSec > 0) {
+        entry.totals.activeSeconds += activeSec;
+        dayStats.activeSeconds += activeSec;
+        teamDay.activeSeconds += activeSec;
+      }
+    }
+
+    if (isNovaWaveRow(row)) {
+      entry.totals.novaWave++;
+      dayStats.novaWave++;
+      teamDay.novaWave++;
+    }
+  });
+
+  const orderedDates = Array.from(dateSet).sort();
+  orderedDates.forEach(dateKey => {
+    ensureDay(teamDaily, dateKey);
+  });
+
+  Object.keys(perCanonical).forEach(canonical => {
+    const entry = perCanonical[canonical];
+    if (!entry.displayName) {
+      entry.displayName = canonical && canonical !== 'unknown'
+        ? titleize(canonical)
+        : 'Unknown';
+    }
+  });
+
+  return {
+    perCanonical,
+    teamDaily,
+    orderedDates
+  };
+}
+
 /* ===== Sheets Storage ===== */
 function getOrCreateSessionsSheet_(ss) {
   // Just get or create the sheet - don't touch headers, order, or formatting
@@ -3316,7 +3647,6 @@ function writeRowsToSheets_(ss, rawDataChunks, clearExisting = false) {
   if (headerWithCompanyName) {
     Logger.log(`Found column "${headerWithCompanyName}" containing company name - will replace "Nova Point of Sale" with empty values`);
   }
-  
   if (!allHeaders.length) {
     Logger.log('No headers found in raw data chunks');
     return 0;
@@ -3470,7 +3800,6 @@ function pullDateRangeThisWeek() {
     Logger.log('pullDateRangeThisWeek error: ' + e.toString());
   }
 }
-
 function pullDateRangePreviousMonth() {
   try {
     const range = getTimeFrameRange_('Last Month');
@@ -3735,15 +4064,22 @@ function ingestTimeRangeToSheets_(startTimestamp, endTimestamp, cfg, clearExisti
       }
       
       // Auto-refresh dashboard and create summaries with the pulled range
-      const perfMap = getPerfSummaryCached_(cfg, pullStartDate, pullEndDate);
         const extensionMeta = getActiveExtensionMetadata_();
       const digiumDataset = getDigiumDataset_(pullStartDate, pullEndDate, extensionMeta);
-      createDailySummarySheet_(ss, pullStartDate, pullEndDate, digiumDataset, extensionMeta);
-      createSupportDataSheet_(ss, pullStartDate, pullEndDate, digiumDataset, extensionMeta, perfMap);
+      try {
+        const dailySheet = ss.getSheetByName('Daily_Summary');
+        if (dailySheet) {
+          ss.deleteSheet(dailySheet);
+          Logger.log('Removed Daily_Summary sheet (no longer needed).');
+        }
+      } catch (e) {
+        Logger.log('Failed to remove Daily_Summary sheet: ' + e.toString());
+      }
+      createSupportDataSheet_(ss, pullStartDate, pullEndDate, digiumDataset, extensionMeta);
       refreshAdvancedAnalyticsDashboard_(pullStartDate, pullEndDate, digiumDataset, extensionMeta);
       
       // Generate/refresh personal dashboards (reuse Digium dataset)
-      generateTechnicianTabs_(pullStartDate, pullEndDate, perfMap, digiumDataset, extensionMeta);
+      generateTechnicianTabs_(pullStartDate, pullEndDate, digiumDataset, extensionMeta);
       
       // Update Digium_Calls sheet from cached dataset
       createDigiumCallsSheet_(digiumDataset, extensionMeta);
@@ -4326,7 +4662,6 @@ function fetchPerformanceSummaryData_(cfg, startDate, endDate) {
                 }
               }
             }
-            
             // Parse sessions per hour
             let sessionsPerHour = 0;
             if (sessionsPerHourCol != null && sessionsPerHourCol !== '') {
@@ -4369,11 +4704,6 @@ function fetchPerformanceSummaryData_(cfg, startDate, endDate) {
       dumpPerformanceSummaryRaw_(startDate, endDate, allRawRows, allHeaders);
     } catch (e) {
       Logger.log('Warning: Failed to dump performance summary raw data: ' + e.toString());
-    }
-    try {
-      writePerformanceSummarySheet_(startDate, endDate, performanceData);
-    } catch (e) {
-      Logger.log('Warning: Failed to write performance summary sheet: ' + e.toString());
     }
     
     Logger.log(`fetchPerformanceSummaryData_: Found performance data for ${Object.keys(performanceData).length} technicians, ${allRawRows.length} total raw rows`);
@@ -4535,82 +4865,6 @@ function dumpPerformanceSummaryRaw_(startDate, endDate, allRawRows, allHeaders) 
   }
 }
 
-function writePerformanceSummarySheet_(startDate, endDate, performanceData) {
-  try {
-    const ss = SpreadsheetApp.getActive();
-    if (!ss) return;
-    let sheet = ss.getSheetByName('Performance_Summary');
-    if (!sheet) {
-      sheet = ss.insertSheet('Performance_Summary');
-    }
-    sheet.clear();
-
-    sheet.getRange(1, 1).setValue('LogMeIn Performance Summary');
-    sheet.getRange(1, 1).setFontSize(16).setFontWeight('bold');
-
-    sheet.getRange(2, 1).setValue(`Date Range: ${isoDate_(startDate)} to ${isoDate_(endDate)}`);
-    sheet.getRange(3, 1).setValue(`Last Updated: ${new Date().toLocaleString()}`);
-    sheet.getRange(2, 1, 2, 1).setFontSize(10).setFontColor('#666666');
-
-    const headers = [
-      'Technician',
-      'Total Sessions',
-      'Sessions per Hour',
-      'Avg Pickup Time',
-      'Avg Session Duration',
-      'Avg Work Time',
-      'Total Login Time',
-      'Total Active Time',
-      'Total Work Time'
-    ];
-    sheet.getRange(5, 1, 1, headers.length).setValues([headers]);
-    sheet.getRange(5, 1, 1, headers.length)
-      .setFontWeight('bold')
-      .setBackground('#1E3A8A')
-      .setFontColor('#FFFFFF');
-
-    const rows = [];
-    Object.keys(performanceData || {}).sort().forEach(name => {
-      const perf = performanceData[name];
-      if (!perf) return;
-      const avgWorkSeconds = perf.count > 0 ? (perf.totalWorkTime || 0) / perf.count : 0;
-      rows.push([
-        name,
-        perf.totalSessions || 0,
-        perf.sessionsPerHour || 0,
-        (perf.avgPickup || 0) / 86400,
-        (perf.avgDuration || 0) / 86400,
-        avgWorkSeconds / 86400,
-        (perf.totalLoginTime || 0) / 86400,
-        (perf.totalActiveTime || 0) / 86400,
-        (perf.totalWorkTime || 0) / 86400
-      ]);
-    });
-
-    if (rows.length) {
-      sheet.getRange(6, 1, rows.length, headers.length).setValues(rows);
-      try {
-        sheet.getRange(6, 2, rows.length, 1).setNumberFormat('0');
-        sheet.getRange(6, 3, rows.length, 1).setNumberFormat('0.0');
-        sheet.getRange(6, 4, rows.length, headers.length - 3).setNumberFormat('hh:mm:ss');
-      } catch (e) { /* ignore */ }
-      try {
-        const banding = sheet.getRange(5, 1, rows.length + 1, headers.length)
-          .applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY);
-        banding.setHeaderRowColor('#1E3A8A')
-               .setFirstRowColor('#F5F7FB')
-               .setSecondRowColor('#FFFFFF')
-               .setFooterRowColor(null);
-      } catch (e) { /* ignore */ }
-    } else {
-      sheet.getRange(6, 1).setValue('No performance data available for the selected range.');
-      sheet.getRange(6, 1).setFontColor('#757575').setFontStyle('italic');
-    }
-    try { sheet.autoResizeColumns(1, headers.length); } catch (e) { /* ignore */ }
-  } catch (err) {
-    Logger.log('writePerformanceSummarySheet_ error: ' + err.toString());
-  }
-}
 
 /* ===== Digium Map (raw, no formatting) ===== */
 function dumpDigiumMapMenu() {
@@ -5082,12 +5336,15 @@ function createDailySummarySheet_(ss, startDate, endDate, digiumDatasetOpt, exte
     
     const extensionMeta = extensionMetaOpt || getActiveExtensionMetadata_();
     const digiumDataset = digiumDatasetOpt || getDigiumDataset_(startDate, endDate, extensionMeta);
-    const cfgLocal = getCfg_();
-    const performanceData = performanceDataOpt || getPerfSummaryCached_(cfgLocal, startDate, endDate) || {};
-    const digByAccount = digiumDataset && digiumDataset.byAccount && digiumDataset.byAccount.ok ? digiumDataset.byAccount : null;
-    const digByDay = digiumDataset && digiumDataset.byDay && digiumDataset.byDay.ok ? digiumDataset.byDay : null;
     const callMetricsByCanonicalGlobal = (digiumDataset && digiumDataset.callMetricsByCanonical) ? digiumDataset.callMetricsByCanonical : {};
-    const callMetricsByCanonical = callMetricsByCanonicalGlobal || {};
+    const callMetricsByCanonical = {};
+    if (callMetricsByCanonicalGlobal && typeof callMetricsByCanonicalGlobal === 'object') {
+      Object.keys(callMetricsByCanonicalGlobal).forEach(key => {
+        const normalizedKey = canonicalTechnicianName_(key);
+        const targetKey = normalizedKey || key;
+        callMetricsByCanonical[targetKey] = callMetricsByCanonicalGlobal[key];
+      });
+    }
     
     // Get all data from Sessions
     const dataRange = sessionsSheet.getDataRange();
@@ -5354,6 +5611,28 @@ function createDailySummarySheet_(ss, startDate, endDate, digiumDatasetOpt, exte
     const summaryHeaders = ['Technician Name', 'Total Sessions', '% Of Total sessions', 'Sessions per HR', 'Avg Pick-up Speed', 'Avg Duration', 'Average Work Time'];
     summaryRows.push(summaryHeaders);
     
+    const perTechDaily = {};
+    const dailyDisplayNames = {};
+    const ensureDailyStats = (canonical, dateKey) => {
+      if (!canonical) return null;
+      if (!perTechDaily[canonical]) perTechDaily[canonical] = {};
+      const techDays = perTechDaily[canonical];
+      if (!techDays[dateKey]) {
+        techDays[dateKey] = {
+          sessions: 0,
+          durationSum: 0,
+          durationCount: 0,
+          pickupSum: 0,
+          pickupCount: 0,
+          workSeconds: 0,
+          activeSeconds: 0,
+          longestSeconds: 0,
+          loginSeconds: 0
+        };
+      }
+      return techDays[dateKey];
+    };
+    
     // Calculate per-technician stats
     const techStats = {};
     const sfMetrics = collectSalesforceTicketMetrics_(startDate, endDate);
@@ -5548,7 +5827,7 @@ function createDailySummarySheet_(ss, startDate, endDate, digiumDatasetOpt, exte
     Logger.log('createDailySummarySheet_ error: ' + e.toString());
   }
 }
-function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, extensionMetaOpt, performanceDataOpt) {
+function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, extensionMetaOpt) {
   try {
     const sessionsSheet = ss.getSheetByName(SHEETS_SESSIONS_TABLE);
     if (!sessionsSheet) return;
@@ -5560,13 +5839,21 @@ function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, exten
     try { supportSheet.getBandings().forEach(b => b.remove()); } catch (e) { Logger.log('Support_Data: failed to remove existing banding: ' + e.toString()); }
     try { supportSheet.setConditionalFormatRules([]); } catch (e) { Logger.log('Support_Data: failed to clear conditional formats: ' + e.toString()); }
     
-    const cfgLocal = getCfg_();
     const extensionMeta = extensionMetaOpt || getActiveExtensionMetadata_();
     const digiumDataset = digiumDatasetOpt || getDigiumDataset_(startDate, endDate, extensionMeta);
     const digByAccount = digiumDataset && digiumDataset.byAccount && digiumDataset.byAccount.ok ? digiumDataset.byAccount : null;
     const digByDay = digiumDataset && digiumDataset.byDay && digiumDataset.byDay.ok ? digiumDataset.byDay : null;
     const callMetricsByCanonicalGlobal = (digiumDataset && digiumDataset.callMetricsByCanonical) ? digiumDataset.callMetricsByCanonical : {};
-    const performanceData = performanceDataOpt || getPerfSummaryCached_(cfgLocal, startDate, endDate) || {};
+    const callMetricsByCanonical = {};
+    if (callMetricsByCanonicalGlobal && typeof callMetricsByCanonicalGlobal === 'object') {
+      Object.keys(callMetricsByCanonicalGlobal).forEach(key => {
+        const normalizedKey = canonicalTechnicianName_(key);
+        const targetKey = normalizedKey || key;
+        callMetricsByCanonical[targetKey] = callMetricsByCanonicalGlobal[key];
+      });
+    }
+    const perTechDaily = {};
+    const dailyDisplayNames = {};
 
     // Get all data from Sessions
     const dataRange = sessionsSheet.getDataRange();
@@ -5590,6 +5877,7 @@ function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, exten
     const durationIdx = getHeaderIndex(['Total Time', 'total_time', 'duration_total_seconds']);
     const workIdx = getHeaderIndex(['Work Time', 'work_time', 'duration_work_seconds']);
     const pickupIdx = getHeaderIndex(['Waiting Time', 'waiting_time', 'pickup_seconds']);
+    const activeIdx = getHeaderIndex(['Active Time', 'active_time', 'duration_active_seconds', 'active seconds', 'duration_active_seconds']);
     const customerIdx = getHeaderIndex(['Your Name:', 'customer_name', 'Customer Name']);
     const sessionIdIdx = getHeaderIndex(['Session ID', 'session_id', 'session id']);
     const channelIdx = getHeaderIndex(['Channel Name', 'channel_name']);
@@ -5616,13 +5904,65 @@ function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, exten
       }
     });
     
+    const tz = Session.getScriptTimeZone ? Session.getScriptTimeZone() : 'Etc/GMT';
+    const indexInfo = {
+      startIdx,
+      techIdx,
+      durationIdx,
+      workIdx,
+      pickupIdx,
+      activeIdx,
+      channelIdx,
+      callingCardIdx
+    };
+    const sessionContext = buildTechnicianSessionContext_(filtered, indexInfo, tz);
+    const perCanonicalSessions = sessionContext.perCanonical || {};
+    const teamDaily = sessionContext.teamDaily || {};
+    let dates = Array.isArray(sessionContext.orderedDates) ? sessionContext.orderedDates.slice() : [];
+    Object.keys(perCanonicalSessions).forEach(canonical => {
+      perTechDaily[canonical] = perCanonicalSessions[canonical].daily || {};
+      if (!dailyDisplayNames[canonical]) {
+        dailyDisplayNames[canonical] = perCanonicalSessions[canonical].displayName || canonical;
+      }
+    });
+
+    if (!dates.length) {
+      const tempDates = [];
+      let cursor = new Date(startDate);
+      const endDateObjAlt = new Date(endDate);
+      while (cursor <= endDateObjAlt) {
+        tempDates.push(Utilities.formatDate(cursor, tz, 'yyyy-MM-dd'));
+        cursor.setDate(cursor.getDate() + 1);
+      }
+      dates = tempDates;
+    }
+
+    const formatDateKey = (dateObj) => {
+      try {
+        return Utilities.formatDate(dateObj, tz, 'yyyy-MM-dd');
+      } catch (e) {
+        return isoDate_(dateObj);
+      }
+    };
+    const formatDisplayDate = (key) => {
+      try {
+        const d = new Date(key + 'T00:00:00');
+        return Utilities.formatDate(d, tz, 'M/d/yyyy');
+      } catch (e) {
+        return key;
+      }
+    };
+
+    const callDailyPerCanonical = (digiumDataset && digiumDataset.callDailyPerCanonical)
+      ? digiumDataset.callDailyPerCanonical
+      : {};
+
     // Header
     supportSheet.getRange(1, 1).setValue('📊 SUPPORT DATA SUMMARY');
     supportSheet.getRange(1, 1).setFontSize(18).setFontWeight('bold').setFontColor('#0B1F50');
     supportSheet.getRange(1, 1, 1, 8).merge();
 
     supportSheet.getRange(2, 1).setValue('Date Range:');
-    const tz = Session.getScriptTimeZone ? Session.getScriptTimeZone() : 'Etc/GMT';
     const displayStart = Utilities.formatDate(startDate, tz, 'yyyy-MM-dd');
     const displayEnd = Utilities.formatDate(endDate, tz, 'yyyy-MM-dd');
     supportSheet.getRange(2, 2).setValue(`${displayStart} to ${displayEnd}`);
@@ -5656,9 +5996,6 @@ function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, exten
     }).length;
     
     // Aggregate call totals from Digium data (if available)
-    const callMetricsByCanonical = (callMetricsByCanonicalGlobal && typeof callMetricsByCanonicalGlobal === 'object')
-      ? callMetricsByCanonicalGlobal
-      : {};
     let totalCalls = 0;
     let totalIncomingCalls = 0;
     let totalOutgoingCalls = 0;
@@ -5709,7 +6046,6 @@ function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, exten
       { label: 'Unresolved Tickets', value: openTickets, format: 'int' },
       { label: 'Tickets Closed', value: closedTickets, format: 'int' }
     ];
-    
     const kpisPerRow = 4;
     kpis.forEach((kpi, idx) => {
       const row = kpiRow + Math.floor(idx / kpisPerRow);
@@ -5769,180 +6105,105 @@ function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, exten
     supportSheet.getRange(techHeaderRow, 1, 1, tableHeaders.length)
       .setFontWeight('bold').setFontSize(12).setBackground('#1E3A8A').setFontColor('#FFFFFF');
     
-    // Calculate per-technician stats
-    const techStats = {};
-    const ensureTechEntry = (tech) => {
-      if (!techStats[tech]) {
-        techStats[tech] = {
-          sessions: 0,
-          durations: [],
-          pickups: [],
-          workSeconds: 0,
-          tickets: 0,
-          daysToCloseAvg: 0,
-          novaWave: 0,
-          totalCalls: 0,
-          inboundCalls: 0,
-          outboundCalls: 0,
-          talkSeconds: 0,
-          openTickets: 0
-        };
-      }
-      return techStats[tech];
+    const canonicalDisplayOverrides = {
+      'ahmed talal': 'Ahmed Talal'
     };
-    const rosterNames = (getRosterTechnicianNames_() || []).filter(name => !isExcludedTechnician_(name));
     const canonicalToDisplay = {};
-    rosterNames.forEach(name => {
-      const canonical = canonicalTechnicianName_(name);
-      if (canonical && !canonicalToDisplay[canonical]) canonicalToDisplay[canonical] = name;
-      ensureTechEntry(name);
-    });
-    if (extensionMeta && extensionMeta.extToName) {
-      Object.keys(extensionMeta.extToName).forEach(ext => {
-        const rawName = extensionMeta.extToName[ext];
-        if (!rawName) return;
-        const canonical = canonicalTechnicianName_(rawName);
-        if (canonical && !canonicalToDisplay[canonical]) canonicalToDisplay[canonical] = rawName;
-        ensureTechEntry(rawName);
-      });
-    }
-    const titleizeCanonical = (canonical) => {
-      if (!canonical) return '';
-      return canonical.split(/\s+/).map(part => part ? part.charAt(0).toUpperCase() + part.slice(1) : '').join(' ').trim();
-    };
-    filtered.forEach(row => {
-      const rawTech = row[techIdx] ? String(row[techIdx]).trim() : '';
-      const canonicalFromRow = canonicalTechnicianName_(rawTech);
-      if (canonicalFromRow && !canonicalToDisplay[canonicalFromRow]) {
-        canonicalToDisplay[canonicalFromRow] = titleizeCanonical(canonicalFromRow);
+    const ensureDisplayName = (canonical) => {
+      if (!canonical) return 'Unknown';
+      if (canonicalDisplayOverrides[canonical]) return canonicalDisplayOverrides[canonical];
+      if (dailyDisplayNames[canonical]) return dailyDisplayNames[canonical];
+      if (perCanonicalSessions[canonical] && perCanonicalSessions[canonical].displayName) {
+        dailyDisplayNames[canonical] = perCanonicalSessions[canonical].displayName;
+        return perCanonicalSessions[canonical].displayName;
       }
-      const displayName = canonicalFromRow && canonicalToDisplay[canonicalFromRow]
-        ? canonicalToDisplay[canonicalFromRow]
-        : (rawTech || 'Unknown');
-      const stats = ensureTechEntry(displayName);
-      stats.sessions++;
-      if (durationIdx >= 0 && row[durationIdx]) stats.durations.push(parseDurationSeconds_(row[durationIdx]));
-      if (pickupIdx >= 0 && row[pickupIdx]) stats.pickups.push(parseDurationSeconds_(row[pickupIdx]));
-      if (workIdx >= 0 && row[workIdx]) stats.workSeconds += parseDurationSeconds_(row[workIdx]);
-      if (resolvedIdx >= 0 && row[resolvedIdx] === 'Resolved') stats.resolved++;
-      const isNovaWave = (() => {
-        if (channelIdx >= 0 && row[channelIdx]) {
-          const name = String(row[channelIdx] || '').toLowerCase();
-          if (name.includes('nova wave')) return true;
-        }
-        if (callingCardIdx >= 0 && row[callingCardIdx]) {
-          const callingCard = String(row[callingCardIdx] || '').toLowerCase();
-          if (callingCard.includes('nova wave')) return true;
-        }
-        return false;
-      })();
-      if (isNovaWave) stats.novaWave++;
-    });
+      const computed = canonical.split(/\s+/).map(part => part ? part.charAt(0).toUpperCase() + part.slice(1) : '').join(' ').trim() || 'Unknown';
+      dailyDisplayNames[canonical] = computed;
+      return computed;
+    };
 
-    const ticketsByCanonical = {};
-    const daysToCloseByCanonical = {};
-    const openByCanonical = {};
+    const ticketAggregates = {};
+    const daysToCloseAggregates = {};
+    const openAggregates = {};
     if (sfMetrics && sfMetrics.perCanonical) {
-      Object.keys(sfMetrics.perCanonical).forEach(canonical => {
-        const entry = sfMetrics.perCanonical[canonical];
+      Object.keys(sfMetrics.perCanonical).forEach(key => {
+        const entry = sfMetrics.perCanonical[key];
         if (!entry) return;
-        ticketsByCanonical[canonical] = (ticketsByCanonical[canonical] || 0) + (entry.created || 0);
-        if (entry.daysToClose && entry.daysToClose.length) {
-          daysToCloseByCanonical[canonical] = (daysToCloseByCanonical[canonical] || []).concat(entry.daysToClose);
-        }
-        if (entry.open) {
-          openByCanonical[canonical] = (openByCanonical[canonical] || 0) + entry.open;
-        }
+        const canonicalSet = new Set();
+        const primary = canonicalTechnicianName_(key);
+        if (primary) canonicalSet.add(primary);
         (entry.rawNames || []).forEach(rawName => {
-          const normalized = canonicalTechnicianName_(rawName);
-          if (!normalized || normalized === canonical) return;
-          ticketsByCanonical[normalized] = (ticketsByCanonical[normalized] || 0) + (entry.created || 0);
+          const c = canonicalTechnicianName_(rawName);
+          if (c) canonicalSet.add(c);
+        });
+        canonicalSet.forEach(canonical => {
+          ticketAggregates[canonical] = (ticketAggregates[canonical] || 0) + (entry.created || 0);
           if (entry.daysToClose && entry.daysToClose.length) {
-            daysToCloseByCanonical[normalized] = (daysToCloseByCanonical[normalized] || []).concat(entry.daysToClose);
+            daysToCloseAggregates[canonical] = (daysToCloseAggregates[canonical] || []).concat(entry.daysToClose);
           }
           if (entry.open) {
-            openByCanonical[normalized] = (openByCanonical[normalized] || 0) + entry.open;
+            openAggregates[canonical] = (openAggregates[canonical] || 0) + entry.open;
           }
         });
       });
-      Object.keys(techStats).forEach(tech => {
-        const canonical = canonicalTechnicianName_(tech);
-        const ticketCount = ticketsByCanonical[canonical] || ticketsByCanonical[tech] || 0;
-        if (ticketCount) techStats[tech].tickets += ticketCount;
-        const daysArr = daysToCloseByCanonical[canonical] || daysToCloseByCanonical[tech] || [];
-        if (daysArr.length) {
-          techStats[tech].daysToCloseAvg = daysArr.reduce((a,b)=>a+b,0) / daysArr.length;
-        } else {
-          techStats[tech].daysToCloseAvg = 0;
-        }
-        const openCount = openByCanonical[canonical] || openByCanonical[tech] || 0;
-        if (openCount) techStats[tech].openTickets = openCount;
-      });
     }
-    Array.from(new Set(Object.keys(ticketsByCanonical).concat(Object.keys(callMetricsByCanonical)))).forEach(canonical => {
-      if (!canonical) return;
-      const display = canonicalToDisplay[canonical] || titleizeCanonical(canonical);
-      if (!canonicalToDisplay[canonical] && display) canonicalToDisplay[canonical] = display;
-      ensureTechEntry(display);
-    });
-    Object.entries(callMetricsByCanonical).forEach(([canonical, metrics]) => {
-      if (!metrics) return;
-      const display = canonicalToDisplay[canonical] || titleizeCanonical(canonical);
-      if (!canonicalToDisplay[canonical] && display) {
-        canonicalToDisplay[canonical] = display;
-      }
-      const stats = ensureTechEntry(display);
-      stats.totalCalls += Number(metrics.totalCalls || 0);
-      stats.inboundCalls += Number(metrics.inboundCalls || 0);
-      stats.outboundCalls += Number(metrics.outboundCalls || 0);
-      stats.talkSeconds += Number(metrics.talkSeconds || 0);
-    });
-    const techRows = Object.keys(techStats)
-      .filter(tech => !isExcludedTechnician_(tech))
-      .sort((a, b) => techStats[b].sessions - techStats[a].sessions)
-      .map(tech => {
-        const stats = techStats[tech];
-        const avgPickup = stats.pickups.length > 0 ? (stats.pickups.reduce((a, b) => a + b, 0) / stats.pickups.length) : 0;
-        const avgDur = stats.durations.length > 0 ? (stats.durations.reduce((a, b) => a + b, 0) / stats.durations.length) : 0;
-        const sessionWorkTime = stats.workSeconds / 86400;
-        const talkTime = stats.talkSeconds / 86400;
-        const totalCallsForTech = stats.totalCalls || 0;
-        const inboundCalls = stats.inboundCalls || 0;
-        const outboundCalls = stats.outboundCalls || 0;
-        const talkSeconds = stats.talkSeconds || 0;
-        const openTickets = stats.openTickets || 0;
-        const tickets = stats.tickets || 0;
-        const ticketOpenRate = tickets > 0 ? (stats.sessions + totalCallsForTech) / tickets : 0;
+
+    const allCanonicalKeys = Array.from(new Set([
+      ...Object.keys(perCanonicalSessions),
+      ...Object.keys(callMetricsByCanonical),
+      ...Object.keys(ticketAggregates)
+    ]));
+
+    const techRows = allCanonicalKeys
+      .map(canonical => {
+        if (!canonical) return null;
+        const sessionStats = perCanonicalSessions[canonical];
+        const totals = sessionStats && sessionStats.totals ? sessionStats.totals : createEmptyDayStats_();
+        const displayName = ensureDisplayName(canonical);
+        if (!displayName || isExcludedTechnician_(displayName)) return null;
+        const callTotals = callMetricsByCanonical[canonical] || {};
+        const totalCallsForTech = Number(callTotals.totalCalls || 0);
+        const inboundCalls = Number(callTotals.inboundCalls || 0);
+        const outboundCalls = Number(callTotals.outboundCalls || 0);
+        const talkSeconds = Number(callTotals.talkSeconds || 0);
+        const ticketCount = ticketAggregates[canonical] || 0;
+        const daysArr = daysToCloseAggregates[canonical] || [];
+        const avgDaysToClose = daysArr.length ? (daysArr.reduce((a, b) => a + b, 0) / daysArr.length) : 0;
+        const openTickets = openAggregates[canonical] || 0;
+        const avgPickupSeconds = totals.pickupCount > 0 ? (totals.pickupSum / totals.pickupCount) : 0;
+        const avgDurationSeconds = totals.durationCount > 0 ? (totals.durationSum / totals.durationCount) : 0;
+        const ticketOpenRate = ticketCount > 0 ? (totals.sessions + totalCallsForTech) / ticketCount : 0;
         return [
-          tech,
-          stats.sessions,
-          stats.novaWave,
-          avgPickup / 86400,
-          avgDur / 86400,
-          sessionWorkTime,
+          displayName,
+          totals.sessions || 0,
+          totals.novaWave || 0,
+          avgPickupSeconds / 86400,
+          avgDurationSeconds / 86400,
+          (totals.workSeconds || 0) / 86400,
           totalCallsForTech,
           inboundCalls,
           outboundCalls,
-          talkTime,
-          stats.tickets,
-          stats.daysToCloseAvg || 0,
+          talkSeconds / 86400,
+          ticketCount,
+          avgDaysToClose || 0,
           ticketOpenRate
         ];
-      });
+      })
+      .filter(Boolean)
+      .sort((a, b) => b[1] - a[1]);
+
     const techDataStartRow = currentRow + 2;
     if (techRows.length > 0) {
       supportSheet.getRange(techDataStartRow, 1, techRows.length, tableHeaders.length).setValues(techRows);
       try {
         supportSheet.getRange(techDataStartRow, 2, techRows.length, 2).setNumberFormat('0');
-        supportSheet.getRange(techDataStartRow, 4, techRows.length, 1).setNumberFormat('hh:mm:ss');
-        supportSheet.getRange(techDataStartRow, 5, techRows.length, 1).setNumberFormat('hh:mm:ss');
-        supportSheet.getRange(techDataStartRow, 6, techRows.length, 1).setNumberFormat('hh:mm:ss');
+        supportSheet.getRange(techDataStartRow, 4, techRows.length, 3).setNumberFormat('hh:mm:ss');
         supportSheet.getRange(techDataStartRow, 7, techRows.length, 3).setNumberFormat('0');
         supportSheet.getRange(techDataStartRow, 10, techRows.length, 1).setNumberFormat('hh:mm:ss');
         supportSheet.getRange(techDataStartRow, 11, techRows.length, 1).setNumberFormat('0');
         supportSheet.getRange(techDataStartRow, 12, techRows.length, 1).setNumberFormat('0.0');
-        supportSheet.getRange(techDataStartRow, 13, techRows.length, 1).setNumberFormat('0.00');
-      } catch (e) { /* ignore */ }
+        supportSheet.getRange(techDataStartRow, 13, techRows.length, 1).setNumberFormat('0.0%');
+      } catch (e) { /* ignore formatting errors */ }
     }
     try {
       const techBandingRange = supportSheet.getRange(techHeaderRow, 1, Math.max(1, techRows.length + 1), tableHeaders.length);
@@ -5958,314 +6219,163 @@ function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, exten
     supportSheet.getRange(currentRow, 1).setValue('Logmein Performance Summary (daily)');
     supportSheet.getRange(currentRow, 1).setFontSize(13).setFontWeight('bold').setFontColor('#0B1F50');
     const channelRow = currentRow + 1;
-    
-    // Group sessions by day from the already-filtered session data
-    const dates = [];
-    let currentDate = new Date(startDate);
-    const endDateObj = new Date(endDate);
-    while (currentDate <= endDateObj) {
-      dates.push(currentDate.toISOString().split('T')[0]);
-      currentDate.setDate(currentDate.getDate() + 1);
-    }
 
-    // Build a map of daily sessions
-    const dailyData = {};
-    filtered.forEach(row => {
-      try {
-        const d = formatDateKey(new Date(row[startIdx]));
-        if (!dailyData[d]) dailyData[d] = { sessions: [], totalWorkSeconds: 0 };
-        dailyData[d].sessions.push(row);
-        // Use robust parser for duration/work fields to avoid negative/invalid values
-        if (workIdx >= 0) dailyData[d].totalWorkSeconds += parseDurationSeconds_(row[workIdx] || 0);
-      } catch (e) { /* ignore malformed rows */ }
-    });
+    const getTeamDayStats = (dateKey) => {
+      const stats = teamDaily[dateKey];
+      if (stats) return stats;
+      const empty = createEmptyDayStats_();
+      empty.techSet = new Set();
+      return empty;
+    };
 
-    // Header row: Metric | date... | Totals/Averages
     const headerRow = ['Metric'];
-    dates.forEach(d => {
-      headerRow.push(formatDisplayDate(d));
-    });
+    dates.forEach(dateKey => headerRow.push(formatDisplayDate(dateKey)));
     headerRow.push('Totals/Averages');
 
-    // Total sessions per day
     const totalSessionsRow = ['Total sessions'];
     let totalSessionsAll = 0;
-    dates.forEach(d => {
-      const count = dailyData[d] ? dailyData[d].sessions.length : 0;
+    dates.forEach(dateKey => {
+      const dayStats = getTeamDayStats(dateKey);
+      const count = dayStats.sessions || 0;
       totalSessionsRow.push(count);
       totalSessionsAll += count;
     });
     totalSessionsRow.push(totalSessionsAll);
 
-    // Total Work Time per day (as time fractions - numeric values so sheet formats stay correct)
     const totalWorkRow = ['Total Work Time'];
     let totalWorkSecondsAll = 0;
-    dates.forEach(d => {
-      const secs = dailyData[d] ? dailyData[d].totalWorkSeconds : 0;
+    dates.forEach(dateKey => {
+      const dayStats = getTeamDayStats(dateKey);
+      const secs = dayStats.workSeconds || 0;
+      totalWorkRow.push(secs / 86400);
       totalWorkSecondsAll += secs;
-      totalWorkRow.push((secs || 0) / 86400); // store as fraction of day
     });
     totalWorkRow.push(totalWorkSecondsAll / 86400);
 
-    // Avg Session per day (average of duration_total_seconds)
     const avgSessionRow = ['Avg Session'];
-    let totalAvgSeconds = 0;
-    let daysWithData = 0;
-    dates.forEach(d => {
-      const data = dailyData[d];
-      if (data && data.sessions.length > 0 && durationIdx >= 0) {
-        // Parse session durations defensively (supports seconds, HH:MM:SS, or day-fractions)
-        const durations = data.sessions.map(s => parseDurationSeconds_(s[durationIdx] || 0)).filter(Boolean);
-        if (durations.length > 0) {
-          const avg = durations.reduce((a,b) => a+b, 0) / durations.length;
-          avgSessionRow.push(avg / 86400);
-          totalAvgSeconds += avg;
-          daysWithData++;
-        } else {
-          avgSessionRow.push(0);
-        }
+    let sessionDurationSum = 0;
+    let sessionDurationCount = 0;
+    dates.forEach(dateKey => {
+      const dayStats = getTeamDayStats(dateKey);
+      if (dayStats.durationCount > 0) {
+        const avg = dayStats.durationSum / dayStats.durationCount;
+        avgSessionRow.push(avg / 86400);
+        sessionDurationSum += avg;
+        sessionDurationCount++;
       } else {
         avgSessionRow.push(0);
       }
     });
-    if (daysWithData > 0) {
-      const overallAvg = totalAvgSeconds / daysWithData;
-      avgSessionRow.push(overallAvg / 86400);
-    } else {
-      avgSessionRow.push(0);
-    }
+    avgSessionRow.push(sessionDurationCount > 0 ? (sessionDurationSum / sessionDurationCount) / 86400 : 0);
 
-    // Avg Pick-up Speed per day
     const avgPickupRow = ['Avg Pick-up Speed'];
-    let totalPickupSeconds = 0;
-    let totalPickupCount = 0;
-    dates.forEach(d => {
-      const data = dailyData[d];
-      if (data && data.sessions.length > 0 && pickupIdx >= 0) {
-        // Parse pickup times defensively
-        const pickups = data.sessions.map(s => parseDurationSeconds_(s[pickupIdx] || 0)).filter(p => p > 0);
-        if (pickups.length > 0) {
-          const avg = pickups.reduce((a,b) => a+b, 0) / pickups.length;
-          avgPickupRow.push(avg / 86400);
-          totalPickupSeconds += avg * pickups.length;
-          totalPickupCount += pickups.length;
-        } else {
-          avgPickupRow.push(0);
-        }
+    let pickupSumTotal = 0;
+    let pickupCountTotal = 0;
+    dates.forEach(dateKey => {
+      const dayStats = getTeamDayStats(dateKey);
+      if (dayStats.pickupCount > 0) {
+        const avg = dayStats.pickupSum / dayStats.pickupCount;
+        avgPickupRow.push(avg / 86400);
+        pickupSumTotal += avg * dayStats.pickupCount;
+        pickupCountTotal += dayStats.pickupCount;
       } else {
         avgPickupRow.push(0);
       }
     });
-    if (totalPickupCount > 0) {
-      const overallAvg = totalPickupSeconds / totalPickupCount;
-      avgPickupRow.push(overallAvg / 86400);
-    } else {
-      avgPickupRow.push(0);
-    }
+    avgPickupRow.push(pickupCountTotal > 0 ? (pickupSumTotal / pickupCountTotal) / 86400 : 0);
 
-    const dayCount = Math.max(1, dates.length);
-
-    const normalizeDateKey = (value) => {
-      const str = String(value || '').trim();
-      if (!str) return '';
-      if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
-      const mmdd = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-      if (mmdd) {
-        return `${mmdd[3]}-${('0' + mmdd[1]).slice(-2)}-${('0' + mmdd[2]).slice(-2)}`;
-      }
-      const parsed = new Date(str);
-      if (!isNaN(parsed.getTime())) {
-        return parsed.toISOString().split('T')[0];
-      }
-      return str;
-    };
-
-    const callDailyStats = {};
-    const callRowMap = {};
-    if (digByDay && digByDay.rows && digByDay.rows.length) {
-      digByDay.rows.forEach(row => {
-        const key = String(row[0] || '').trim().toLowerCase();
-        if (key) callRowMap[key] = row;
-      });
-      const rawCategories = (digByDay.dates && digByDay.dates.length ? digByDay.dates : (digByDay.categories || []));
-      const normalizedCategories = rawCategories.length ? rawCategories.map(normalizeDateKey) : [];
-      const getMetricValue = (keys, idx) => {
-        for (const key of keys) {
-          const row = callRowMap[key];
-          if (!row) continue;
-          if (row.length > idx + 1) {
-            return Number(row[idx + 1]) || 0;
-          }
-          if (row.length === 2 && idx === 0) {
-            return Number(row[1]) || 0;
-          }
-        }
-        return 0;
-      };
-      if (normalizedCategories.length) {
-        normalizedCategories.forEach((dateKey, idx) => {
-          if (!dateKey) return;
-          if (!callDailyStats[dateKey]) {
-            callDailyStats[dateKey] = { totalCalls: 0, inbound: 0, outbound: 0, talkSeconds: 0, callSeconds: 0 };
-          }
-          callDailyStats[dateKey].totalCalls = getMetricValue(['total calls'], idx);
-          callDailyStats[dateKey].inbound = getMetricValue(['total incoming calls'], idx);
-          callDailyStats[dateKey].outbound = getMetricValue(['total outgoing calls'], idx);
-          callDailyStats[dateKey].talkSeconds = getMetricValue(['talking duration (s)', 'talking duration'], idx);
-          callDailyStats[dateKey].callSeconds = getMetricValue(['call duration (s)', 'call duration'], idx);
-        });
-      } else if (dates.length === 1) {
-        const singleKey = dates[0];
-        callDailyStats[singleKey] = {
-          totalCalls: getMetricValue(['total calls'], 0),
-          inbound: getMetricValue(['total incoming calls'], 0),
-          outbound: getMetricValue(['total outgoing calls'], 0),
-          talkSeconds: getMetricValue(['talking duration (s)', 'talking duration'], 0),
-          callSeconds: getMetricValue(['call duration (s)', 'call duration'], 0)
-        };
-      }
-    }
+    const pctRow = ['Percentage of daily calls/total sessions'];
     dates.forEach(dateKey => {
-      if (!callDailyStats[dateKey]) {
-        callDailyStats[dateKey] = { totalCalls: 0, inbound: 0, outbound: 0, talkSeconds: 0, callSeconds: 0 };
-      }
+      const dayStats = getTeamDayStats(dateKey);
+      const count = dayStats.sessions || 0;
+      const pct = totalSessionsAll > 0 ? (count / totalSessionsAll) : 0;
+      pctRow.push(pct);
     });
+    pctRow.push(1);
 
-    const summaryMetricRows = [totalSessionsRow, totalWorkRow, avgSessionRow, avgPickupRow];
+    const avgRealRow = ['Average REAL', ...Array(dates.length).fill(0), 0];
 
-    const performanceValues = Object.values(performanceData || {});
-    if (performanceValues.length) {
-      let totalRescueSessions = 0;
-      let totalRescueLoginSeconds = 0;
-      let totalRescueActiveSeconds = 0;
-      let totalRescueWorkSeconds = 0;
-      performanceValues.forEach(perf => {
-        if (!perf) return;
-        totalRescueSessions += Number(perf.totalSessions || 0);
-        totalRescueLoginSeconds += Number(perf.totalLoginTime || 0);
-        totalRescueActiveSeconds += Number(perf.totalActiveTime || 0);
-        totalRescueWorkSeconds += Number(perf.totalWorkTime || 0);
-      });
-      const buildRescueRow = (label, totalValue, opts) => {
-        const options = opts || {};
-        const row = [label];
-        const perDay = totalValue / dayCount;
-        if (options.asDuration) {
-          dates.forEach(() => row.push(perDay / 86400));
-          row.push(totalValue / 86400);
+    const techsWorkingRow = ['Total # of Techs working'];
+    let totalTechsAll = 0;
+    dates.forEach(dateKey => {
+      const dayStats = getTeamDayStats(dateKey);
+      const techCount = dayStats.techSet ? dayStats.techSet.size : 0;
+      techsWorkingRow.push(techCount);
+      totalTechsAll += techCount;
+    });
+    techsWorkingRow.push(totalTechsAll);
+
+    const techHoursRow = ['Total hours of technicans'];
+    dates.forEach((_, idx) => {
+      const techCount = techsWorkingRow[idx + 1] || 0;
+      techHoursRow.push(techCount * 8);
+    });
+    techHoursRow.push(totalTechsAll * 8);
+
+    const avgSessionsPerTechRow = ['Average sessions per tech'];
+    dates.forEach((_, idx) => {
+      const techCount = techsWorkingRow[idx + 1] || 0;
+      const sessionCount = totalSessionsRow[idx + 1] || 0;
+      const avg = techCount > 0 ? sessionCount / techCount : 0;
+      avgSessionsPerTechRow.push(Number(avg.toFixed(1)));
+    });
+    avgSessionsPerTechRow.push(Number((totalSessionsAll / Math.max(1, totalTechsAll)).toFixed(1)));
+
+    const avgCallsPerTechRow = ['Average calls per tech'];
+    dates.forEach((_, idx) => {
+      const techCount = techsWorkingRow[idx + 1] || 0;
+      const sessionCount = totalSessionsRow[idx + 1] || 0;
+      const avg = techCount > 0 ? sessionCount / techCount : 0;
+      avgCallsPerTechRow.push(Number(avg.toFixed(1)));
+    });
+    avgCallsPerTechRow.push(Number((totalSessionsAll / Math.max(1, totalTechsAll)).toFixed(1)));
+
+    const summaryRows = [];
+    summaryRows.push(headerRow);
+    summaryRows.push(['LMI:', ...Array(dates.length + 1).fill('')]);
+    summaryRows.push(totalSessionsRow);
+    summaryRows.push(totalWorkRow);
+    summaryRows.push(avgSessionRow);
+    summaryRows.push(avgPickupRow);
+    summaryRows.push(pctRow);
+    summaryRows.push(avgRealRow);
+    summaryRows.push(Array(dates.length + 2).fill(''));
+    summaryRows.push(['Daily Calculations', ...Array(dates.length + 1).fill('')]);
+    summaryRows.push(['# of techs working will be a total of techs that picked up sessions that day', ...Array(dates.length + 1).fill('')]);
+    summaryRows.push(techsWorkingRow);
+    summaryRows.push(techHoursRow);
+    summaryRows.push(avgSessionsPerTechRow);
+    summaryRows.push(avgCallsPerTechRow);
+
+    const summaryHeight = summaryRows.length;
+    supportSheet.getRange(channelRow, 1, summaryHeight, headerRow.length).setValues(summaryRows);
+    supportSheet.getRange(channelRow, 1, 1, headerRow.length)
+      .setFontWeight('bold').setBackground('#1E3A8A').setFontColor('#FFFFFF').setFontSize(12);
+
+    for (let i = 1; i < summaryHeight; i++) {
+      const metricName = String(summaryRows[i][0] || '').toLowerCase();
+      const range = supportSheet.getRange(channelRow + i, 2, 1, headerRow.length - 1);
+      try {
+        if (metricName.includes('time') || metricName.includes('duration')) {
+          range.setNumberFormat('hh:mm:ss');
+        } else if (metricName.includes('percentage')) {
+          range.setNumberFormat('0.00');
+        } else if (metricName.includes('average sessions') || metricName.includes('average calls')) {
+          range.setNumberFormat('0.0');
         } else {
-          dates.forEach(() => row.push(perDay));
-          row.push(totalValue);
+          range.setNumberFormat('0');
         }
-        return row;
-      };
-      if (totalRescueSessions > 0) {
-        summaryMetricRows.push(buildRescueRow('Total Sessions (Rescue Summary)', totalRescueSessions));
-      }
-      if (totalRescueLoginSeconds > 0) {
-        summaryMetricRows.push(buildRescueRow('Total Login Time (Rescue Summary)', totalRescueLoginSeconds, { asDuration: true }));
-      }
-      if (totalRescueActiveSeconds > 0) {
-        summaryMetricRows.push(buildRescueRow('Total Active Time (Rescue Summary)', totalRescueActiveSeconds, { asDuration: true }));
-      }
-      if (totalRescueWorkSeconds > 0) {
-        summaryMetricRows.push(buildRescueRow('Total Work Time (Rescue Summary)', totalRescueWorkSeconds, { asDuration: true }));
-      }
-    }
-
-    const hasCallData = (totalCalls || totalIncomingCalls || totalOutgoingCalls || totalTalkingSeconds || totalCallSeconds);
-    if (hasCallData) {
-      const buildCallRow = (label, extractor, opts) => {
-        const options = opts || {};
-        const values = [];
-        let total = 0;
-        dates.forEach(dateKey => {
-          const entry = callDailyStats[dateKey] || {};
-          const rawVal = extractor(entry) || 0;
-          total += rawVal;
-          values.push(options.asDuration ? rawVal / 86400 : rawVal);
-        });
-        if (total === 0 && options.totalFallback != null) {
-          total = options.totalFallback;
-          if (dates.length === 1) {
-            values[0] = options.asDuration ? options.totalFallback / 86400 : options.totalFallback;
-          }
-        }
-        const totalDisplay = options.asDuration ? total / 86400 : total;
-        const row = [label, ...values, totalDisplay];
-        const hasValue = totalDisplay !== 0 || values.some(v => v !== 0);
-        return hasValue ? row : null;
-      };
-
-      const totalCallsRow = buildCallRow('Total Calls (Digium)', entry => entry.totalCalls, { totalFallback: totalCalls });
-      if (totalCallsRow) summaryMetricRows.push(totalCallsRow);
-
-      const inboundCallsRow = buildCallRow('Incoming Calls (Digium)', entry => entry.inbound, { totalFallback: totalIncomingCalls });
-      if (inboundCallsRow) summaryMetricRows.push(inboundCallsRow);
-
-      const outboundCallsRow = buildCallRow('Outgoing Calls (Digium)', entry => entry.outbound, { totalFallback: totalOutgoingCalls });
-      if (outboundCallsRow) summaryMetricRows.push(outboundCallsRow);
-
-      const talkTimeRow = buildCallRow('Total Talk Time (Digium)', entry => entry.talkSeconds, { asDuration: true, totalFallback: totalTalkingSeconds });
-      if (talkTimeRow) summaryMetricRows.push(talkTimeRow);
-
-      const callDurationRow = buildCallRow('Total Call Duration (Digium)', entry => entry.callSeconds, { asDuration: true, totalFallback: totalCallSeconds });
-      if (callDurationRow) summaryMetricRows.push(callDurationRow);
-
-      if (totalCalls > 0 || totalTalkingSeconds > 0) {
-        const avgTalkRow = ['Avg Talk Time per Call (Digium)'];
-        dates.forEach(dateKey => {
-          const entry = callDailyStats[dateKey] || {};
-          const avg = entry.totalCalls > 0 ? (entry.talkSeconds || 0) / entry.totalCalls : 0;
-          avgTalkRow.push(avg / 86400);
-        });
-        const avgTalkTotal = totalCalls > 0 ? (totalTalkingSeconds / totalCalls) / 86400 : 0;
-        avgTalkRow.push(avgTalkTotal);
-        if (avgTalkRow.slice(1).some(v => v !== 0)) summaryMetricRows.push(avgTalkRow);
-      }
-
-      if (totalCalls > 0 || totalCallSeconds > 0) {
-        const avgCallDurationRow = ['Avg Call Duration (Digium)'];
-        dates.forEach(dateKey => {
-          const entry = callDailyStats[dateKey] || {};
-          const avg = entry.totalCalls > 0 ? (entry.callSeconds || 0) / entry.totalCalls : 0;
-          avgCallDurationRow.push(avg / 86400);
-        });
-        const avgCallTotal = totalCalls > 0 ? (totalCallSeconds / totalCalls) / 86400 : 0;
-        avgCallDurationRow.push(avgCallTotal);
-        if (avgCallDurationRow.slice(1).some(v => v !== 0)) summaryMetricRows.push(avgCallDurationRow);
-      }
-    }
-
-    const wideRows = [headerRow, ...summaryMetricRows];
-    supportSheet.getRange(channelRow, 1, 1, wideRows[0].length).setValues([wideRows[0]]);
-    supportSheet.getRange(channelRow, 1, 1, wideRows[0].length).setFontWeight('bold').setBackground('#1E3A8A').setFontColor('#FFFFFF').setFontSize(12);
-    if (wideRows.length > 1) {
-      const dataRows = wideRows.slice(1);
-      supportSheet.getRange(channelRow + 1, 1, dataRows.length, wideRows[0].length).setValues(dataRows);
-      dataRows.forEach((row, idx) => {
-        const metricName = String(row[0] || '').toLowerCase();
-        const range = supportSheet.getRange(channelRow + 1 + idx, 2, 1, wideRows[0].length - 1);
-        try {
-          if (metricName.includes('time') || metricName.includes('duration')) {
-            range.setNumberFormat('hh:mm:ss');
-          } else {
-            range.setNumberFormat('0');
-          }
-        } catch (e) { /* non-fatal */ }
-      });
+      } catch (e) { /* ignore */ }
     }
     try {
-      const channelBandingRange = supportSheet.getRange(channelRow, 1, wideRows.length, wideRows[0].length);
+      const channelBandingRange = supportSheet.getRange(channelRow, 1, summaryHeight, headerRow.length);
       const channelBanding = channelBandingRange.applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY);
       channelBanding.setHeaderRowColor('#1E3A8A')
                     .setFirstRowColor('#F5F7FB')
                     .setSecondRowColor('#FFFFFF')
                     .setFooterRowColor(null);
     } catch (e) { Logger.log('Support_Data: channel table banding failed: ' + e.toString()); }
-    
-    currentRow = channelRow + wideRows.length + 2;
-    
+    currentRow = channelRow + summaryHeight + 2;
     // Section header for Call data
     supportSheet.getRange(currentRow, 1).setValue('Call Data (Digium)');
     supportSheet.getRange(currentRow, 1).setFontSize(14).setFontWeight('bold').setFontColor('#0B1F50');
@@ -6412,6 +6522,244 @@ function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, exten
                    .setFooterRowColor(null);
       } catch (e) { Logger.log('Support_Data: call table banding failed: ' + e.toString()); }
     }
+
+    const getCallMetricsForCanonical = (canonical) => {
+      if (!canonical) return null;
+      if (callMetricsByCanonical[canonical]) return callMetricsByCanonical[canonical];
+      if (canonical === 'ahmed talal' && callMetricsByCanonical['eddie talal']) return callMetricsByCanonical['eddie talal'];
+      return null;
+    };
+    const toTitleCaseCanonical = (canonical) => {
+      if (!canonical) return 'Unknown';
+      return canonical.split(/\s+/).map(part => part ? part.charAt(0).toUpperCase() + part.slice(1) : '').join(' ').trim() || 'Unknown';
+    };
+
+    const perTechKeysSorted = Object.keys(perTechDaily || {})
+      .map(canonical => {
+        const name = ensureDisplayName ? ensureDisplayName(canonical) : toTitleCaseCanonical(canonical);
+        return { canonical, name };
+      })
+      .filter(item => item.name && !isExcludedTechnician_(item.name))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    perTechKeysSorted.forEach(({ canonical, name }) => {
+      const dayStatsMap = perTechDaily[canonical] || {};
+      const hasSessionData = dates.some(dateKey => {
+        const dayStats = dayStatsMap[dateKey];
+        return dayStats && dayStats.sessions > 0;
+      });
+      const callMetrics = getCallMetricsForCanonical(canonical);
+      const hasCallData = callMetrics && (
+        Number(callMetrics.totalCalls || 0) > 0 ||
+        Number(callMetrics.inboundCalls || 0) > 0 ||
+        Number(callMetrics.outboundCalls || 0) > 0 ||
+        Number(callMetrics.talkSeconds || 0) > 0 ||
+        Number(callMetrics.callSeconds || 0) > 0
+      );
+      if (!hasSessionData && !hasCallData) {
+        return;
+      }
+
+      supportSheet.getRange(currentRow, 1).setValue(`👤 ${name} - Daily Performance`);
+      supportSheet.getRange(currentRow, 1).setFontSize(12).setFontWeight('bold').setFontColor('#1E3A8A');
+      currentRow += 1;
+
+      const sessionHeader = ['Metric'];
+      dates.forEach(d => sessionHeader.push(formatDisplayDate(d)));
+      sessionHeader.push('Totals/Averages');
+
+      const sessionRows = [];
+
+      const totalSessionsRow = ['Total sessions'];
+      let totalSessionsAll = 0;
+      dates.forEach(dateKey => {
+        const dayStats = dayStatsMap[dateKey] || {};
+        const count = dayStats.sessions || 0;
+        totalSessionsRow.push(count);
+        totalSessionsAll += count;
+      });
+      totalSessionsRow.push(totalSessionsAll);
+      sessionRows.push(totalSessionsRow);
+
+      const totalActiveRow = ['Total Active Time'];
+      let totalActiveAll = 0;
+      dates.forEach(dateKey => {
+        const secs = (dayStatsMap[dateKey] && dayStatsMap[dateKey].activeSeconds) || 0;
+        totalActiveRow.push(secs / 86400);
+        totalActiveAll += secs;
+      });
+      totalActiveRow.push(totalActiveAll / 86400);
+      sessionRows.push(totalActiveRow);
+
+      const totalWorkRow = ['Total Work Time'];
+      let totalWorkAll = 0;
+      dates.forEach(dateKey => {
+        const secs = (dayStatsMap[dateKey] && dayStatsMap[dateKey].workSeconds) || 0;
+        totalWorkRow.push(secs / 86400);
+        totalWorkAll += secs;
+      });
+      totalWorkRow.push(totalWorkAll / 86400);
+      sessionRows.push(totalWorkRow);
+
+      const totalLoginRow = ['Total Login Time'];
+      let totalLoginAll = 0;
+      dates.forEach(dateKey => {
+        const secs = (dayStatsMap[dateKey] && dayStatsMap[dateKey].loginSeconds) || 0;
+        totalLoginRow.push(secs / 86400);
+        totalLoginAll += secs;
+      });
+      totalLoginRow.push(totalLoginAll / 86400);
+      sessionRows.push(totalLoginRow);
+
+      const avgSessionRow = ['Avg Session'];
+      let totalAvgSeconds = 0;
+      let daysWithAvg = 0;
+      dates.forEach(dateKey => {
+        const dayStats = dayStatsMap[dateKey] || {};
+        if (dayStats.durationCount > 0) {
+          const avg = dayStats.durationSum / dayStats.durationCount;
+          avgSessionRow.push(avg / 86400);
+          totalAvgSeconds += avg;
+          daysWithAvg++;
+        } else {
+          avgSessionRow.push(0);
+        }
+      });
+      avgSessionRow.push(daysWithAvg > 0 ? (totalAvgSeconds / daysWithAvg) / 86400 : 0);
+      sessionRows.push(avgSessionRow);
+
+      const avgPickupRow = ['Avg Pick-up Speed'];
+      let totalPickupSeconds = 0;
+      let totalPickupCount = 0;
+      dates.forEach(dateKey => {
+        const dayStats = dayStatsMap[dateKey] || {};
+        if (dayStats.pickupCount > 0) {
+          const avg = dayStats.pickupSum / dayStats.pickupCount;
+          avgPickupRow.push(avg / 86400);
+          totalPickupSeconds += avg * dayStats.pickupCount;
+          totalPickupCount += dayStats.pickupCount;
+        } else {
+          avgPickupRow.push(0);
+        }
+      });
+      avgPickupRow.push(totalPickupCount > 0 ? (totalPickupSeconds / totalPickupCount) / 86400 : 0);
+      sessionRows.push(avgPickupRow);
+
+      const longestSessionRow = ['Longest Session Time'];
+      let longestOverall = 0;
+      dates.forEach(dateKey => {
+        const secs = (dayStatsMap[dateKey] && dayStatsMap[dateKey].longestSeconds) || 0;
+        if (secs > longestOverall) longestOverall = secs;
+        longestSessionRow.push(secs / 86400);
+      });
+      longestSessionRow.push(longestOverall / 86400);
+      sessionRows.push(longestSessionRow);
+
+      const sessionsPerHourRow = ['Sessions Per Hour'];
+      let totalSessionsPerHourBase = 0;
+      dates.forEach(dateKey => {
+        const count = (dayStatsMap[dateKey] && dayStatsMap[dateKey].sessions) || 0;
+        const value = count > 0 ? Number((count / 8).toFixed(1)) : 0;
+        sessionsPerHourRow.push(value);
+        totalSessionsPerHourBase += count;
+      });
+      const totalSessionsPerHour = totalSessionsPerHourBase > 0 ? Number(((totalSessionsPerHourBase / dates.length) / 8).toFixed(1)) : 0;
+      sessionsPerHourRow.push(totalSessionsPerHour);
+      sessionRows.push(sessionsPerHourRow);
+
+      supportSheet.getRange(currentRow, 1, 1, sessionHeader.length).setValues([sessionHeader]);
+      supportSheet.getRange(currentRow, 1, 1, sessionHeader.length)
+        .setFontWeight('bold').setFontSize(10).setBackground('#E8F1FF').setFontColor('#1E3A8A');
+      supportSheet.getRange(currentRow + 1, 1, sessionRows.length, sessionHeader.length).setValues(sessionRows);
+      sessionRows.forEach((rowVals, idx) => {
+        const metricName = String(rowVals[0] || '').toLowerCase();
+        const range = supportSheet.getRange(currentRow + 1 + idx, 2, 1, sessionHeader.length - 1);
+        try {
+          if (metricName.includes('time') || metricName.includes('duration') || metricName.includes('pickup')) {
+            range.setNumberFormat('hh:mm:ss');
+          } else if (metricName.includes('sessions per hour')) {
+            range.setNumberFormat('0.0');
+          } else {
+            range.setNumberFormat('0');
+          }
+        } catch (e) { /* ignore */ }
+      });
+      currentRow += sessionRows.length + 2;
+
+      const callDailyEntry = callDailyPerCanonical[canonical] || null;
+      const perDayCallStats = callDailyEntry && callDailyEntry.perDay ? callDailyEntry.perDay : {};
+      const callTotals = callDailyEntry && callDailyEntry.totals ? callDailyEntry.totals : {};
+      const totalCallsOverall = (callTotals.totalCalls != null ? callTotals.totalCalls : Number(callMetrics.totalCalls || 0));
+      const inboundOverall = (callTotals.inbound != null ? callTotals.inbound : Number(callMetrics.inboundCalls || 0));
+      const outboundOverall = (callTotals.outbound != null ? callTotals.outbound : Number(callMetrics.outboundCalls || 0));
+      const talkSecondsOverall = (callTotals.talkSeconds != null ? callTotals.talkSeconds : Number(callMetrics.talkSeconds || 0));
+      const callSecondsOverall = (callTotals.callSeconds != null ? callTotals.callSeconds : Number(callMetrics.callSeconds || 0));
+
+      if (hasCallData || Object.keys(perDayCallStats).length) {
+        supportSheet.getRange(currentRow, 1).setValue(`📞 ${name} - Daily Call Data`);
+        supportSheet.getRange(currentRow, 1).setFontSize(11).setFontWeight('bold').setFontColor('#1E3A8A');
+        currentRow += 1;
+
+        const callHeader = ['Metric'];
+        dates.forEach(d => callHeader.push(formatDisplayDate(d)));
+        callHeader.push('Totals/Averages');
+
+        const callRows = [];
+        const buildCallRow = (label, valueExtractor, totalValue, asDuration) => {
+          const row = [label];
+          dates.forEach(dateKey => {
+            const entry = perDayCallStats[dateKey] || {};
+            const val = valueExtractor(entry) || 0;
+            row.push(asDuration ? val / 86400 : val);
+          });
+          row.push(asDuration ? totalValue / 86400 : totalValue);
+          return row;
+        };
+
+        callRows.push(buildCallRow('Total Calls', entry => entry.totalCalls, totalCallsOverall, false));
+        callRows.push(buildCallRow('Incoming Calls', entry => entry.inbound, inboundOverall, false));
+        callRows.push(buildCallRow('Outgoing Calls', entry => entry.outbound, outboundOverall, false));
+        callRows.push(buildCallRow('Total Talk Time', entry => entry.talkSeconds, talkSecondsOverall, true));
+        callRows.push(buildCallRow('Total Call Duration', entry => entry.callSeconds, callSecondsOverall, true));
+
+        const avgTalkRow = ['Avg Talk Time per Call'];
+        dates.forEach(dateKey => {
+          const entry = perDayCallStats[dateKey] || {};
+          const tc = entry.totalCalls || 0;
+          avgTalkRow.push(tc > 0 ? (entry.talkSeconds || 0) / tc / 86400 : 0);
+        });
+        avgTalkRow.push(totalCallsOverall > 0 ? (talkSecondsOverall / totalCallsOverall) / 86400 : 0);
+        callRows.push(avgTalkRow);
+
+        const avgCallDurationRow = ['Avg Call Duration'];
+        dates.forEach(dateKey => {
+          const entry = perDayCallStats[dateKey] || {};
+          const tc = entry.totalCalls || 0;
+          avgCallDurationRow.push(tc > 0 ? (entry.callSeconds || 0) / tc / 86400 : 0);
+        });
+        avgCallDurationRow.push(totalCallsOverall > 0 ? (callSecondsOverall / totalCallsOverall) / 86400 : 0);
+        callRows.push(avgCallDurationRow);
+
+        supportSheet.getRange(currentRow, 1, 1, callHeader.length).setValues([callHeader]);
+        supportSheet.getRange(currentRow, 1, 1, callHeader.length)
+          .setFontWeight('bold').setFontSize(10).setBackground('#E8F1FF').setFontColor('#1E3A8A');
+        supportSheet.getRange(currentRow + 1, 1, callRows.length, callHeader.length).setValues(callRows);
+        callRows.forEach((rowVals, idx) => {
+          const metricName = String(rowVals[0] || '').toLowerCase();
+          const range = supportSheet.getRange(currentRow + 1 + idx, 2, 1, callHeader.length - 1);
+          try {
+            if (metricName.includes('time') || metricName.includes('duration')) {
+              range.setNumberFormat('hh:mm:ss');
+            } else {
+              range.setNumberFormat('0');
+            }
+          } catch (e) { /* ignore */ }
+        });
+        currentRow += callRows.length + 2;
+      }
+
+      currentRow += 1;
+    });
     
     // Formatting
     supportSheet.setColumnWidth(1, 200);
@@ -6705,7 +7053,7 @@ function refreshAnalyticsDashboard_(startDate, endDate, perfMapOpt) {
     Logger.log('refreshAnalyticsDashboard_ error: ' + e.toString());
   }
 }
-function generateTechnicianTabs_(startDate, endDate, perfMapOpt, digiumDatasetOpt, extensionMetaOpt) {
+function generateTechnicianTabs_(startDate, endDate, digiumDatasetOpt, extensionMetaOpt) {
   try {
     const ss = SpreadsheetApp.getActive();
     const cfg = getCfg_();
@@ -6829,67 +7177,6 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt, digiumDatasetOp
   });
   // Use grouped names (this ensures "Tomer" and "Tomer Reiter" map to one dashboard, but keeps Oscars separate)
   const techs = Object.values(techGroups);
-  // Pull performance summary once for the whole range; used for Avg Session (API)
-  const perfByTech = perfMapOpt || getPerfSummaryCached_(cfg, startDate, endDate) || {};
-  const mergePerfEntries = (existing, incoming) => {
-    if (!incoming) return existing || null;
-    const srcCount = incoming.count && incoming.count > 0 ? incoming.count : 1;
-    const clone = {
-      avgDuration: incoming.avgDuration || 0,
-      avgPickup: incoming.avgPickup || 0,
-      totalSessions: incoming.totalSessions || 0,
-      totalLoginTime: incoming.totalLoginTime || 0,
-      totalActiveTime: incoming.totalActiveTime || 0,
-      totalWorkTime: incoming.totalWorkTime || 0,
-      sessionsPerHour: incoming.sessionsPerHour || 0,
-      count: srcCount,
-      rawRow: incoming.rawRow
-    };
-    if (!existing) return clone;
-    const tgtCount = existing.count && existing.count > 0 ? existing.count : 1;
-    const combinedCount = tgtCount + srcCount;
-    return {
-      avgDuration: ((existing.avgDuration || 0) * tgtCount + clone.avgDuration * srcCount) / combinedCount,
-      avgPickup: ((existing.avgPickup || 0) * tgtCount + clone.avgPickup * srcCount) / combinedCount,
-      totalSessions: (existing.totalSessions || 0) + clone.totalSessions,
-      totalLoginTime: (existing.totalLoginTime || 0) + clone.totalLoginTime,
-      totalActiveTime: (existing.totalActiveTime || 0) + clone.totalActiveTime,
-      totalWorkTime: (existing.totalWorkTime || 0) + clone.totalWorkTime,
-      sessionsPerHour: ((existing.sessionsPerHour || 0) * tgtCount + clone.sessionsPerHour * srcCount) / combinedCount,
-      count: combinedCount,
-      rawRow: clone.rawRow || existing.rawRow
-    };
-  };
-  const perfByCanonical = {};
-  const perfByNormalized = {};
-  Object.keys(perfByTech || {}).forEach(rawName => {
-    const entry = perfByTech[rawName];
-    if (!entry) return;
-    const canonical = canonicalTechnicianName_(rawName);
-    if (canonical) {
-      perfByCanonical[canonical] = mergePerfEntries(perfByCanonical[canonical], entry);
-    }
-    const normalizedFull = normalizeTechnicianNameFull_(rawName);
-    if (normalizedFull) {
-      perfByNormalized[normalizedFull] = mergePerfEntries(perfByNormalized[normalizedFull], entry);
-    }
-  });
-  const getPerfEntryForTech = (name) => {
-    if (!name) return null;
-    const canonical = canonicalTechnicianName_(name);
-    if (canonical && perfByCanonical[canonical]) return perfByCanonical[canonical];
-    const normalized = normalizeTechnicianNameFull_(name);
-    if (normalized && perfByNormalized[normalized]) return perfByNormalized[normalized];
-    if (perfByTech[name]) return perfByTech[name];
-    const lower = String(name).trim().toLowerCase();
-    const directKey = Object.keys(perfByTech || {}).find(k => String(k).trim().toLowerCase() === lower);
-    if (directKey) return perfByTech[directKey];
-    const variationCanonical = Object.keys(perfByCanonical || {}).find(key => areTechnicianNameVariations_(key, name));
-    if (variationCanonical && perfByCanonical[variationCanonical]) return perfByCanonical[variationCanonical];
-    const variationRaw = Object.keys(perfByTech || {}).find(key => areTechnicianNameVariations_(key, name));
-    if (variationRaw) return perfByTech[variationRaw];
-    return null;
-  };
   // Track which sheets we've processed to avoid duplicates (use first name for grouping)
   // This ensures "Tomer" and "Tomer Reiter" map to the same sheet
   const processedSheets = new Set();
@@ -6973,7 +7260,6 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt, digiumDatasetOp
         });
       });
     }
-    
     for (const techName of techs) {
       if (isExcludedTechnician_(techName)) {
         Logger.log(`Skipping excluded technician ${techName}`);
@@ -7071,11 +7357,13 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt, digiumDatasetOp
     // Match technician names - prioritize exact matches, then known variations
     const techNameForMatching = normalizeForMatching(techName);
     const techNameNormalizedFull = normalizeTechName(techName);
+    const techNameNormalizedFirst = normalizeTechNameFirst(techName);
     const techRows = filtered.filter(row => {
       const rowTech = row[techIdx];
       if (!rowTech) return false;
       const rowTechNormalized = normalizeForMatching(rowTech);
       const rowTechNormalizedFull = normalizeTechName(rowTech);
+      const rowTechNormalizedFirst = normalizeTechNameFirst(rowTech);
       
       // First: Match by normalized name (handles "Eddie Talal" vs "Ahmed Talal")
       if (rowTechNormalized === techNameForMatching) return true;
@@ -7085,9 +7373,7 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt, digiumDatasetOp
       
       // Third: Match by name variations (e.g., "Tomer" matches "Tomer Reiter")
       // Only do this if they share the same first name AND one is a substring of the other
-      const techNameFirst = techNameNormalizedFull.split(/\s+/)[0];
-      const rowTechFirst = rowTechNormalizedFull.split(/\s+/)[0];
-      if (techNameFirst === rowTechFirst) {
+      if (techNameNormalizedFirst === rowTechNormalizedFirst) {
         // Check if one name contains the other (variation match)
         if (techNameNormalizedFull.includes(rowTechNormalizedFull) || 
             rowTechNormalizedFull.includes(techNameNormalizedFull)) {
@@ -7131,7 +7417,6 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt, digiumDatasetOp
       callMetrics.talkSeconds = canonicalMetrics.talkSeconds || 0;
       callMetrics.callSeconds = canonicalMetrics.callSeconds || 0;
     }
-    const perfEntry = getPerfEntryForTech(techName);
     const applyCallMetrics = (rows) => {
       if (!Array.isArray(rows)) return;
       rows.forEach(row => {
@@ -7234,7 +7519,7 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt, digiumDatasetOp
       const days = Math.max(1, (new Date(endDate) - new Date(startDate)) / (1000*60*60*24));
       // Total Active Hours should reflect active time from sessions (not work time)
       const totalActiveSecondsFromSessions = activeSecondsArr.reduce((a,b)=>a+b, 0);
-      const totalActiveSecondsPerf = perfEntry && perfEntry.totalActiveTime ? perfEntry.totalActiveTime : 0;
+      const totalActiveSecondsPerf = 0;
       const totalActiveSeconds = totalActiveSecondsPerf > 0 ? totalActiveSecondsPerf : totalActiveSecondsFromSessions;
       const activeHoursTotal = (totalActiveSeconds / 3600).toFixed(1);
       // Count Nova Wave sessions for this technician - use Channel Name instead of Calling Card
@@ -7252,7 +7537,7 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt, digiumDatasetOp
       
       // Total Login Time should come from performance summary data (Rescue API)
       // Fall back to sum of session durations if performance data not available
-      let totalLoginTimeSeconds = perfEntry && perfEntry.totalLoginTime ? perfEntry.totalLoginTime : 0;
+      let totalLoginTimeSeconds = 0;
       if (totalLoginTimeSeconds === 0 && hasSessionData && durationIdx >= 0) {
         // Fallback: calculate from session durations if performance data not available
         totalLoginTimeSeconds = techRows.map(r => parseDurationSeconds_(r[durationIdx] || 0)).reduce((a,b)=>a+b, 0);
@@ -7266,8 +7551,8 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt, digiumDatasetOp
       const avgDurationSeconds = durations.length > 0 ? Math.round(durations.reduce((a,b)=>a+b,0) / durations.length) : 0;
       const avgPickupSeconds = pickups.length > 0 ? Math.round(pickups.reduce((a,b)=>a+b,0) / pickups.length) : 0;
       // Calculate values with proper defensive checks
-      const avgActiveTimeSeconds = (totalActiveSeconds > 0 && ((perfEntry && (perfEntry.totalSessions || 0)) || techRows.length))
-        ? Math.round(totalActiveSeconds / Math.max(1, (perfEntry && perfEntry.totalSessions) || techRows.length || 1))
+      const avgActiveTimeSeconds = (totalActiveSeconds > 0 && ((0 || 0) || techRows.length))
+        ? Math.round(totalActiveSeconds / Math.max(1, (0 || 0) || techRows.length || 1))
         : (activeSecondsArr.length > 0 ? Math.round(activeSecondsArr.reduce((a,b)=>a+b,0) / activeSecondsArr.length) : 0);
       const avgPickupTimeSeconds = avgPickupSeconds; // Already calculated above
       const slaHitPercent = pickups.length > 0 ? (slaHits / pickups.length) : 0; // Numeric 0-1 for percentage format
@@ -7277,9 +7562,9 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt, digiumDatasetOp
       Logger.log(`${techName} KPIs - Sessions: ${techRows.length}, Pickups: ${pickups.length}, Active Seconds: ${totalActiveSeconds}, Avg Pickup: ${avgPickupTimeSeconds}s`);
       
       // Get total sessions from performance data if available, otherwise fall back to techRows.length
-      const totalSessionsFromPerfKPI = perfEntry && perfEntry.totalSessions ? perfEntry.totalSessions : 0;
+      const totalSessionsFromPerfKPI = 0;
       const totalSessions = totalSessionsFromPerfKPI > 0 ? totalSessionsFromPerfKPI : techRows.length;
-      const sessionsPerHourFromPerf = perfEntry && perfEntry.sessionsPerHour ? perfEntry.sessionsPerHour : null;
+      const sessionsPerHourFromPerf = null;
       const sessionsPerHour = sessionsPerHourFromPerf != null && sessionsPerHourFromPerf > 0
         ? sessionsPerHourFromPerf
         : (hasSessionData ? (techRows.length / days / 8) : 0);
@@ -7398,7 +7683,7 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt, digiumDatasetOp
     const longestSessionRow = ['Longest Session Time'];
     const sessionsPerHourRow = ['Sessions Per Hour'];
     // Get total sessions from performance data for this technician
-    const perfDataForSummary = perfEntry || {};
+    const perfDataForSummary = {};
     const totalSessionsFromPerfSummary = perfDataForSummary.totalSessions || 0;
     const totalActiveFromPerfSummary = perfDataForSummary.totalActiveTime || 0;
     const totalWorkFromPerfSummary = perfDataForSummary.totalWorkTime || 0;
@@ -7450,7 +7735,7 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt, digiumDatasetOp
   totalWorkRow.push(workSecs / 86400);
   totalWorkAll += workSecs;
   // For Login Time, use performance summary data if available, otherwise use session durations
-  const perfDataForDayLogin = perfEntry || {};
+  const perfDataForDayLogin = {};
   const loginTimeForDay = perfDataForDayLogin.totalLoginTime || 0;
   if (loginTimeForDay > 0) {
     // Use performance summary login time (divide by number of days if it's a total)
@@ -7467,8 +7752,8 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt, digiumDatasetOp
     totalLoginRow.push(0);
   }
         // For Avg Session per day, use API performance data if available, otherwise calculate from sessions
-        const perfDataForDay = perfEntry || {};
-        const apiAvgDuration = perfDataForDay.avgDuration || 0; // In seconds from API
+        const perfDataForDay = {}; // legacy summary removed; calculate from sessions only
+        const apiAvgDuration = perfDataForDay.avgDuration || 0;
         
         if (data && data.sessions.length > 0 && durationIdx >= 0) {
           const durations = data.sessions.map(s => parseDurationSeconds_(s[durationIdx] || 0)).filter(Boolean);
@@ -7525,19 +7810,13 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt, digiumDatasetOp
         sessionsPerHourRow.push(Number(sessionsPerHour));
         totalSessionsPerHour += Number(sessionsPerHour);
       });
-  // Use performance data total sessions if available, otherwise use calculated total
-  const finalTotalSessions = totalSessionsFromPerfSummary > 0 ? totalSessionsFromPerfSummary : totalSessionsAll;
-  totalSessionsRow.push(finalTotalSessions);
-  const finalTotalActive = totalActiveFromPerfSummary > 0 ? totalActiveFromPerfSummary / 86400 : totalActiveAll / 86400;
-  totalActiveRow.push(finalTotalActive);
-  const finalTotalWork = totalWorkFromPerfSummary > 0 ? totalWorkFromPerfSummary / 86400 : totalWorkAll / 86400;
-  totalWorkRow.push(finalTotalWork);
-  const finalTotalLogin = totalLoginFromPerfSummary > 0 ? totalLoginFromPerfSummary : totalLoginAll;
-  totalLoginRow.push(finalTotalLogin / 86400);
+  totalSessionsRow.push(totalSessionsAll);
+  totalActiveRow.push(totalActiveAll / 86400);
+  totalWorkRow.push(totalWorkAll / 86400);
+    totalLoginRow.push(totalLoginAll / 86400);
       // For "Totals/Averages" column, use API performance data if available, otherwise calculate from session data
-      // perfDataForSummary already declared above, reuse it
-      const apiAvgDuration = perfDataForSummary.avgDuration || 0; // In seconds from API
-      const apiAvgPickup = perfDataForSummary.avgPickup || 0; // In seconds from API
+      const apiAvgDuration = 0; // legacy summary removed; calculate from sessions only
+      const apiAvgPickup = 0; // legacy summary removed; calculate from sessions only
       
       if (apiAvgDuration > 0) {
         // Use API average duration if available
@@ -7555,9 +7834,8 @@ function generateTechnicianTabs_(startDate, endDate, perfMapOpt, digiumDatasetOp
         avgPickupRow.push(totalPickupCount>0 ? (totalPickupSeconds / totalPickupCount) / 86400 : 0);
       }
   longestSessionRow.push(longestSessionAll / 86400);
-  const sessionsPerHourAverage = dates.length > 0 ? totalSessionsPerHour / dates.length : 0;
-  const finalSessionsPerHourValue = sessionsPerHourFromPerfSummary != null && sessionsPerHourFromPerfSummary > 0 ? sessionsPerHourFromPerfSummary : sessionsPerHourAverage;
-  sessionsPerHourRow.push(Number(finalSessionsPerHourValue.toFixed ? finalSessionsPerHourValue.toFixed(1) : finalSessionsPerHourValue));
+  const sessionsPerHourTotal = totalSessionsAll > 0 ? (totalSessionsAll / (dates.length * 8)) : 0;
+  sessionsPerHourRow.push(Number(sessionsPerHourTotal.toFixed(1)));
   const wideRows = [headerRow, totalSessionsRow, totalActiveRow, totalLoginRow, totalWorkRow, avgSessionRow, avgPickupRow, longestSessionRow, sessionsPerHourRow];
       techSheet.getRange(summaryStart + 1, 1, wideRows.length, wideRows[0].length).setValues(wideRows);
       // style header
@@ -8042,7 +8320,6 @@ function createAdvancedAnalyticsDashboard() {
     SpreadsheetApp.getActive().toast('Error: ' + e.toString().substring(0, 50));
   }
 }
-
 // Refresh Advanced Analytics Dashboard based on time frame
 function refreshAdvancedAnalyticsDashboard_(startDate, endDate, digiumDatasetOpt, extensionMetaOpt) {
   try {
@@ -8278,7 +8555,6 @@ function createPeakHoursAnalysis_(sheet, startRow, startDate, endDate, styleRegi
         combined
       };
     }).sort((a, b) => b.combined - a.combined);
-    
     // Title
     sheet.getRange(startRow, 1).setValue('📊 Peak Hours & Day of Week Analysis');
     sheet.getRange(startRow, 1, 1, 10).merge();
@@ -8927,7 +9203,6 @@ function createPredictiveAnalytics_(sheet, startRow, styleRegistry, startDate, e
       Math.round(sessionForecast.predictions[idx]),
       Math.round(callForecast.predictions[idx])
     ]);
-
     const averageSessions = sessionSeries.reduce((a, b) => a + b, 0) / sessionSeries.length;
     const averageCalls = callSeries.reduce((a, b) => a + b, 0) / callSeries.length;
 
@@ -8964,6 +9239,6 @@ function createPredictiveAnalytics_(sheet, startRow, styleRegistry, startDate, e
   } catch (e) {
     Logger.log('createPredictiveAnalytics_ error: ' + e.toString());
  
-   return startRow + 50;
+    return startRow + 50;
   }
 }
