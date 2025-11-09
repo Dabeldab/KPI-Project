@@ -21,6 +21,8 @@ Previously, the application used Basic Authentication for every API call. Now it
 - ✅ **Better Performance**: Login once, reuse session for multiple calls
 - ✅ **API Compliant**: Follows LogMeIn Rescue official documentation
 - ✅ **Automatic Retry**: Handles expired sessions gracefully
+- ✅ **Rate Limited**: Protects against brute force attacks (5 login attempts per 15 minutes)
+- ✅ **API Protection**: General rate limiting (100 requests per minute per IP)
 
 ## How It Works
 
@@ -278,6 +280,40 @@ Authorization: Basic [base64(username:password)]
 ```
 
 Our implementation tries all three methods for maximum compatibility.
+
+## Security Features
+
+### Rate Limiting
+
+The implementation includes built-in rate limiting to protect against brute force attacks:
+
+**Login Endpoint Rate Limiting**:
+- **Limit**: 5 login attempts per IP address
+- **Window**: 15 minutes
+- **Response**: `429 Too Many Requests` with message "Too many login attempts, please try again after 15 minutes"
+
+**General API Rate Limiting**:
+- **Limit**: 100 requests per IP address
+- **Window**: 1 minute
+- **Response**: `429 Too Many Requests` with message "Too many requests, please try again later"
+
+**Testing Rate Limiting**:
+```bash
+# This will show rate limiting in action after 5 attempts
+for i in {1..7}; do 
+  curl -X POST http://localhost:3001/api/rescue/login
+  echo ""
+done
+```
+
+### Security Best Practices Implemented
+
+✅ **No Credentials in Code**: All credentials in environment variables  
+✅ **Session Token Expiration**: Tokens expire after 55 minutes  
+✅ **Rate Limiting**: Protects against brute force attacks  
+✅ **CORS Enabled**: Allows frontend-backend communication  
+✅ **Error Handling**: Detailed logging without exposing sensitive data  
+✅ **Auto-Retry Logic**: Handles expired sessions without user intervention  
 
 ## Next Steps
 
