@@ -22,24 +22,180 @@ const createAuthHeader = (username, password) => {
 };
 
 // ============================================
+// LogMeIn Rescue API Authentication
+// ============================================
+
+// Store for LogMeIn Rescue session tokens
+let rescueSession = {
+  token: null,
+  cookieJar: null,
+  expiresAt: null
+};
+
+// Login to LogMeIn Rescue API and get session token
+const loginToRescue = async () => {
+  try {
+    console.log('[Rescue Login] Attempting to login to LogMeIn Rescue API...');
+    
+    // According to LogMeIn Rescue API documentation, we need to call the login endpoint
+    // The login endpoint returns a session cookie/token that we use for subsequent requests
+    const response = await axios.post(
+      `${process.env.LOGMEIN_API_URL}/login`,
+      null,
+      {
+        params: {
+          userName: process.env.LOGMEIN_USERNAME,
+          password: process.env.LOGMEIN_PASSWORD
+        },
+        // Enable cookie handling
+        withCredentials: true,
+        maxRedirects: 0,
+        validateStatus: (status) => status >= 200 && status < 400
+      }
+    );
+
+    console.log('[Rescue Login] Login response status:', response.status);
+    console.log('[Rescue Login] Response headers:', response.headers);
+    
+    // Extract session token/cookie from response
+    const cookies = response.headers['set-cookie'];
+    if (cookies) {
+      rescueSession.cookieJar = cookies.join('; ');
+      rescueSession.token = response.data?.token || 'session-active';
+      // Set expiration to 55 minutes (tokens typically last 1 hour)
+      rescueSession.expiresAt = Date.now() + (55 * 60 * 1000);
+      console.log('[Rescue Login] ✅ Login successful, session token obtained');
+      return true;
+    }
+    
+    // Some implementations return token in response body
+    if (response.data?.token || response.data?.sessionId) {
+      rescueSession.token = response.data.token || response.data.sessionId;
+      rescueSession.expiresAt = Date.now() + (55 * 60 * 1000);
+      console.log('[Rescue Login] ✅ Login successful, token from response body');
+      return true;
+    }
+    
+    console.log('[Rescue Login] ⚠️ Login response did not contain expected token/cookie');
+    return false;
+  } catch (error) {
+    console.error('[Rescue Login] ❌ Login failed:', error.message);
+    if (error.response) {
+      console.error('[Rescue Login] Status:', error.response.status);
+      console.error('[Rescue Login] Response:', error.response.data);
+    }
+    return false;
+  }
+};
+
+// Check if session is valid and login if needed
+const ensureRescueSession = async () => {
+  // Check if we have a valid session
+  if (rescueSession.token && rescueSession.expiresAt && Date.now() < rescueSession.expiresAt) {
+    console.log('[Rescue Session] Using existing session');
+    return true;
+  }
+  
+  console.log('[Rescue Session] No valid session, logging in...');
+  return await loginToRescue();
+};
+
+// Helper function to make authenticated Rescue API calls
+const makeRescueApiCall = async (endpoint, method = 'GET', data = null) => {
+  // Ensure we have a valid session
+  const sessionValid = await ensureRescueSession();
+  if (!sessionValid) {
+    throw new Error('Failed to establish Rescue API session');
+  }
+  
+  const config = {
+    method,
+    url: `${process.env.LOGMEIN_API_URL}${endpoint}`,
+    headers: {}
+  };
+  
+  // Add session token/cookie to request
+  if (rescueSession.cookieJar) {
+    config.headers['Cookie'] = rescueSession.cookieJar;
+  }
+  if (rescueSession.token && rescueSession.token !== 'session-active') {
+    config.headers['Authorization'] = `Bearer ${rescueSession.token}`;
+  }
+  
+  // Add basic auth as fallback
+  if (!rescueSession.cookieJar && !config.headers['Authorization']) {
+    config.headers['Authorization'] = createAuthHeader(
+      process.env.LOGMEIN_USERNAME,
+      process.env.LOGMEIN_PASSWORD
+    );
+  }
+  
+  if (data) {
+    config.data = data;
+  }
+  
+  try {
+    const response = await axios(config);
+    return response.data;
+  } catch (error) {
+    // If we get 401, session might have expired - try to re-login once
+    if (error.response?.status === 401) {
+      console.log('[Rescue API] Session expired, attempting re-login...');
+      rescueSession.token = null;
+      rescueSession.expiresAt = null;
+      
+      const sessionValid = await ensureRescueSession();
+      if (sessionValid) {
+        // Retry the request with new session
+        if (rescueSession.cookieJar) {
+          config.headers['Cookie'] = rescueSession.cookieJar;
+        }
+        if (rescueSession.token && rescueSession.token !== 'session-active') {
+          config.headers['Authorization'] = `Bearer ${rescueSession.token}`;
+        }
+        const retryResponse = await axios(config);
+        return retryResponse.data;
+      }
+    }
+    throw error;
+  }
+};
+
+// ============================================
 // LogMeIn Rescue API Routes
 // ============================================
+
+// Test login endpoint
+app.post('/api/rescue/login', async (req, res) => {
+  try {
+    const success = await loginToRescue();
+    if (success) {
+      res.json({
+        success: true,
+        message: 'Login successful',
+        expiresAt: rescueSession.expiresAt
+      });
+    } else {
+      res.status(401).json({
+        success: false,
+        error: 'Login failed - check credentials'
+      });
+    }
+  } catch (error) {
+    console.error('Login endpoint error:', error.message);
+    res.status(500).json({
+      success: false,
+      error: 'Login failed',
+      details: error.message
+    });
+  }
+});
 
 // Check if any tech is available on channel
 app.get('/api/rescue/tech-available', async (req, res) => {
   try {
-    const response = await axios.get(
-      `${process.env.LOGMEIN_API_URL}/isAnyTechAvailableOnChannel`,
-      {
-        headers: {
-          'Authorization': createAuthHeader(
-            process.env.LOGMEIN_USERNAME,
-            process.env.LOGMEIN_PASSWORD
-          )
-        }
-      }
-    );
-    res.json(response.data);
+    const data = await makeRescueApiCall('/isAnyTechAvailableOnChannel');
+    res.json(data);
   } catch (error) {
     console.error('LogMeIn Rescue tech-available error:', error.message);
     res.status(error.response?.status || 500).json({
@@ -52,18 +208,8 @@ app.get('/api/rescue/tech-available', async (req, res) => {
 // Get active sessions
 app.get('/api/rescue/sessions', async (req, res) => {
   try {
-    const response = await axios.get(
-      `${process.env.LOGMEIN_API_URL}/getSession_v2`,
-      {
-        headers: {
-          'Authorization': createAuthHeader(
-            process.env.LOGMEIN_USERNAME,
-            process.env.LOGMEIN_PASSWORD
-          )
-        }
-      }
-    );
-    res.json(response.data);
+    const data = await makeRescueApiCall('/getSession_v2');
+    res.json(data);
   } catch (error) {
     console.error('LogMeIn Rescue sessions error:', error.message);
     res.status(error.response?.status || 500).json({

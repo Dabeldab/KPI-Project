@@ -41,34 +41,94 @@ console.log('\n========================================\n');
 if (checks.logmein_username && checks.logmein_password && checks.logmein_url) {
   console.log('🛟 Testing LogMeIn Rescue API...\n');
   
+  // Test 1: Try the login endpoint
+  console.log('   Test 1: Attempting login via /login endpoint...');
   try {
-    const credentials = Buffer.from(`${process.env.LOGMEIN_USERNAME}:${process.env.LOGMEIN_PASSWORD}`).toString('base64');
-    const response = await axios.get(
-      `${process.env.LOGMEIN_API_URL}/isAnyTechAvailableOnChannel`,
+    const loginResponse = await axios.post(
+      `${process.env.LOGMEIN_API_URL}/login`,
+      null,
       {
-        headers: {
-          'Authorization': `Basic ${credentials}`
+        params: {
+          userName: process.env.LOGMEIN_USERNAME,
+          password: process.env.LOGMEIN_PASSWORD
         },
+        maxRedirects: 0,
+        validateStatus: (status) => status >= 200 && status < 400,
         timeout: 10000
       }
     );
     
-    console.log('✅ LogMeIn Rescue: Authentication successful!');
-    console.log(`   Response: ${JSON.stringify(response.data)}\n`);
-  } catch (error) {
-    console.log('❌ LogMeIn Rescue: Authentication failed');
-    if (error.response) {
-      console.log(`   Status: ${error.response.status}`);
-      console.log(`   Error: ${error.response.statusText}`);
-      if (error.response.status === 401) {
-        console.log('   ⚠️  Invalid username or password');
-      } else if (error.response.status === 404) {
-        console.log('   ⚠️  API endpoint not found - check URL');
+    console.log('   ✅ Login endpoint successful!');
+    console.log(`   Status: ${loginResponse.status}`);
+    
+    // Check for session cookie or token
+    const cookies = loginResponse.headers['set-cookie'];
+    const token = loginResponse.data?.token || loginResponse.data?.sessionId;
+    
+    if (cookies || token) {
+      console.log('   ✅ Session token/cookie obtained');
+      if (token) {
+        console.log(`   Token: ${token.substring(0, 20)}...`);
+      }
+      
+      // Test 2: Try using the session for an API call
+      console.log('\n   Test 2: Making authenticated API call...');
+      const headers = {};
+      if (cookies) {
+        headers['Cookie'] = cookies.join('; ');
+      }
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      
+      try {
+        const apiResponse = await axios.get(
+          `${process.env.LOGMEIN_API_URL}/isAnyTechAvailableOnChannel`,
+          { headers, timeout: 10000 }
+        );
+        console.log('   ✅ API call with session successful!');
+        console.log(`   Response: ${JSON.stringify(apiResponse.data)}\n`);
+      } catch (apiError) {
+        console.log('   ⚠️  API call with session failed, but login worked');
+        console.log(`   Error: ${apiError.message}\n`);
       }
     } else {
-      console.log(`   Error: ${error.message}`);
+      console.log('   ⚠️  Login successful but no token/cookie found in response\n');
     }
-    console.log('');
+  } catch (loginError) {
+    // If login endpoint fails, try basic auth as fallback
+    console.log(`   ⚠️  Login endpoint failed: ${loginError.message}`);
+    console.log('   Trying basic authentication as fallback...\n');
+    
+    try {
+      const credentials = Buffer.from(`${process.env.LOGMEIN_USERNAME}:${process.env.LOGMEIN_PASSWORD}`).toString('base64');
+      const response = await axios.get(
+        `${process.env.LOGMEIN_API_URL}/isAnyTechAvailableOnChannel`,
+        {
+          headers: {
+            'Authorization': `Basic ${credentials}`
+          },
+          timeout: 10000
+        }
+      );
+      
+      console.log('✅ LogMeIn Rescue: Basic authentication successful!');
+      console.log(`   Response: ${JSON.stringify(response.data)}\n`);
+    } catch (error) {
+      console.log('❌ LogMeIn Rescue: All authentication methods failed');
+      if (error.response) {
+        console.log(`   Status: ${error.response.status}`);
+        console.log(`   Error: ${error.response.statusText}`);
+        if (error.response.status === 401) {
+          console.log('   ⚠️  Invalid username or password');
+        } else if (error.response.status === 404) {
+          console.log('   ⚠️  API endpoint not found - check URL');
+        }
+      } else {
+        console.log(`   Error: ${error.message}`);
+      }
+      console.log('');
+    }
   }
 } else {
   console.log('⏭️  Skipping LogMeIn Rescue test (credentials not configured)\n');

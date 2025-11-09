@@ -4,6 +4,11 @@ const API_BASE_URL = '/api';
 
 // LogMeIn Rescue API calls
 export const rescueApi = {
+  login: async () => {
+    const response = await axios.post(`${API_BASE_URL}/rescue/login`);
+    return response.data;
+  },
+  
   getTechAvailability: async () => {
     const response = await axios.get(`${API_BASE_URL}/rescue/tech-available`);
     return response.data;
