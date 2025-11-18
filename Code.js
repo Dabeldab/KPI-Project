@@ -4213,27 +4213,53 @@ function uiIngestRangeToSheets() {
       body { font-family: Arial; padding: 20px; }
       input { width: 200px; margin: 5px 0; padding: 5px; }
       button { padding: 10px 20px; margin: 10px 5px 0 0; }
+      button:disabled { opacity: 0.6; cursor: not-allowed; }
+      #status { margin-top: 10px; padding: 5px; color: #333; }
+      #status.loading { color: #0066cc; font-style: italic; }
+      #status.error { color: #cc0000; }
     </style>
     <h3>Pull Custom Date Range</h3>
     <p>Start Date:<br><input type="date" id="startDate"></p>
     <p>End Date:<br><input type="date" id="endDate"></p>
-    <button onclick="pull()">Pull Data</button>
+    <button id="pullBtn" onclick="pull()">Pull Data</button>
     <button onclick="google.script.host.close()">Cancel</button>
+    <div id="status"></div>
     <script>
       function pull() {
         const start = document.getElementById('startDate').value;
         const end = document.getElementById('endDate').value;
+        const pullBtn = document.getElementById('pullBtn');
+        const status = document.getElementById('status');
+        
         if (!start || !end) {
           alert('Please select both start and end dates');
           return;
         }
-        google.script.run.withSuccessHandler(function(msg) {
-          alert(msg);
-          google.script.host.close();
-        }).ingestCustomRangeToSheets(start, end);
+        
+        // Disable button and show loading state
+        pullBtn.disabled = true;
+        pullBtn.textContent = 'Pulling...';
+        status.textContent = 'Fetching data for ' + start + ' to ' + end + '...';
+        status.className = 'loading';
+        
+        google.script.run
+          .withSuccessHandler(function(msg) {
+            status.textContent = msg;
+            status.className = '';
+            alert(msg);
+            google.script.host.close();
+          })
+          .withFailureHandler(function(error) {
+            pullBtn.disabled = false;
+            pullBtn.textContent = 'Pull Data';
+            status.textContent = 'Error: ' + (error.message || error.toString());
+            status.className = 'error';
+            alert('Error fetching data: ' + (error.message || error.toString()));
+          })
+          .ingestCustomRangeToSheets(start, end);
       }
     </script>
-  `).setWidth(350).setHeight(250);
+  `).setWidth(350).setHeight(280);
   SpreadsheetApp.getUi().showModalDialog(html, 'Pull Custom Range');
 }
 
