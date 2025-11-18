@@ -605,16 +605,25 @@ function collectSalesforceTicketMetrics_(startDate, endDate) {
       const createdCanonical = canonicalTechnicianName_(createdByRaw);
       const closedCanonical = canonicalTechnicianName_(closedByRaw);
 
+      // For historical tickets, use raw name (normalized) as fallback if not in map
+      const getEntryKey = (canonical, rawName) => {
+        if (canonical) return canonical;
+        // Use normalized raw name as fallback for names not in extension_map
+        const normalized = normalizeTechnicianNameFull_(rawName);
+        return normalized || '';
+      };
+
       const ensureEntry = (canonical, rawName) => {
-        if (!canonical) return null;
-        if (!result.perCanonical[canonical]) {
-          result.perCanonical[canonical] = { created: 0, closed: 0, open: 0, issues: {}, rawNames: new Set(), daysToClose: [] };
+        const entryKey = getEntryKey(canonical, rawName);
+        if (!entryKey) return null;
+        if (!result.perCanonical[entryKey]) {
+          result.perCanonical[entryKey] = { created: 0, closed: 0, open: 0, issues: {}, rawNames: new Set(), daysToClose: [] };
         }
         if (rawName) {
           const trimmed = String(rawName || '').trim();
-          if (trimmed) result.perCanonical[canonical].rawNames.add(trimmed);
+          if (trimmed) result.perCanonical[entryKey].rawNames.add(trimmed);
         }
-        return result.perCanonical[canonical];
+        return result.perCanonical[entryKey];
       };
 
       const addIssueLabel = (targetMap, label) => {
