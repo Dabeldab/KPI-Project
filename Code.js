@@ -7378,33 +7378,113 @@ function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, exten
     let callHeaderLength = 0;
     if (digByDay && digByDay.ok && digByDay.rows && digByDay.rows.length) {
       const categories = Array.isArray(digByDay.categories) ? digByDay.categories : [];
-      if (categories.length > 0) {
-        const callHeader = ['Metric'].concat(categories.map(dateStr => {
+      const dates = Array.isArray(digByDay.dates) ? digByDay.dates : categories;
+      
+      if (dates.length > 0) {
+        // Build header with dates and Total column
+        const dateHeaders = dates.map(dateStr => {
           const dt = new Date(dateStr + 'T00:00:00');
           return isNaN(dt.getTime()) ? dateStr : `${dt.getMonth() + 1}/${dt.getDate()}/${dt.getFullYear()}`;
-        }));
-      supportSheet.getRange(currentRow, 1, 1, callHeader.length).setValues([callHeader]);
-      supportSheet.getRange(currentRow, 1, 1, callHeader.length)
-        .setFontWeight('bold').setFontSize(12).setBackground('#1E3A8A').setFontColor('#FFFFFF');
-      callHeaderRowIndex = currentRow;
-      callHeaderLength = callHeader.length;
-      
+        });
+        const callHeader = ['Metric'].concat(dateHeaders).concat(['Total']);
+        
+        supportSheet.getRange(currentRow, 1, 1, callHeader.length).setValues([callHeader]);
+        supportSheet.getRange(currentRow, 1, 1, callHeader.length)
+          .setFontWeight('bold').setFontSize(12).setBackground('#1E3A8A').setFontColor('#FFFFFF');
+        callHeaderRowIndex = currentRow;
+        callHeaderLength = callHeader.length;
+        
+        // Find key rows for calculating weighted averages
+        let totalCallsRow = null;
+        let callDurationRow = null;
+        let talkingDurationRow = null;
+        digByDay.rows.forEach(row => {
+          const label = String(row[0] || '').toLowerCase();
+          if (/^total calls$/i.test(label) && !label.includes('incoming') && !label.includes('outgoing')) {
+            totalCallsRow = row;
+          } else if (/call duration/i.test(label) && !/avg/i.test(label)) {
+            callDurationRow = row;
+          } else if (/talking duration/i.test(label) && !/avg/i.test(label)) {
+            talkingDurationRow = row;
+          }
+        });
+        
         const processedRows = digByDay.rows.map(row => {
-        const metricName = String(row[0] || '');
-        const isDuration = metricName.toLowerCase().includes('duration') || metricName.toLowerCase().includes('talking');
-        const out = [metricName];
-        for (let i = 1; i < callHeader.length; i++) {
+          const metricName = String(row[0] || '');
+          const metricLower = metricName.toLowerCase();
+          const isDuration = metricLower.includes('duration') || metricLower.includes('talking');
+          const isAverage = metricLower.includes('avg') || metricLower.startsWith('average');
+          const out = [metricName];
+          
+          // Process date columns
+          const dateValues = [];
+          for (let i = 1; i <= dates.length && i < row.length; i++) {
             const rawVal = row[i] != null ? Number(row[i]) : 0;
             const normalizedVal = !isNaN(rawVal) ? rawVal : 0;
-          if (isDuration) {
-              out.push(normalizedVal >= 0 ? normalizedVal / 86400 : 0);
-          } else {
-              out.push(normalizedVal);
+            if (isDuration) {
+              dateValues.push(normalizedVal >= 0 ? normalizedVal / 86400 : 0);
+            } else {
+              dateValues.push(normalizedVal);
+            }
           }
-        }
-        return out;
-      });
-      
+          out.push(...dateValues);
+          
+          // Calculate total for this metric
+          let totalValue = 0;
+          if (isAverage) {
+            // For averages, calculate weighted average using total duration and total calls
+            if (totalCallsRow && callDurationRow && (metricLower.includes('call duration') || metricLower.includes('avg call'))) {
+              // Use total call duration row and total calls row to calculate overall average
+              let totalCallDuration = 0;
+              let totalCalls = 0;
+              for (let i = 1; i <= dates.length && i < callDurationRow.length && i < totalCallsRow.length; i++) {
+                const durationSeconds = Number(callDurationRow[i]) || 0;
+                const calls = Number(totalCallsRow[i]) || 0;
+                totalCallDuration += durationSeconds;
+                totalCalls += calls;
+              }
+              totalValue = totalCalls > 0 ? totalCallDuration / totalCalls : 0;
+              // Convert to days for display format
+              if (isDuration) {
+                totalValue = totalValue / 86400;
+              }
+            } else if (totalCallsRow && talkingDurationRow && (metricLower.includes('talking duration') || metricLower.includes('avg talking'))) {
+              // Use total talking duration row and total calls row to calculate overall average
+              let totalTalkingDuration = 0;
+              let totalCalls = 0;
+              for (let i = 1; i <= dates.length && i < talkingDurationRow.length && i < totalCallsRow.length; i++) {
+                const durationSeconds = Number(talkingDurationRow[i]) || 0;
+                const calls = Number(totalCallsRow[i]) || 0;
+                totalTalkingDuration += durationSeconds;
+                totalCalls += calls;
+              }
+              totalValue = totalCalls > 0 ? totalTalkingDuration / totalCalls : 0;
+              // Convert to days for display format
+              if (isDuration) {
+                totalValue = totalValue / 86400;
+              }
+            } else {
+              // Fallback: simple average of the converted date values
+              const sum = dateValues.reduce((s, v) => s + (Number(v) || 0), 0);
+              totalValue = dateValues.length > 0 ? sum / dateValues.length : 0;
+            }
+          } else {
+            // For non-averages (counts, durations), sum all days using raw values
+            const rawValues = [];
+            for (let i = 1; i <= dates.length && i < row.length; i++) {
+              rawValues.push(Number(row[i]) || 0);
+            }
+            totalValue = rawValues.reduce((sum, val) => sum + val, 0);
+            // Convert to days for display format if it's a duration
+            if (isDuration) {
+              totalValue = totalValue / 86400;
+            }
+          }
+          out.push(totalValue);
+          
+          return out;
+        });
+        
         supportSheet.getRange(currentRow + 1, 1, processedRows.length, callHeader.length).setValues(processedRows);
         processedRows.forEach((row, idx) => {
           const metricName = String(row[0] || '').toLowerCase();
@@ -7412,6 +7492,8 @@ function createSupportDataSheet_(ss, startDate, endDate, digiumDatasetOpt, exten
           try {
             if (metricName.includes('duration') || metricName.includes('talking')) {
               range.setNumberFormat('hh:mm:ss');
+            } else if (metricName.includes('avg') || metricName.startsWith('average')) {
+              range.setNumberFormat('0.0');
             } else {
               range.setNumberFormat('0');
             }
